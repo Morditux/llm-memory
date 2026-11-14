@@ -1,5 +1,7 @@
 # llm-memory
 
+[![CI](https://github.com/Morditux/llm-memory/actions/workflows/ci.yml/badge.svg)](https://github.com/Morditux/llm-memory/actions/workflows/ci.yml)
+
 A local MCP server that stores a **memory shared by several LLMs** in a SQLite file
 (Claude Desktop, Claude Code, VS Code, an internal LLM…). When you switch from one client to
 another, the new one retrieves the context in a single call: decisions, preferences, facts,
@@ -13,8 +15,16 @@ task state and the handoff left by the previous assistant.
 
 ## Installation
 
-Prebuilt binaries: `make release` produces `dist/llm-memory-<os>-<arch>` for linux/amd64,
-linux/arm64, darwin/arm64 and windows/amd64. Or from source (Go ≥ 1.26):
+Prebuilt binaries are published on [GitHub Releases](https://github.com/Morditux/llm-memory/releases)
+for linux/amd64, linux/arm64, darwin/arm64 and windows/amd64 (or built locally with `make release`).
+
+With Go ≥ 1.26:
+
+```bash
+go install github.com/Morditux/llm-memory/cmd/llm-memory@latest
+```
+
+Or from a local clone:
 
 ```bash
 make build                  # → bin/llm-memory
