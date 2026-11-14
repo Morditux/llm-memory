@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "llm-memory": {
+      "command": "/absolute/path/llm-memory",
+      "args": ["serve", "--db", "/home/YOU/.llm-memory/memory.db", "--source", "antigravity"]
+    }
+  }
+}

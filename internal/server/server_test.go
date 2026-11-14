@@ -1,0 +1,413 @@
+package server
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"path/filepath"
+	"slices"
+	"strings"
+	"testing"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"github.com/Morditux/llm-memory/internal/store"
+)
+
+// connect starts a server on st and a client named clientName, connected by
+// in-memory transports.
+func connect(t *testing.T, st *store.Store, opts Options, clientName string) *mcp.ClientSession {
+	t.Helper()
+	ctx := context.Background()
+	srv, err := New(st, opts)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	serverT, clientT := mcp.NewInMemoryTransports()
+	ss, err := srv.Connect(ctx, serverT, nil)
+	if err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	client := mcp.NewClient(&mcp.Implementation{Name: clientName, Version: "1.0"}, nil)
+	cs, err := client.Connect(ctx, clientT, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = cs.Close()
+		_ = ss.Wait()
+	})
+	return cs
+}
+
+func openStore(t *testing.T, path string) *store.Store {
+	t.Helper()
+	st, err := store.Open(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	return st
+}
+
+func newSession(t *testing.T, clientName string) *mcp.ClientSession {
+	t.Helper()
+	st := openStore(t, filepath.Join(t.TempDir(), "mem.db"))
+	return connect(t, st, Options{Version: "test"}, clientName)
+}
+
+func call(t *testing.T, cs *mcp.ClientSession, name string, args map[string]any) *mcp.CallToolResult {
+	t.Helper()
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{Name: name, Arguments: args})
+	if err != nil {
+		t.Fatalf("%s: protocol error: %v", name, err)
+	}
+	return res
+}
+
+// callOK calls a tool, fails on IsError, and decodes the structured output.
+func callOK[T any](t *testing.T, cs *mcp.ClientSession, name string, args map[string]any) T {
+	t.Helper()
+	res := call(t, cs, name, args)
+	if res.IsError {
+		t.Fatalf("%s(%v): tool error: %s", name, args, text(res))
+	}
+	var out T
+	b, err := json.Marshal(res.StructuredContent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(b, &out); err != nil {
+		t.Fatalf("%s: decode %s: %v", name, b, err)
+	}
+	return out
+}
+
+func callErr(t *testing.T, cs *mcp.ClientSession, name string, args map[string]any, wantSub ...string) {
+	t.Helper()
+	res := call(t, cs, name, args)
+	if !res.IsError {
+		t.Fatalf("%s(%v): expected IsError, got %s", name, args, text(res))
+	}
+	msg := text(res)
+	for _, w := range wantSub {
+		if !strings.Contains(msg, w) {
+			t.Errorf("%s error %q should contain %q", name, msg, w)
+		}
+	}
+}
+
+func text(res *mcp.CallToolResult) string {
+	var parts []string
+	for _, c := range res.Content {
+		if tc, ok := c.(*mcp.TextContent); ok {
+			parts = append(parts, tc.Text)
+		}
+	}
+	return strings.Join(parts, "\n")
+}
+
+func briefingText(t *testing.T, cs *mcp.ClientSession, args map[string]any) string {
+	t.Helper()
+	res := call(t, cs, "get_context", args)
+	if res.IsError {
+		t.Fatalf("get_context: %s", text(res))
+	}
+	return text(res)
+}
+
+func TestListTools(t *testing.T) {
+	cs := newSession(t, "client-a")
+	res, err := cs.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	byName := map[string]*mcp.Tool{}
+	for _, tool := range res.Tools {
+		names = append(names, tool.Name)
+		byName[tool.Name] = tool
+	}
+	slices.Sort(names)
+	want := []string{"forget", "get_context", "get_memory", "handoff", "list_namespaces", "recall", "remember", "update_memory"}
+	if !slices.Equal(names, want) {
+		t.Fatalf("tools = %v, want %v", names, want)
+	}
+
+	for _, tool := range res.Tools {
+		if tool.Description == "" {
+			t.Errorf("%s: empty description", tool.Name)
+		}
+		b, _ := json.Marshal(tool.InputSchema)
+		var sch map[string]any
+		if err := json.Unmarshal(b, &sch); err != nil || sch["type"] != "object" {
+			t.Errorf("%s: input schema is not an object: %s", tool.Name, b)
+		}
+		props, _ := sch["properties"].(map[string]any)
+		for pname, p := range props {
+			if d, _ := p.(map[string]any)["description"].(string); d == "" {
+				t.Errorf("%s.%s: missing description", tool.Name, pname)
+			}
+		}
+		if tool.Name != "get_context" && tool.OutputSchema == nil {
+			t.Errorf("%s: missing output schema", tool.Name)
+		}
+	}
+
+	for _, n := range []string{"get_context", "recall", "get_memory", "list_namespaces"} {
+		if a := byName[n].Annotations; a == nil || !a.ReadOnlyHint {
+			t.Errorf("%s should be readOnly", n)
+		}
+	}
+	for _, n := range []string{"remember", "update_memory", "forget", "handoff"} {
+		if a := byName[n].Annotations; a == nil || a.ReadOnlyHint {
+			t.Errorf("%s should not be readOnly", n)
+		}
+	}
+	if a := byName["forget"].Annotations; a.DestructiveHint == nil || *a.DestructiveHint {
+		t.Error("forget should have destructiveHint=false")
+	}
+
+	b, _ := json.Marshal(byName["remember"].InputSchema)
+	s := string(b)
+	if !strings.Contains(s, `"decision"`) || strings.Contains(s, `"handoff"`) {
+		t.Errorf("remember kind enum wrong: %s", s)
+	}
+	var req struct {
+		Required []string `json:"required"`
+	}
+	_ = json.Unmarshal(b, &req)
+	slices.Sort(req.Required)
+	if !slices.Equal(req.Required, []string{"content", "kind"}) {
+		t.Errorf("remember required = %v", req.Required)
+	}
+}
+
+func TestScenario(t *testing.T) {
+	cs := newSession(t, "client-a")
+
+	// remember → the client name is recorded as source.
+	r := callOK[RememberOutput](t, cs, "remember", map[string]any{
+		"content": "PostgreSQL plutôt que MySQL, pour le support JSONB.", "kind": "decision",
+		"namespace": "Demo", "title": "Base de données", "tags": []string{"db"},
+	})
+	id := r.Memory.ID
+	if r.Memory.Namespace != "demo" || r.Memory.Source != "client-a" || len(r.PossibleDuplicates) != 0 {
+		t.Fatalf("remember: %+v", r)
+	}
+
+	// recall (accents ignored, prefix).
+	rc := callOK[RecallOutput](t, cs, "recall", map[string]any{"query": "base donnees postg"})
+	if len(rc.Results) != 1 || rc.Results[0].ID != id || !strings.Contains(rc.Results[0].Snippet, "**") {
+		t.Fatalf("recall: %+v", rc)
+	}
+
+	// update_memory.
+	u := callOK[UpdateMemoryOutput](t, cs, "update_memory", map[string]any{"id": id, "importance": 3, "title": "SGBD"})
+	if u.Memory.Importance != 3 || u.Memory.Title != "SGBD" || !slices.Equal(u.Changed, []string{"importance", "title"}) {
+		t.Fatalf("update: %+v", u)
+	}
+
+	// get_context shows it under Essentiel.
+	b := briefingText(t, cs, map[string]any{"namespace": "demo"})
+	if !strings.Contains(b, fmt.Sprintf("#%d [decision] **SGBD**", id)) {
+		t.Fatalf("briefing missing memory:\n%s", b)
+	}
+
+	// get_memory with history.
+	g := callOK[GetMemoryOutput](t, cs, "get_memory", map[string]any{"id": id, "with_history": true})
+	if len(g.History) != 2 || g.History[0].Action != "create" || g.History[1].Title != "SGBD" || g.History[0].ChangedBy != "client-a" {
+		t.Fatalf("history: %+v", g.History)
+	}
+
+	// forget → gone from recall and get_context.
+	f := callOK[ForgetOutput](t, cs, "forget", map[string]any{"id": id, "reason": "test"})
+	if !f.Archived || !strings.Contains(f.Message, "restore") {
+		t.Fatalf("forget: %+v", f)
+	}
+	if rc := callOK[RecallOutput](t, cs, "recall", map[string]any{"query": "postgresql"}); len(rc.Results) != 0 || rc.Hint == "" {
+		t.Fatalf("recall after forget: %+v", rc)
+	}
+	if b := briefingText(t, cs, map[string]any{"namespace": "demo"}); strings.Contains(b, "SGBD") {
+		t.Fatalf("forgotten memory in briefing:\n%s", b)
+	}
+	g = callOK[GetMemoryOutput](t, cs, "get_memory", map[string]any{"id": id, "with_history": true})
+	if g.Memory.ArchivedAt == "" || g.History[2].Reason != "test" {
+		t.Fatalf("archived memory: %+v", g)
+	}
+
+	// list_namespaces.
+	ln := callOK[ListNamespacesOutput](t, cs, "list_namespaces", nil)
+	if ln.Default != "global" || len(ln.Namespaces) != 2 || ln.Namespaces[0].Name != "demo" || ln.Namespaces[0].ActiveCount != 0 {
+		t.Fatalf("list_namespaces: %+v", ln)
+	}
+}
+
+func TestHandoffBetweenClients(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "mem.db")
+
+	// Session A (Claude Desktop) records a decision and a handoff.
+	stA := openStore(t, path)
+	a := connect(t, stA, Options{}, "claude-desktop")
+	callOK[RememberOutput](t, a, "remember", map[string]any{
+		"content": "PostgreSQL plutôt que MySQL, pour le support JSONB.", "kind": "decision", "namespace": "demo",
+	})
+	h1 := callOK[HandoffOutput](t, a, "handoff", map[string]any{"summary": "Premier jet", "namespace": "demo"})
+	h2 := callOK[HandoffOutput](t, a, "handoff", map[string]any{
+		"summary":        "Schéma prêt.\nReste l'API.",
+		"next_steps":     []string{"écrire /orders", " ", "tests"},
+		"open_questions": []string{"GraphQL ?"},
+		"namespace":      "demo",
+	})
+	if !slices.Equal(h2.Replaced, []int64{h1.Memory.ID}) {
+		t.Fatalf("second handoff should replace the first: %+v", h2)
+	}
+	if h2.Memory.Title != "Handoff: Schéma prêt." || h2.Memory.Kind != "handoff" {
+		t.Errorf("handoff memory: %+v", h2.Memory)
+	}
+	for _, want := range []string{"## Summary\nSchéma prêt.", "## Next steps\n- écrire /orders\n- tests", "## Open questions\n- GraphQL ?"} {
+		if !strings.Contains(h2.Memory.Content, want) {
+			t.Errorf("handoff content missing %q:\n%s", want, h2.Memory.Content)
+		}
+	}
+	_ = stA.Close()
+
+	// Session B (VS Code), new process on the same file.
+	stB := openStore(t, path)
+	b := connect(t, stB, Options{DefaultNamespace: "demo"}, "vscode")
+	brief := briefingText(t, b, nil) // default namespace from the server options
+	for _, want := range []string{`namespace "demo"`, "Latest handoff", "claude-desktop", "Reste l'API", "PostgreSQL plutôt que MySQL"} {
+		if !strings.Contains(brief, want) {
+			t.Errorf("briefing in session B missing %q:\n%s", want, brief)
+		}
+	}
+	if strings.Contains(brief, "Premier jet") {
+		t.Error("replaced handoff still shown")
+	}
+	r := callOK[RememberOutput](t, b, "remember", map[string]any{"content": "API en Go", "kind": "fact"})
+	if r.Memory.Source != "vscode" || r.Memory.Namespace != "demo" {
+		t.Errorf("session B memory: %+v", r.Memory)
+	}
+}
+
+func TestForcedSource(t *testing.T) {
+	st := openStore(t, filepath.Join(t.TempDir(), "mem.db"))
+	cs := connect(t, st, Options{Source: "claude-code"}, "some-client")
+	r := callOK[RememberOutput](t, cs, "remember", map[string]any{"content": "x", "kind": "note"})
+	if r.Memory.Source != "claude-code" {
+		t.Errorf("source = %q, want forced claude-code", r.Memory.Source)
+	}
+}
+
+func TestPossibleDuplicates(t *testing.T) {
+	cs := newSession(t, "a")
+	first := callOK[RememberOutput](t, cs, "remember", map[string]any{
+		"content": "Le déploiement se fait avec Docker Compose sur un VPS Hetzner.", "kind": "fact", "namespace": "demo",
+	})
+	dup := callOK[RememberOutput](t, cs, "remember", map[string]any{
+		"content": "Déploiement : Docker Compose sur VPS Hetzner.", "kind": "fact", "namespace": "demo",
+	})
+	if len(dup.PossibleDuplicates) != 1 || dup.PossibleDuplicates[0].ID != first.Memory.ID || dup.Hint == "" {
+		t.Fatalf("expected duplicate warning: %+v", dup)
+	}
+	// Superseding the old one: no duplicate warning about it, and it is archived.
+	repl := callOK[RememberOutput](t, cs, "remember", map[string]any{
+		"content": "Le déploiement se fait avec Docker Compose sur un VPS Hetzner, via Ansible.", "kind": "fact",
+		"namespace": "demo", "supersedes": []int64{first.Memory.ID, dup.Memory.ID},
+	})
+	if len(repl.PossibleDuplicates) != 0 || len(repl.Superseded) != 2 {
+		t.Fatalf("supersedes: %+v", repl)
+	}
+}
+
+func TestToolErrors(t *testing.T) {
+	cs := newSession(t, "a")
+	callErr(t, cs, "get_memory", map[string]any{"id": 999}, "#999 does not exist", "recall")
+	callErr(t, cs, "update_memory", map[string]any{"id": 999, "title": "x"}, "does not exist")
+	callErr(t, cs, "forget", map[string]any{"id": 999}, "does not exist")
+	callErr(t, cs, "recall", map[string]any{"query": "x", "namespace": "nowhere"}, "nowhere", "global", "list_namespaces")
+	callErr(t, cs, "get_context", map[string]any{"namespace": "nowhere"}, "nowhere", "global", "remember")
+	callErr(t, cs, "remember", map[string]any{"content": "x", "kind": "opinion"})               // schema enum
+	callErr(t, cs, "remember", map[string]any{"content": "x", "kind": "handoff"})               // handoff tool only
+	callErr(t, cs, "remember", map[string]any{"kind": "fact"})                                  // missing content
+	callErr(t, cs, "remember", map[string]any{"content": "   ", "kind": "fact"}, "content")     // blank
+	callErr(t, cs, "remember", map[string]any{"content": "x", "kind": "fact", "importance": 7}) // bounds
+	callErr(t, cs, "remember", map[string]any{"content": "x", "kind": "fact", "namespace": "-x"}, "namespace")
+	callErr(t, cs, "remember", map[string]any{"content": strings.Repeat("a", 8001), "kind": "fact"})
+	callErr(t, cs, "handoff", map[string]any{"summary": "  "}, "summary")
+
+	m := callOK[RememberOutput](t, cs, "remember", map[string]any{"content": "x", "kind": "fact"})
+	callErr(t, cs, "update_memory", map[string]any{"id": m.Memory.ID}, "no field to change")
+	callErr(t, cs, "update_memory", map[string]any{"id": m.Memory.ID, "namespace": "nowhere"}, "nowhere")
+	callOK[ForgetOutput](t, cs, "forget", map[string]any{"id": m.Memory.ID})
+	callErr(t, cs, "forget", map[string]any{"id": m.Memory.ID}, "already archived")
+	callErr(t, cs, "update_memory", map[string]any{"id": m.Memory.ID, "title": "y"}, "archived")
+}
+
+func TestEmptyBaseBriefing(t *testing.T) {
+	cs := newSession(t, "a")
+	b := briefingText(t, cs, nil)
+	if !strings.Contains(b, "No memory stored yet") {
+		t.Errorf("welcome message missing:\n%s", b)
+	}
+	rc := callOK[RecallOutput](t, cs, "recall", map[string]any{"query": ""})
+	if rc.Results == nil || len(rc.Results) != 0 {
+		t.Errorf("empty recall: %+v", rc)
+	}
+}
+
+func TestNewRejectsBadDefaultNamespace(t *testing.T) {
+	st := openStore(t, filepath.Join(t.TempDir(), "mem.db"))
+	if _, err := New(st, Options{DefaultNamespace: "-bad"}); err == nil {
+		t.Error("expected error")
+	}
+	if _, err := New(st, Options{DefaultNamespace: "Mon Projet"}); err != nil {
+		t.Errorf("normalisable namespace rejected: %v", err)
+	}
+}
+
+func TestHandoffTitle(t *testing.T) {
+	if got := handoffTitle("## Summary\nx"); got != "Handoff: Summary" {
+		t.Errorf("got %q", got)
+	}
+	long := strings.Repeat("é", 100)
+	if got := handoffTitle(long); len([]rune(got)) != len([]rune("Handoff: "))+maxHandoffTitle {
+		t.Errorf("title not cut: %q", got)
+	}
+}
+
+// meaningSearcher stands for the semantic engine: it finds memories whose
+// content contains a synonym of the query.
+type meaningSearcher struct{ st *store.Store }
+
+func (m meaningSearcher) Search(ctx context.Context, q store.SearchQuery) ([]store.SearchResult, error) {
+	if strings.EqualFold(q.Query, "sgbd") {
+		q.Query = "postgresql"
+	}
+	return m.st.Search(ctx, q)
+}
+
+func TestRecallUsesSearcher(t *testing.T) {
+	st := openStore(t, filepath.Join(t.TempDir(), "mem.db"))
+	v1 := connect(t, st, Options{}, "a")
+	callOK[RememberOutput](t, v1, "remember", map[string]any{"content": "PostgreSQL pour JSONB", "kind": "decision"})
+	if rc := callOK[RecallOutput](t, v1, "recall", map[string]any{"query": "SGBD"}); len(rc.Results) != 0 {
+		t.Fatalf("v1 recall found %+v", rc)
+	}
+	sem := connect(t, st, Options{Searcher: meaningSearcher{st}}, "b")
+	if rc := callOK[RecallOutput](t, sem, "recall", map[string]any{"query": "SGBD"}); len(rc.Results) != 1 {
+		t.Fatalf("semantic recall: %+v", rc)
+	}
+	desc := func(cs *mcp.ClientSession) string {
+		res, _ := cs.ListTools(context.Background(), nil)
+		for _, tool := range res.Tools {
+			if tool.Name == "recall" {
+				return tool.Description
+			}
+		}
+		return ""
+	}
+	if strings.Contains(desc(v1), "Semantic") || !strings.Contains(desc(sem), "Semantic search is enabled") {
+		t.Errorf("recall descriptions:\nv1: %s\nsemantic: %s", desc(v1), desc(sem))
+	}
+}

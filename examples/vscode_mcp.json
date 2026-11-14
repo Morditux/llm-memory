@@ -1,0 +1,9 @@
+{
+  "servers": {
+    "llm-memory": {
+      "type": "stdio",
+      "command": "/absolute/path/llm-memory",
+      "args": ["serve", "--namespace", "my-project", "--source", "vscode"]
+    }
+  }
+}

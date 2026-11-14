@@ -1,0 +1,17 @@
+Database: <DB>
+Size:     <SIZE> (schema 2)
+Memories: 3 active, 1 archived
+
+By namespace:
+  demo    2 active  1 archived
+  global  1 active  0 archived
+
+By kind:
+  decision    1 active  1 archived
+  fact        1 active  0 archived
+  preference  1 active  0 archived
+
+By source:
+  claude-desktop  1 active  1 archived
+  claude-code     1 active  0 archived
+  vscode          1 active  0 archived

@@ -1,0 +1,4 @@
+ID  NAMESPACE  KIND                 TITLE / CONTENT                                               SOURCE          UPDATED (UTC)
+3   demo       fact                 Le déploiement se fait avec Docker Compose sur un VPS Hetzn…  claude-code     2026-01-13 08:30
+2   demo       decision             BDD                                                           vscode          2026-01-12 10:00
+1   demo       decision (archived)  BDD                                                           claude-desktop  2026-01-12 10:00

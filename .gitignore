@@ -1,0 +1,6 @@
+/bin/
+/dist/
+coverage.out
+*.db
+*.db-wal
+*.db-shm

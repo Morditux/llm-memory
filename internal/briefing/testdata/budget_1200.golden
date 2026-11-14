@@ -1,0 +1,37 @@
+# Shared memory — namespace "demo"
+
+20 active memories · last activity <DATE> (claude-desktop)
+Use the ids (#42) with get_memory, update_memory and forget.
+
+## Latest handoff (#25, claude-desktop, <DATE>)
+#### Summary
+The schema is in place, search works.
+
+#### Next steps
+- write the briefing
+- wire the MCP server
+
+#### Open questions
+- duplicate threshold?
+
+## Essential (importance 3)
+- #20 [decision] **Base de données**: PostgreSQL plutôt que MySQL, pour le support JSONB.
+- #2 [preference] (global) Ne jamais stocker de secrets dans le dépôt.
+
+## Ongoing tasks
+- #21 **API REST**: Tests d'intégration écrits pour /orders ; reste /users. Bloqué par l'absence de fixtures.
+
+## Project preferences
+- #5 **Tests**: Tests en table, base dans t.TempDir().
+
+## Global preferences
+- #1 **Langue**: Répondre en français, de façon concise.
+
+## Recent decisions
+- #19 **Décision 12**: Contenu de la décision numéro 12, avec sa raison.
+- #18 **Décision 11**: Contenu de la décision numéro 11, avec sa raison.
+- #17 **Décision 10**: Contenu de la décision numéro 10, avec sa raison.
+- … 9 more, use recall (kinds: decision)
+
+## Recent facts
+- … 3 more, use recall (kinds: fact)

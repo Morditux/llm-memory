@@ -1,0 +1,16 @@
+# Shared memory — namespace "api"
+
+1 active memory · last activity <DATE> (vscode)
+Use the ids (#42) with get_memory, update_memory and forget.
+
+## Essential (importance 3)
+- #2 [preference] (global) Ne jamais stocker de secrets dans le dépôt.
+
+## Global preferences
+- #1 **Langue**: Répondre en français, de façon concise.
+
+## Recent decisions
+- #4 Pagination par curseur opaque.
+
+---
+Other namespaces: demo (20), global (3).

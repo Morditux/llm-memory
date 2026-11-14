@@ -1,0 +1,51 @@
+# Shared memory — namespace "demo"
+
+20 active memories · last activity <DATE> (claude-desktop)
+Use the ids (#42) with get_memory, update_memory and forget.
+
+## Latest handoff (#25, claude-desktop, <DATE>)
+#### Summary
+The schema is in place, search works.
+
+#### Next steps
+- write the briefing
+- wire the MCP server
+
+#### Open questions
+- duplicate threshold?
+
+## Essential (importance 3)
+- #20 [decision] **Base de données**: PostgreSQL plutôt que MySQL, pour le support JSONB.
+- #2 [preference] (global) Ne jamais stocker de secrets dans le dépôt.
+
+## Ongoing tasks
+- #21 **API REST**: Tests d'intégration écrits pour /orders ; reste /users. Bloqué par l'absence de fixtures.
+
+## Project preferences
+- #5 **Tests**: Tests en table, base dans t.TempDir().
+
+## Global preferences
+- #1 **Langue**: Répondre en français, de façon concise.
+
+## Recent decisions
+- #19 **Décision 12**: Contenu de la décision numéro 12, avec sa raison.
+- #18 **Décision 11**: Contenu de la décision numéro 11, avec sa raison.
+- #17 **Décision 10**: Contenu de la décision numéro 10, avec sa raison.
+- #16 **Décision 09**: Contenu de la décision numéro 9, avec sa raison.
+- #15 **Décision 08**: Contenu de la décision numéro 8, avec sa raison.
+- #14 **Décision 07**: Contenu de la décision numéro 7, avec sa raison.
+- #13 **Décision 06**: Contenu de la décision numéro 6, avec sa raison.
+- #12 **Décision 05**: Contenu de la décision numéro 5, avec sa raison.
+- #11 **Décision 04**: Contenu de la décision numéro 4, avec sa raison.
+- #10 **Décision 03**: Contenu de la décision numéro 3, avec sa raison.
+- … 2 more, use recall (kinds: decision)
+
+## Recent facts
+- #23 Un fait très long qui doit être coupé dans la liste. Un fait très long qui doit être coupé dans la liste. Un fait très long qui doit être coupé dans la liste. Un fait très long qui doit être coupé dans la liste. Un fait très long qui…
+- #7 Les migrations s'appliquent au démarrage via PRAGMA user_version.
+- #6 **Hébergement**
+
+1 note not shown: use recall (kinds: note).
+
+---
+Other namespaces: api (1), global (3).

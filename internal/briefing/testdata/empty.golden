@@ -1,0 +1,10 @@
+# Shared memory — namespace "global"
+
+0 active memories
+Use the ids (#42) with get_memory, update_memory and forget.
+
+No memory stored yet. This memory is shared with other assistants:
+- remember: store a decision and its reason, a lasting preference or a stable fact about the project;
+- recall: look information up before asking for it again;
+- handoff: before ending a session, summarise the state, next steps and open questions;
+- never store secrets in it (passwords, keys, tokens).
