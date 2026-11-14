@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -240,8 +241,10 @@ func TestExportImportCLI(t *testing.T) {
 	if r.err != nil || !strings.Contains(r.errOut, "Exported 4 memories") {
 		t.Fatalf("export -o: %+v", r)
 	}
-	if fi, _ := os.Stat(dump); fi.Mode().Perm() != 0o600 {
-		t.Errorf("export file mode %o", fi.Mode().Perm())
+	if runtime.GOOS != "windows" {
+		if fi, _ := os.Stat(dump); fi.Mode().Perm() != 0o600 {
+			t.Errorf("export file mode %o", fi.Mode().Perm())
+		}
 	}
 	stdoutDump := cliOK(t, "export", "--history", "--db", db)
 	var d store.Dump
