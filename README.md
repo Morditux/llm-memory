@@ -11,8 +11,6 @@ task state and the handoff left by the previous assistant.
 - Sequential use (one LLM at a time); two clients open at the same time do not block each other.
 - LLMs never delete anything: `forget` archives, and the history of every memory is kept.
 
-The specification and design decisions are in [PLAN.md](PLAN.md).
-
 ## Installation
 
 Prebuilt binaries: `make release` produces `dist/llm-memory-<os>-<arch>` for linux/amd64,
