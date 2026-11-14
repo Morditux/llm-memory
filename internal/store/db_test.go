@@ -24,7 +24,11 @@ func newTestStore(t *testing.T) *Store {
 func TestOpenCreatesDirAndMigrates(t *testing.T) {
 	ctx := context.Background()
 	dir := filepath.Join(t.TempDir(), "nested", "dir with space")
-	p := filepath.Join(dir, "m#e?m%.db") // URI-special characters
+	name := "m#e?m%.db" // URI-special characters
+	if runtime.GOOS == "windows" {
+		name = "m#e%m.db" // '?' is invalid in Windows filenames
+	}
+	p := filepath.Join(dir, name)
 	s, err := Open(ctx, p)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
