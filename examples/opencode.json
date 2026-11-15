@@ -1,0 +1,10 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "llm-memory": {
+      "type": "local",
+      "command": ["/absolute/path/llm-memory", "serve", "--db", "/home/YOU/.llm-memory/memory.db", "--source", "opencode"],
+      "enabled": true
+    }
+  }
+}

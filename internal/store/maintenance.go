@@ -22,6 +22,18 @@ func (s *Store) CountArchivedBefore(ctx context.Context, t time.Time) (int, erro
 	return n, nil
 }
 
+// CountExpired counts active memories whose expires_at is <= now.
+func (s *Store) CountExpired(ctx context.Context, now time.Time) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx,
+		"SELECT count(*) FROM memories WHERE archived_at IS NULL AND expires_at IS NOT NULL AND expires_at <= ?",
+		FormatTime(now)).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("count expired: %w", err)
+	}
+	return n, nil
+}
+
 // Purge physically deletes memories archived strictly before t, with their
 // history (ON DELETE CASCADE). It is the only hard delete and is not
 // reachable from MCP tools.

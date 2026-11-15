@@ -617,7 +617,7 @@ func TestCLIAxes1And2(t *testing.T) {
 		t.Errorf("gc output = %q", gcOut)
 	}
 	docOut := cliOK(t, "doctor", "--db", db)
-	if !strings.Contains(docOut, "Integrity:  ok") {
+	if !strings.Contains(docOut, "Integrity:") || !strings.Contains(docOut, "ok (SQLite + FTS5)") {
 		t.Errorf("doctor output:\n%s", docOut)
 	}
 	setupOut := cliOK(t, "setup", "--db", db, "antigravity")
@@ -653,5 +653,161 @@ func TestCLIBackup(t *testing.T) {
 	listOut := cliOK(t, "list", "--db", dest)
 	if !strings.Contains(listOut, "important backup fact") {
 		t.Errorf("backup missing memory:\n%s", listOut)
+	}
+}
+
+func TestCLISetupAndDoctor(t *testing.T) {
+	dir := t.TempDir()
+	db := filepath.Join(dir, "mem.db")
+	cliOK(t, "remember", "--db", db, "--kind", "fact", "setup test fact")
+
+	// doctor --json
+	docJSON := cliOK(t, "doctor", "--db", db, "--json")
+	var rep doctorReport
+	if err := json.Unmarshal([]byte(docJSON), &rep); err != nil {
+		t.Fatalf("unmarshal doctor json: %v\n%s", err, docJSON)
+	}
+	if !rep.OK || rep.Active != 1 || rep.Database != db || rep.LatestSchema == 0 {
+		t.Errorf("unexpected doctor report: %+v", rep)
+	}
+
+	// setup codex (TOML)
+	codexOut := cliOK(t, "setup", "--db", db, "--namespace", "proj", "codex")
+	if !strings.Contains(codexOut, "[mcp_servers.llm-memory]") ||
+		!strings.Contains(codexOut, `command = "`) ||
+		!strings.Contains(codexOut, `"--namespace", "proj"`) {
+		t.Errorf("unexpected codex setup output:\n%s", codexOut)
+	}
+
+	// setup opencode (JSON)
+	ocOut := cliOK(t, "setup", "--db", db, "--ollama", "opencode")
+	var ocCfg struct {
+		Schema string `json:"$schema"`
+		MCP    map[string]struct {
+			Type    string   `json:"type"`
+			Command []string `json:"command"`
+			Enabled bool     `json:"enabled"`
+		} `json:"mcp"`
+	}
+	if err := json.Unmarshal([]byte(ocOut), &ocCfg); err != nil {
+		t.Fatalf("unmarshal opencode json: %v\n%s", err, ocOut)
+	}
+	entry, ok := ocCfg.MCP["llm-memory"]
+	if !ok || entry.Type != "local" || !entry.Enabled || len(entry.Command) < 4 {
+		t.Fatalf("unexpected opencode entry: %+v", ocCfg)
+	}
+	joined := strings.Join(entry.Command, " ")
+	if !strings.Contains(joined, defaultOllamaURL) || !strings.Contains(joined, defaultOllamaModel) {
+		t.Errorf("opencode --ollama missing embed flags: %v", entry.Command)
+	}
+
+	// setup vscode
+	vsOut := cliOK(t, "setup", "--db", db, "vscode")
+	if !strings.Contains(vsOut, `"servers"`) || !strings.Contains(vsOut, `"stdio"`) {
+		t.Errorf("unexpected vscode setup output:\n%s", vsOut)
+	}
+
+	// setup unknown client returns usage error
+	var stderr bytes.Buffer
+	err := run(context.Background(), []string{"setup", "unknown-client"}, app{
+		stdin: strings.NewReader(""), stdout: &bytes.Buffer{}, stderr: &stderr,
+		env: config.Env{Getenv: func(string) string { return "" }, UserHomeDir: func() (string, error) { return dir, nil }},
+	})
+	if !errors.Is(err, errUsage) {
+		t.Errorf("expected errUsage for unknown client, got %v", err)
+	}
+}
+
+func TestCLISetupWrite(t *testing.T) {
+	home := t.TempDir()
+	db := filepath.Join(home, "mem.db")
+	runWithHome := func(args ...string) {
+		t.Helper()
+		var stdout, stderr bytes.Buffer
+		err := run(context.Background(), args, app{
+			stdin:  strings.NewReader(""),
+			stdout: &stdout,
+			stderr: &stderr,
+			env: config.Env{
+				Getenv:      func(string) string { return "" },
+				UserHomeDir: func() (string, error) { return home, nil },
+			},
+		})
+		if err != nil {
+			t.Fatalf("run %v: %v\nstderr: %s", args, err, stderr.String())
+		}
+		if !strings.Contains(stdout.String(), "Updated ") {
+			t.Errorf("expected Updated message, got %q", stdout.String())
+		}
+	}
+
+	// Antigravity: preserves existing servers in ~/.gemini/config/mcp_config.json.
+	agyPath := filepath.Join(home, ".gemini", "config", "mcp_config.json")
+	if err := os.MkdirAll(filepath.Dir(agyPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(agyPath, []byte(`{"mcpServers":{"other":{"command":"echo"}}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runWithHome("setup", "--db", db, "--write", "antigravity")
+	agyData, err := os.ReadFile(agyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(agyData), `"other"`) || !strings.Contains(string(agyData), `"llm-memory"`) {
+		t.Errorf("antigravity config not merged properly:\n%s", agyData)
+	}
+
+	// Claude Code: writes ~/.claude.json.
+	runWithHome("setup", "--db", db, "--write", "claude-code")
+	ccData, err := os.ReadFile(filepath.Join(home, ".claude.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(ccData), `"mcpServers"`) || !strings.Contains(string(ccData), `"llm-memory"`) {
+		t.Errorf("claude-code config unexpected:\n%s", ccData)
+	}
+
+	// OpenCode: writes ~/.config/opencode/opencode.json.
+	runWithHome("setup", "--db", db, "--write", "--ollama", "opencode")
+	ocData, err := os.ReadFile(filepath.Join(home, ".config", "opencode", "opencode.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(ocData), `"type": "local"`) || !strings.Contains(string(ocData), defaultOllamaModel) {
+		t.Errorf("opencode config unexpected:\n%s", ocData)
+	}
+
+	// Codex: appends then updates in-place without clobbering other tables.
+	codexPath := filepath.Join(home, ".codex", "config.toml")
+	if err := os.MkdirAll(filepath.Dir(codexPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	initialTOML := "[mcp_servers.other]\ncommand = \"echo\"\n\n[mcp_servers.llm-memory]\ncommand = \"old\"\nargs = [\"serve\"]\n\n[tui]\ntheme = \"dark\"\n"
+	if err := os.WriteFile(codexPath, []byte(initialTOML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runWithHome("setup", "--db", db, "--namespace", "work", "--write", "codex")
+	codexData, err := os.ReadFile(codexPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	codexStr := string(codexData)
+	if !strings.Contains(codexStr, "[mcp_servers.other]") ||
+		!strings.Contains(codexStr, "[tui]") ||
+		strings.Contains(codexStr, `command = "old"`) ||
+		!strings.Contains(codexStr, `"--namespace", "work"`) {
+		t.Errorf("codex config not updated cleanly:\n%s", codexStr)
+	}
+
+	// VS Code with --config override.
+	vsPath := filepath.Join(home, "proj", ".vscode", "mcp.json")
+	runWithHome("setup", "--db", db, "--write", "--config", vsPath, "vscode")
+	vsData, err := os.ReadFile(vsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(vsData), `"servers"`) || !strings.Contains(string(vsData), `"stdio"`) {
+		t.Errorf("vscode config unexpected:\n%s", vsData)
 	}
 }

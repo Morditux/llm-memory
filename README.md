@@ -50,6 +50,8 @@ All clients launch the same binary with the same database file (by default
 | Antigravity | [examples/antigravity_mcp_config.json](examples/antigravity_mcp_config.json) (`~/.gemini/config/mcp_config.json`) |
 | Claude Desktop | [examples/claude_desktop_config.json](examples/claude_desktop_config.json) |
 | Claude Code | [examples/claude_code.md](examples/claude_code.md) |
+| Codex | [examples/codex_config.toml](examples/codex_config.toml) (`~/.codex/config.toml`) |
+| OpenCode | [examples/opencode.json](examples/opencode.json) (`~/.config/opencode/opencode.json`) |
 | VS Code | [examples/vscode_mcp.json](examples/vscode_mcp.json) (project default namespace) |
 | Internal LLM | same principle if its client supports MCP over stdio; otherwise `llm-memory context` and `llm-memory search` to paste the context by hand |
 
@@ -112,6 +114,8 @@ llm-memory export [--namespace X] [--history] [-o dump.json]
 llm-memory import [--dry-run] dump.json  # or - for stdin; exact duplicates are skipped
 llm-memory stats [--json]                # per namespace, kind, source; file size
 llm-memory backup [--keep N] [--verify] [--json] [<dest>] # hot SQLite backup (VACUUM INTO)
+llm-memory doctor [--json]               # check database integrity, permissions and embeddings
+llm-memory setup [--ollama] [--write] [--config PATH] <client> # print or patch MCP config (antigravity, claude-desktop, claude-code, codex, opencode, vscode)
 llm-memory reindex [--all]               # embeddings (semantic search only)
 llm-memory ui [--addr 127.0.0.1:8765]    # local web explorer (create/edit, diff history, similar/supersede, GC)
 llm-memory serve [--listen 127.0.0.1:8766] [--stateless] [--read-only] # stdio (default) or Streamable HTTP (/mcp, /healthz)

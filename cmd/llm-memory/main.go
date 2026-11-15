@@ -62,10 +62,11 @@ Usage:
   llm-memory namespace <list|rename|merge|archive> ...
                                              manage namespaces
   llm-memory gc                              archive expired (TTL) memories
-  llm-memory doctor                          check database integrity and embeddings endpoint
+  llm-memory doctor [--json]                 check database integrity, permissions and embeddings
   llm-memory backup [--keep N] [--verify] [--json] [<dest>]
                                              hot SQLite backup via VACUUM INTO
-  llm-memory setup <client>                  print MCP configuration for a client
+  llm-memory setup [--ollama] [--write] [--config PATH] <client>
+                                             print or write MCP configuration for a client
   llm-memory ui [--addr 127.0.0.1:8765]      start local web explorer
   llm-memory version                         version and schema version
 

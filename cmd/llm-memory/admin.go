@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -916,9 +917,60 @@ func (a app) cmdGC(ctx context.Context, args []string) error {
 	return nil
 }
 
+type doctorReport struct {
+	OK                bool     `json:"ok"`
+	Binary            string   `json:"binary"`
+	Database          string   `json:"database"`
+	FileBytes         int64    `json:"file_bytes"`
+	Permissions       string   `json:"permissions"`
+	PermissionsWarn   string   `json:"permissions_warning,omitempty"`
+	SchemaVersion     int      `json:"schema_version"`
+	LatestSchema      int      `json:"latest_schema"`
+	Integrity         string   `json:"integrity"`
+	Active            int      `json:"active"`
+	Archived          int      `json:"archived"`
+	ExpiredPendingGC  int      `json:"expired_pending_gc"`
+	Namespace         string   `json:"namespace"`
+	Embeddings        string   `json:"embeddings"`
+	EmbeddingsURL     string   `json:"embeddings_url,omitempty"`
+	EmbeddingsModel   string   `json:"embeddings_model,omitempty"`
+	MissingEmbeddings int      `json:"missing_embeddings,omitempty"`
+	Warnings          []string `json:"warnings,omitempty"`
+}
+
+func checkPrivatePerms(dbPath string) (summary, warning string) {
+	if runtime.GOOS == "windows" {
+		return "n/a (Windows)", ""
+	}
+	dir := filepath.Dir(dbPath)
+	dirFI, dirErr := os.Stat(dir)
+	fileFI, fileErr := os.Stat(dbPath)
+	var parts []string
+	var warns []string
+	if dirErr == nil {
+		m := dirFI.Mode().Perm()
+		parts = append(parts, fmt.Sprintf("dir %04o", m))
+		if m&0o077 != 0 {
+			warns = append(warns, fmt.Sprintf("directory %s is group/world-accessible (%04o, expected 0700)", dir, m))
+		}
+	}
+	if fileErr == nil {
+		m := fileFI.Mode().Perm()
+		parts = append(parts, fmt.Sprintf("file %04o", m))
+		if m&0o077 != 0 {
+			warns = append(warns, fmt.Sprintf("database %s is group/world-accessible (%04o, expected 0600)", dbPath, m))
+		}
+	}
+	if len(parts) == 0 {
+		return "unknown", ""
+	}
+	return strings.Join(parts, ", "), strings.Join(warns, "; ")
+}
+
 func (a app) cmdDoctor(ctx context.Context, args []string) error {
 	fs := a.newFlagSet("doctor")
 	flags := config.Register(fs)
+	asJSON := fs.Bool("json", false, "output as JSON")
 	if _, err := parse(fs, args, 0, 0); err != nil {
 		return err
 	}
@@ -928,8 +980,9 @@ func (a app) cmdDoctor(ctx context.Context, args []string) error {
 	}
 	defer func() { _ = st.Close() }()
 
-	if err := st.IntegrityCheck(ctx); err != nil {
-		return err
+	bin, err := os.Executable()
+	if err != nil || bin == "" {
+		bin = "llm-memory"
 	}
 	sv, err := st.SchemaVersion(ctx)
 	if err != nil {
@@ -939,27 +992,240 @@ func (a app) cmdDoctor(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(a.stdout, "Database:   %s (%s)\n", cfg.DB, humanBytes(stats.FileBytes))
-	fmt.Fprintf(a.stdout, "Schema:     v%d (latest v%d)\n", sv, store.LatestSchemaVersion())
-	fmt.Fprintf(a.stdout, "Integrity:  ok (SQLite + FTS5)\n")
-	fmt.Fprintf(a.stdout, "Memories:   %d active, %d archived\n", stats.Active, stats.Archived)
-	fmt.Fprintf(a.stdout, "Namespace:  %s\n", cfg.Namespace)
+	expired, err := st.CountExpired(ctx, time.Now().UTC())
+	if err != nil {
+		return err
+	}
+
+	permSummary, permWarn := checkPrivatePerms(cfg.DB)
+	rep := doctorReport{
+		OK:               true,
+		Binary:           bin,
+		Database:         cfg.DB,
+		FileBytes:        stats.FileBytes,
+		Permissions:      permSummary,
+		PermissionsWarn:  permWarn,
+		SchemaVersion:    sv,
+		LatestSchema:     store.LatestSchemaVersion(),
+		Integrity:        "ok (SQLite + FTS5)",
+		Active:           stats.Active,
+		Archived:         stats.Archived,
+		ExpiredPendingGC: expired,
+		Namespace:        cfg.Namespace,
+		Embeddings:       "disabled (full-text search only)",
+	}
+	if permWarn != "" {
+		rep.Warnings = append(rep.Warnings, permWarn)
+	}
+	if expired > 0 {
+		rep.Warnings = append(rep.Warnings, fmt.Sprintf("%d expired memories pending gc (run `llm-memory gc`)", expired))
+	}
+
+	var checkErr error
+	if err := st.IntegrityCheck(ctx); err != nil {
+		rep.OK = false
+		rep.Integrity = fmt.Sprintf("error (%v)", err)
+		checkErr = err
+	}
 
 	if cfg.Embed.Enabled() {
+		rep.EmbeddingsURL = cfg.Embed.URL
+		rep.EmbeddingsModel = cfg.Embed.Model
+		missing, mErr := st.CountMissingEmbeddings(ctx, cfg.Embed.Model)
+		if mErr == nil {
+			rep.MissingEmbeddings = missing
+			if missing > 0 {
+				rep.Warnings = append(rep.Warnings, fmt.Sprintf("%d memories missing embeddings (run `llm-memory reindex`)", missing))
+			}
+		}
 		client, err := semantic.NewClient(semantic.ClientConfig{
 			URL: cfg.Embed.URL, Model: cfg.Embed.Model, APIKey: cfg.Embed.APIKey, Timeout: cfg.Embed.Timeout,
 		})
 		if err != nil {
-			fmt.Fprintf(a.stdout, "Embeddings: error (%v)\n", err)
+			rep.OK = false
+			rep.Embeddings = fmt.Sprintf("error (%v)", err)
+			if checkErr == nil {
+				checkErr = err
+			}
+		} else if _, err := client.Embed(ctx, []string{"healthcheck"}); err != nil {
+			rep.OK = false
+			rep.Embeddings = fmt.Sprintf("unreachable (%s, %v)", cfg.Embed.URL, err)
+			if checkErr == nil {
+				checkErr = err
+			}
+		} else {
+			rep.Embeddings = fmt.Sprintf("ok (%s, model %s)", cfg.Embed.URL, cfg.Embed.Model)
+		}
+	}
+
+	if *asJSON {
+		if err := writeJSON(a.stdout, rep); err != nil {
 			return err
 		}
-		if _, err := client.Embed(ctx, []string{"healthcheck"}); err != nil {
-			fmt.Fprintf(a.stdout, "Embeddings: unreachable (%s, %v)\n", cfg.Embed.URL, err)
-			return err
-		}
-		fmt.Fprintf(a.stdout, "Embeddings: ok (%s, model %s)\n", cfg.Embed.URL, cfg.Embed.Model)
+		return checkErr
+	}
+
+	fmt.Fprintf(a.stdout, "Binary:      %s\n", rep.Binary)
+	fmt.Fprintf(a.stdout, "Database:    %s (%s)\n", rep.Database, humanBytes(rep.FileBytes))
+	fmt.Fprintf(a.stdout, "Permissions: %s\n", rep.Permissions)
+	fmt.Fprintf(a.stdout, "Schema:      v%d (latest v%d)\n", rep.SchemaVersion, rep.LatestSchema)
+	fmt.Fprintf(a.stdout, "Integrity:   %s\n", rep.Integrity)
+	fmt.Fprintf(a.stdout, "Memories:    %d active, %d archived (%d expired pending gc)\n", rep.Active, rep.Archived, rep.ExpiredPendingGC)
+	fmt.Fprintf(a.stdout, "Namespace:   %s\n", rep.Namespace)
+	if cfg.Embed.Enabled() {
+		fmt.Fprintf(a.stdout, "Embeddings:  %s (%d missing)\n", rep.Embeddings, rep.MissingEmbeddings)
 	} else {
-		fmt.Fprintf(a.stdout, "Embeddings: disabled (full-text search only)\n")
+		fmt.Fprintf(a.stdout, "Embeddings:  %s\n", rep.Embeddings)
+	}
+	for _, w := range rep.Warnings {
+		fmt.Fprintf(a.stdout, "Warning:     %s\n", w)
+	}
+	return checkErr
+}
+
+const (
+	defaultOllamaURL   = "http://localhost:11434/v1/embeddings"
+	defaultOllamaModel = "nomic-embed-text"
+)
+
+func formatTOMLStringArray(items []string) string {
+	quoted := make([]string, len(items))
+	for i, item := range items {
+		quoted[i] = strconv.Quote(item)
+	}
+	return "[" + strings.Join(quoted, ", ") + "]"
+}
+
+func clientConfigPath(client string, env config.Env) (string, error) {
+	home, err := env.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("resolve home directory: %w", err)
+	}
+	xdgConfig := env.Getenv("XDG_CONFIG_HOME")
+	if xdgConfig == "" {
+		xdgConfig = filepath.Join(home, ".config")
+	}
+	switch client {
+	case "antigravity":
+		return filepath.Join(home, ".gemini", "config", "mcp_config.json"), nil
+	case "claude-desktop":
+		switch runtime.GOOS {
+		case "darwin":
+			return filepath.Join(home, "Library", "Application Support", "Claude", "claude_desktop_config.json"), nil
+		case "windows":
+			appData := env.Getenv("APPDATA")
+			if appData == "" {
+				appData = filepath.Join(home, "AppData", "Roaming")
+			}
+			return filepath.Join(appData, "Claude", "claude_desktop_config.json"), nil
+		default:
+			return filepath.Join(xdgConfig, "Claude", "claude_desktop_config.json"), nil
+		}
+	case "claude-code":
+		return filepath.Join(home, ".claude.json"), nil
+	case "codex":
+		return filepath.Join(home, ".codex", "config.toml"), nil
+	case "opencode":
+		return filepath.Join(xdgConfig, "opencode", "opencode.json"), nil
+	case "vscode":
+		return filepath.Join(".vscode", "mcp.json"), nil
+	default:
+		return "", fmt.Errorf("unknown client %q", client)
+	}
+}
+
+func patchJSONConfig(path, sectionKey, serverName string, entry, defaults map[string]any) error {
+	root := map[string]any{}
+	data, err := os.ReadFile(path)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("read %s: %w", path, err)
+	}
+	if len(strings.TrimSpace(string(data))) > 0 {
+		if err := json.Unmarshal(data, &root); err != nil {
+			return fmt.Errorf("parse %s: %w", path, err)
+		}
+	}
+	for k, v := range defaults {
+		if _, ok := root[k]; !ok {
+			root[k] = v
+		}
+	}
+	var section map[string]any
+	if raw, ok := root[sectionKey]; ok && raw != nil {
+		m, ok := raw.(map[string]any)
+		if !ok {
+			return fmt.Errorf("%s: %q is not a JSON object", path, sectionKey)
+		}
+		section = m
+	} else {
+		section = map[string]any{}
+		root[sectionKey] = section
+	}
+	section[serverName] = entry
+
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("create directory for %s: %w", path, err)
+	}
+	out, err := json.MarshalIndent(root, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode %s: %w", path, err)
+	}
+	out = append(out, '\n')
+	if err := os.WriteFile(path, out, 0o644); err != nil {
+		return fmt.Errorf("write %s: %w", path, err)
+	}
+	return nil
+}
+
+func patchCodexTOML(path, block string) error {
+	data, err := os.ReadFile(path)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("read %s: %w", path, err)
+	}
+	content := strings.ReplaceAll(string(data), "\r\n", "\n")
+	var updated string
+	if strings.TrimSpace(content) == "" {
+		updated = block
+	} else {
+		lines := strings.Split(content, "\n")
+		start := -1
+		end := len(lines)
+		for i, line := range lines {
+			trimmed := strings.TrimSpace(line)
+			if start == -1 {
+				if trimmed == "[mcp_servers.llm-memory]" {
+					start = i
+				}
+				continue
+			}
+			if strings.HasPrefix(trimmed, "[") {
+				end = i
+				break
+			}
+		}
+		if start >= 0 {
+			var rebuilt []string
+			rebuilt = append(rebuilt, lines[:start]...)
+			rebuilt = append(rebuilt, strings.TrimRight(block, "\n"))
+			if end < len(lines) {
+				if strings.TrimSpace(lines[end]) != "" {
+					rebuilt = append(rebuilt, "")
+				}
+				rebuilt = append(rebuilt, lines[end:]...)
+			}
+			updated = strings.Join(rebuilt, "\n")
+			if !strings.HasSuffix(updated, "\n") {
+				updated += "\n"
+			}
+		} else {
+			updated = strings.TrimRight(content, "\n") + "\n\n" + block
+		}
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("create directory for %s: %w", path, err)
+	}
+	if err := os.WriteFile(path, []byte(updated), 0o644); err != nil {
+		return fmt.Errorf("write %s: %w", path, err)
 	}
 	return nil
 }
@@ -967,6 +1233,9 @@ func (a app) cmdDoctor(ctx context.Context, args []string) error {
 func (a app) cmdSetup(_ context.Context, args []string) error {
 	fs := a.newFlagSet("setup")
 	flags := config.Register(fs)
+	ollama := fs.Bool("ollama", false, "include local Ollama embeddings defaults ("+defaultOllamaModel+")")
+	write := fs.Bool("write", false, "patch the client configuration file directly")
+	cfgPath := fs.String("config", "", "override target config file path (with --write)")
 	pos, err := parse(fs, args, 1, 1)
 	if err != nil {
 		return err
@@ -974,6 +1243,14 @@ func (a app) cmdSetup(_ context.Context, args []string) error {
 	cfg, err := flags.Resolve(a.env)
 	if err != nil {
 		return err
+	}
+	if *ollama {
+		if cfg.Embed.URL == "" {
+			cfg.Embed.URL = defaultOllamaURL
+		}
+		if cfg.Embed.Model == "" {
+			cfg.Embed.Model = defaultOllamaModel
+		}
 	}
 	bin, err := os.Executable()
 	if err != nil || bin == "" {
@@ -987,7 +1264,48 @@ func (a app) cmdSetup(_ context.Context, args []string) error {
 		srvArgs = append(srvArgs, "--embed-url", cfg.Embed.URL, "--embed-model", cfg.Embed.Model)
 	}
 
-	switch strings.ToLower(pos[0]) {
+	client := strings.ToLower(pos[0])
+	if *write {
+		target := *cfgPath
+		if target == "" {
+			target, err = clientConfigPath(client, a.env)
+			if err != nil {
+				fmt.Fprintf(a.stderr, "unknown client %q (expected antigravity, claude-desktop, claude-code, codex, opencode or vscode)\n", pos[0])
+				return errUsage
+			}
+		}
+		switch client {
+		case "antigravity", "claude-desktop", "claude-code":
+			entry := map[string]any{"command": bin, "args": srvArgs}
+			if err := patchJSONConfig(target, "mcpServers", "llm-memory", entry, nil); err != nil {
+				return err
+			}
+		case "vscode":
+			entry := map[string]any{"type": "stdio", "command": bin, "args": srvArgs}
+			if err := patchJSONConfig(target, "servers", "llm-memory", entry, nil); err != nil {
+				return err
+			}
+		case "opencode":
+			entry := map[string]any{"type": "local", "command": append([]string{bin}, srvArgs...), "enabled": true}
+			defaults := map[string]any{"$schema": "https://opencode.ai/config.json"}
+			if err := patchJSONConfig(target, "mcp", "llm-memory", entry, defaults); err != nil {
+				return err
+			}
+		case "codex":
+			block := fmt.Sprintf("[mcp_servers.llm-memory]\ncommand = %s\nargs = %s\n",
+				strconv.Quote(bin), formatTOMLStringArray(srvArgs))
+			if err := patchCodexTOML(target, block); err != nil {
+				return err
+			}
+		default:
+			fmt.Fprintf(a.stderr, "unknown client %q (expected antigravity, claude-desktop, claude-code, codex, opencode or vscode)\n", pos[0])
+			return errUsage
+		}
+		fmt.Fprintf(a.stdout, "Updated %s (%s)\n", target, client)
+		return nil
+	}
+
+	switch client {
 	case "antigravity", "claude-desktop":
 		out := map[string]any{
 			"mcpServers": map[string]any{
@@ -1012,8 +1330,25 @@ func (a app) cmdSetup(_ context.Context, args []string) error {
 	case "claude-code":
 		fmt.Fprintf(a.stdout, "claude mcp add llm-memory -- %s %s\n", bin, strings.Join(srvArgs, " "))
 		return nil
+	case "codex":
+		fmt.Fprintf(a.stdout, "[mcp_servers.llm-memory]\ncommand = %s\nargs = %s\n",
+			strconv.Quote(bin), formatTOMLStringArray(srvArgs))
+		return nil
+	case "opencode":
+		cmd := append([]string{bin}, srvArgs...)
+		out := map[string]any{
+			"$schema": "https://opencode.ai/config.json",
+			"mcp": map[string]any{
+				"llm-memory": map[string]any{
+					"type":    "local",
+					"command": cmd,
+					"enabled": true,
+				},
+			},
+		}
+		return writeJSON(a.stdout, out)
 	default:
-		fmt.Fprintf(a.stderr, "unknown client %q (expected antigravity, claude-desktop, claude-code or vscode)\n", pos[0])
+		fmt.Fprintf(a.stderr, "unknown client %q (expected antigravity, claude-desktop, claude-code, codex, opencode or vscode)\n", pos[0])
 		return errUsage
 	}
 }
