@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 )
 
 func historyCount(t *testing.T, s *Store, id int64) int {
@@ -431,5 +432,46 @@ func TestListTagsAndNamespaceDescription(t *testing.T) {
 	got, err = s.List(ctx, ListFilter{Tags: []string{"go", "backend"}})
 	if err != nil || len(got) != 1 || got[0].ID != m1.ID {
 		t.Errorf("List with multiple tags = %+v, %v", got, err)
+	}
+}
+
+func TestExpirationTTL(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	past := time.Now().UTC().Add(-1 * time.Hour)
+	future := time.Now().UTC().Add(24 * time.Hour)
+
+	expired, err := s.Create(ctx, NewMemory{
+		Namespace: "demo", Kind: KindTaskState, Content: "expired task", ExpiresAt: &past,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	valid, err := s.Create(ctx, NewMemory{
+		Namespace: "demo", Kind: KindTaskState, Content: "active task", ExpiresAt: &future,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// List and Search exclude expired memories even before ArchiveExpired runs.
+	listed, err := s.List(ctx, ListFilter{Namespace: "demo"})
+	if err != nil || len(listed) != 1 || listed[0].ID != valid.ID {
+		t.Fatalf("List = %+v, %v; want only valid", listed, err)
+	}
+	found, err := s.Search(ctx, SearchQuery{Query: "task", Namespace: "demo"})
+	if err != nil || len(found) != 1 || found[0].ID != valid.ID {
+		t.Fatalf("Search = %+v, %v; want only valid", found, err)
+	}
+
+	// ArchiveExpired archives only expired memories.
+	n, err := s.ArchiveExpired(ctx, time.Now().UTC(), "ttl")
+	if err != nil || n != 1 {
+		t.Fatalf("ArchiveExpired = %d, %v; want 1", n, err)
+	}
+	got, err := s.Get(ctx, expired.ID)
+	if err != nil || !got.Archived() {
+		t.Fatalf("expired memory after gc: archived=%v, err=%v", got.Archived(), err)
 	}
 }

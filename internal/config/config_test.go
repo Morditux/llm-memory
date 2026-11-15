@@ -5,6 +5,7 @@ import (
 	"flag"
 	"io"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -173,5 +174,66 @@ func TestResolveEmbed(t *testing.T) {
 		if _, err := resolve(t, args, nil); err == nil {
 			t.Errorf("%v: expected error", args)
 		}
+	}
+}
+
+func TestDetectNamespace(t *testing.T) {
+	root := t.TempDir()
+
+	// 1. Plain directory without markers -> global.
+	plain := filepath.Join(root, "plain")
+	if err := os.MkdirAll(plain, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := DetectNamespace(plain); got != DefaultNamespace {
+		t.Errorf("plain = %q, want %q", got, DefaultNamespace)
+	}
+
+	// 2. Git repo fallback -> normalized repo directory name.
+	repo := filepath.Join(root, "My_Cool.Repo")
+	sub := filepath.Join(repo, "pkg", "sub")
+	if err := os.MkdirAll(filepath.Join(repo, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := DetectNamespace(sub); got != "my-cool-repo" {
+		t.Errorf("git repo = %q, want my-cool-repo", got)
+	}
+
+	// 3. .llm-memory.yml overrides .git.
+	if err := os.WriteFile(filepath.Join(repo, ".llm-memory.yml"), []byte("# comment\nnamespace: \"Custom App\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := DetectNamespace(sub); got != "custom-app" {
+		t.Errorf(".llm-memory.yml = %q, want custom-app", got)
+	}
+
+	// 4. .llm-memory takes priority over .llm-memory.yml.
+	if err := os.WriteFile(filepath.Join(sub, ".llm-memory"), []byte("# header\nSub Service\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := DetectNamespace(sub); got != "sub-service" {
+		t.Errorf(".llm-memory = %q, want sub-service", got)
+	}
+
+	// 5. Resolve with --namespace auto.
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	f := Register(fs)
+	if err := fs.Parse([]string{"--namespace", "auto"}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := f.Resolve(Env{
+		Getenv:      func(string) string { return "" },
+		UserHomeDir: func() (string, error) { return "/home/test", nil },
+		Getwd:       func() (string, error) { return sub, nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Namespace != "sub-service" {
+		t.Errorf("Resolve(--namespace auto) = %q, want sub-service", cfg.Namespace)
 	}
 }

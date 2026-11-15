@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -32,6 +33,7 @@ const (
 // Defaults.
 const (
 	DefaultNamespace = "global"
+	AutoNamespace    = "auto"
 	DefaultLogLevel  = "info"
 	defaultDBRel     = ".llm-memory/memory.db"
 )
@@ -94,6 +96,7 @@ func Register(fs *flag.FlagSet) *Flags {
 type Env struct {
 	Getenv      func(string) string
 	UserHomeDir func() (string, error)
+	Getwd       func() (string, error)
 }
 
 // Resolve applies flag > env > default. It must be called after fs.Parse.
@@ -126,6 +129,17 @@ func (f *Flags) Resolve(env Env) (Config, error) {
 	cfg.Namespace = pick("namespace", f.namespace, EnvNamespace, DefaultNamespace)
 	if strings.TrimSpace(cfg.Namespace) == "" {
 		return Config{}, errors.New("namespace must not be empty")
+	}
+	if strings.EqualFold(strings.TrimSpace(cfg.Namespace), AutoNamespace) {
+		getwd := env.Getwd
+		if getwd == nil {
+			getwd = os.Getwd
+		}
+		if wd, werr := getwd(); werr == nil && wd != "" {
+			cfg.Namespace = DetectNamespace(wd)
+		} else {
+			cfg.Namespace = DefaultNamespace
+		}
 	}
 	cfg.Source = strings.TrimSpace(pick("source", f.source, EnvSource, ""))
 
@@ -197,4 +211,89 @@ func expandHome(p string, home func() (string, error)) (string, error) {
 		return h, nil
 	}
 	return filepath.Join(h, p[2:]), nil
+}
+
+// DetectNamespace walks up from dir looking for a .llm-memory or .llm-memory.yml
+// marker file, then a .git root whose directory name becomes the namespace.
+// Falls back to DefaultNamespace when nothing matches.
+func DetectNamespace(dir string) string {
+	cur := filepath.Clean(dir)
+	for {
+		if ns := readNamespaceFile(filepath.Join(cur, ".llm-memory")); ns != "" {
+			return ns
+		}
+		if ns := readNamespaceYAML(filepath.Join(cur, ".llm-memory.yml")); ns != "" {
+			return ns
+		}
+		if _, err := os.Stat(filepath.Join(cur, ".git")); err == nil {
+			if ns := sanitizeNamespace(filepath.Base(cur)); ns != "" {
+				return ns
+			}
+			return DefaultNamespace
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			break
+		}
+		cur = parent
+	}
+	return DefaultNamespace
+}
+
+func readNamespaceFile(path string) string {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	for line := range strings.SplitSeq(string(b), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		return sanitizeNamespace(line)
+	}
+	return ""
+}
+
+func readNamespaceYAML(path string) string {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	for line := range strings.SplitSeq(string(b), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if after, ok := strings.CutPrefix(line, "namespace:"); ok {
+			val := strings.TrimSpace(after)
+			val = strings.Trim(val, `"'`)
+			return sanitizeNamespace(val)
+		}
+	}
+	return ""
+}
+
+func sanitizeNamespace(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	var b strings.Builder
+	prevDash := false
+	for _, r := range s {
+		isAlnum := (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9')
+		if isAlnum {
+			b.WriteRune(r)
+			prevDash = false
+		} else if !prevDash && b.Len() > 0 {
+			b.WriteByte('-')
+			prevDash = true
+		}
+		if b.Len() >= 64 {
+			break
+		}
+	}
+	out := strings.TrimRight(b.String(), "-")
+	if out == "" {
+		return ""
+	}
+	return out
 }

@@ -588,3 +588,44 @@ func TestCLIWriteCommandsAndJSON(t *testing.T) {
 		t.Errorf("empty search --json = %q", emptySearch)
 	}
 }
+
+func TestCLIAxes1And2(t *testing.T) {
+	db := filepath.Join(t.TempDir(), "mem.db")
+
+	// remember with --expires-in and namespace commands.
+	cliOK(t, "remember", "--db", db, "--namespace", "alpha", "--kind", "note", "--expires-in", "7d", "temporary note")
+	cliOK(t, "remember", "--db", db, "--namespace", "alpha", "--kind", "fact", "persistent fact")
+
+	nsOut := cliOK(t, "namespace", "list", "--db", db)
+	if !strings.Contains(nsOut, "alpha") {
+		t.Errorf("namespace list missing alpha:\n%s", nsOut)
+	}
+	cliOK(t, "namespace", "rename", "--db", db, "alpha", "beta")
+	cliOK(t, "namespace", "merge", "--db", db, "beta", "gamma")
+	cliOK(t, "namespace", "archive", "--db", db, "gamma")
+
+	// context --focus.
+	cliOK(t, "remember", "--db", db, "--namespace", "proj", "--kind", "note", "--title", "Redis", "Redis runs on 6379")
+	ctxOut := cliOK(t, "context", "--db", db, "--namespace", "proj", "--focus", "redis")
+	if !strings.Contains(ctxOut, `Relevant to "redis"`) {
+		t.Errorf("context --focus missing relevant section:\n%s", ctxOut)
+	}
+
+	// gc, doctor, setup.
+	gcOut := cliOK(t, "gc", "--db", db)
+	if !strings.Contains(gcOut, "Archived 0 expired") {
+		t.Errorf("gc output = %q", gcOut)
+	}
+	docOut := cliOK(t, "doctor", "--db", db)
+	if !strings.Contains(docOut, "Integrity:  ok") {
+		t.Errorf("doctor output:\n%s", docOut)
+	}
+	setupOut := cliOK(t, "setup", "--db", db, "antigravity")
+	if !strings.Contains(setupOut, "mcpServers") {
+		t.Errorf("setup antigravity output:\n%s", setupOut)
+	}
+	setupCC := cliOK(t, "setup", "--db", db, "claude-code")
+	if !strings.Contains(setupCC, "claude mcp add llm-memory") {
+		t.Errorf("setup claude-code output:\n%s", setupCC)
+	}
+}

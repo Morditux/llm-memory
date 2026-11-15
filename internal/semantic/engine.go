@@ -8,6 +8,7 @@ import (
 	"math"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/Morditux/llm-memory/internal/store"
 )
@@ -264,4 +265,46 @@ func truncate(r []store.SearchResult, n int) []store.SearchResult {
 // Describe is a one-line summary for logs and the CLI.
 func (e *Engine) Describe() string {
 	return fmt.Sprintf("model %s, min score %.2f", e.emb.Model(), e.minScore)
+}
+
+// FindSimilar returns active memories in namespace whose cosine similarity to
+// text is at least minScore (default 0.75 if <= 0). API failures are logged and
+// ignored so writes never depend on the embeddings endpoint.
+func (e *Engine) FindSimilar(ctx context.Context, text, namespace string, minScore float64, limit int) ([]store.Similar, error) {
+	if strings.TrimSpace(text) == "" || limit <= 0 {
+		return nil, nil
+	}
+	if minScore <= 0 {
+		minScore = max(e.minScore, 0.75)
+	}
+	qv, err := e.emb.Embed(ctx, []string{text})
+	if err != nil {
+		e.log.WarnContext(ctx, "semantic: duplicate check failed, skipping", "err", err)
+		return nil, nil
+	}
+	vecs, err := e.store.Vectors(ctx, e.emb.Model(), store.VectorFilter{Namespace: namespace})
+	if err != nil {
+		return nil, err
+	}
+	nearest := rankByCosine(qv[0], vecs, minScore, limit)
+	now := time.Now().UTC()
+	out := make([]store.Similar, 0, len(nearest))
+	for _, s := range nearest {
+		m, err := e.store.Get(ctx, s.id)
+		if err != nil || m.Archived() || m.Expired(now) {
+			continue
+		}
+		snip := strings.TrimSpace(m.Content)
+		if r := []rune(snip); len(r) > 160 {
+			snip = string(r[:160]) + "…"
+		}
+		out = append(out, store.Similar{
+			ID:         m.ID,
+			Kind:       m.Kind,
+			Title:      m.Title,
+			Snippet:    snip,
+			Similarity: s.score,
+		})
+	}
+	return out, nil
 }

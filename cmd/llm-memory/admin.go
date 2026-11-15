@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
@@ -16,8 +18,10 @@ import (
 	"time"
 
 	"github.com/Morditux/llm-memory/internal/config"
+	"github.com/Morditux/llm-memory/internal/semantic"
 	"github.com/Morditux/llm-memory/internal/server"
 	"github.com/Morditux/llm-memory/internal/store"
+	"github.com/Morditux/llm-memory/internal/ui"
 )
 
 const (
@@ -607,6 +611,7 @@ func (a app) cmdRemember(ctx context.Context, args []string) error {
 	tags := fs.String("tag", "", "comma-separated tags")
 	importance := fs.Int("importance", store.DefaultImportance, "1 (low), 2 (normal), 3 (essential)")
 	supersedes := fs.String("supersedes", "", "comma-separated IDs to archive")
+	expiresIn := fs.String("expires-in", "", "optional TTL duration (e.g. 24h, 7d)")
 	asJSON := fs.Bool("json", false, "output as JSON")
 	pos, err := parse(fs, args, 1, -1)
 	if err != nil {
@@ -618,6 +623,10 @@ func (a app) cmdRemember(ctx context.Context, args []string) error {
 	}
 	if store.Kind(*kind) == store.KindHandoff {
 		return errors.New("use `llm-memory handoff` for handoffs")
+	}
+	exp, err := parseCLIExpiration(*expiresIn)
+	if err != nil {
+		return err
 	}
 	supIDs, err := parseIDList(*supersedes)
 	if err != nil {
@@ -641,6 +650,7 @@ func (a app) cmdRemember(ctx context.Context, args []string) error {
 		Importance: *importance,
 		Source:     cliActor(cfg),
 		Supersedes: supIDs,
+		ExpiresAt:  exp,
 	})
 	if err != nil {
 		return err
@@ -759,4 +769,293 @@ func humanBytes(n int64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
+}
+
+func parseCLIExpiration(s string) (*time.Time, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil, nil
+	}
+	if strings.HasSuffix(s, "d") {
+		days, err := strconv.Atoi(strings.TrimSuffix(s, "d"))
+		if err != nil || days <= 0 {
+			return nil, fmt.Errorf("invalid --expires-in duration %q", s)
+		}
+		t := time.Now().UTC().Add(time.Duration(days) * 24 * time.Hour)
+		return &t, nil
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil || d <= 0 {
+		return nil, fmt.Errorf("invalid --expires-in duration %q", s)
+	}
+	t := time.Now().UTC().Add(d)
+	return &t, nil
+}
+
+// ---- namespace / gc / doctor / setup / ui ----------------------------------
+
+func (a app) cmdNamespace(ctx context.Context, args []string) error {
+	if len(args) == 0 {
+		fmt.Fprintln(a.stderr, "Usage: llm-memory namespace <list|rename|merge|archive> [args]")
+		return errUsage
+	}
+	sub, rest := args[0], args[1:]
+	switch sub {
+	case "list":
+		fs := a.newFlagSet("namespace list")
+		flags := config.Register(fs)
+		asJSON := fs.Bool("json", false, "output as JSON")
+		if _, err := parse(fs, rest, 0, 0); err != nil {
+			return err
+		}
+		st, _, err := a.openStore(ctx, flags)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = st.Close() }()
+		nss, err := st.ListNamespaces(ctx)
+		if err != nil {
+			return err
+		}
+		if *asJSON {
+			return writeJSON(a.stdout, nss)
+		}
+		tw := tabwriter.NewWriter(a.stdout, 0, 4, 2, ' ', 0)
+		fmt.Fprintln(tw, "NAME\tACTIVE\tLAST ACTIVITY\tDESCRIPTION")
+		for _, n := range nss {
+			last := "-"
+			if n.LastActivity != nil {
+				last = n.LastActivity.Local().Format(cliDate)
+			}
+			fmt.Fprintf(tw, "%s\t%d\t%s\t%s\n", n.Name, n.ActiveCount, last, n.Description)
+		}
+		return tw.Flush()
+	case "rename":
+		fs := a.newFlagSet("namespace rename")
+		flags := config.Register(fs)
+		pos, err := parse(fs, rest, 2, 2)
+		if err != nil {
+			return err
+		}
+		st, _, err := a.openStore(ctx, flags)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = st.Close() }()
+		ns, err := st.RenameNamespace(ctx, pos[0], pos[1])
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(a.stdout, "Renamed namespace %q to %q\n", pos[0], ns)
+		return nil
+	case "merge":
+		fs := a.newFlagSet("namespace merge")
+		flags := config.Register(fs)
+		pos, err := parse(fs, rest, 2, 2)
+		if err != nil {
+			return err
+		}
+		st, cfg, err := a.openStore(ctx, flags)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = st.Close() }()
+		moved, err := st.MergeNamespace(ctx, pos[0], pos[1], cliActor(cfg))
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(a.stdout, "Merged %q into %q (%d memories moved)\n", pos[0], pos[1], moved)
+		return nil
+	case "archive":
+		fs := a.newFlagSet("namespace archive")
+		flags := config.Register(fs)
+		reason := fs.String("reason", "", "archive reason recorded in history")
+		pos, err := parse(fs, rest, 1, 1)
+		if err != nil {
+			return err
+		}
+		st, cfg, err := a.openStore(ctx, flags)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = st.Close() }()
+		n, err := st.ArchiveNamespace(ctx, pos[0], cliActor(cfg), *reason)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(a.stdout, "Archived %d memories in namespace %q\n", n, pos[0])
+		return nil
+	default:
+		fmt.Fprintf(a.stderr, "unknown namespace subcommand %q (expected list, rename, merge or archive)\n", sub)
+		return errUsage
+	}
+}
+
+func (a app) cmdGC(ctx context.Context, args []string) error {
+	fs := a.newFlagSet("gc")
+	flags := config.Register(fs)
+	asJSON := fs.Bool("json", false, "output as JSON")
+	if _, err := parse(fs, args, 0, 0); err != nil {
+		return err
+	}
+	st, cfg, err := a.openStore(ctx, flags)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = st.Close() }()
+	n, err := st.ArchiveExpired(ctx, time.Now().UTC(), cliActor(cfg))
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		return writeJSON(a.stdout, map[string]int64{"archived": n})
+	}
+	fmt.Fprintf(a.stdout, "Archived %d expired memories\n", n)
+	return nil
+}
+
+func (a app) cmdDoctor(ctx context.Context, args []string) error {
+	fs := a.newFlagSet("doctor")
+	flags := config.Register(fs)
+	if _, err := parse(fs, args, 0, 0); err != nil {
+		return err
+	}
+	st, cfg, err := a.openStore(ctx, flags)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = st.Close() }()
+
+	if err := st.IntegrityCheck(ctx); err != nil {
+		return err
+	}
+	sv, err := st.SchemaVersion(ctx)
+	if err != nil {
+		return err
+	}
+	stats, err := st.Stats(ctx)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(a.stdout, "Database:   %s (%s)\n", cfg.DB, humanBytes(stats.FileBytes))
+	fmt.Fprintf(a.stdout, "Schema:     v%d (latest v%d)\n", sv, store.LatestSchemaVersion())
+	fmt.Fprintf(a.stdout, "Integrity:  ok (SQLite + FTS5)\n")
+	fmt.Fprintf(a.stdout, "Memories:   %d active, %d archived\n", stats.Active, stats.Archived)
+	fmt.Fprintf(a.stdout, "Namespace:  %s\n", cfg.Namespace)
+
+	if cfg.Embed.Enabled() {
+		client, err := semantic.NewClient(semantic.ClientConfig{
+			URL: cfg.Embed.URL, Model: cfg.Embed.Model, APIKey: cfg.Embed.APIKey, Timeout: cfg.Embed.Timeout,
+		})
+		if err != nil {
+			fmt.Fprintf(a.stdout, "Embeddings: error (%v)\n", err)
+			return err
+		}
+		if _, err := client.Embed(ctx, []string{"healthcheck"}); err != nil {
+			fmt.Fprintf(a.stdout, "Embeddings: unreachable (%s, %v)\n", cfg.Embed.URL, err)
+			return err
+		}
+		fmt.Fprintf(a.stdout, "Embeddings: ok (%s, model %s)\n", cfg.Embed.URL, cfg.Embed.Model)
+	} else {
+		fmt.Fprintf(a.stdout, "Embeddings: disabled (full-text search only)\n")
+	}
+	return nil
+}
+
+func (a app) cmdSetup(_ context.Context, args []string) error {
+	fs := a.newFlagSet("setup")
+	flags := config.Register(fs)
+	pos, err := parse(fs, args, 1, 1)
+	if err != nil {
+		return err
+	}
+	cfg, err := flags.Resolve(a.env)
+	if err != nil {
+		return err
+	}
+	bin, err := os.Executable()
+	if err != nil || bin == "" {
+		bin = "llm-memory"
+	}
+	srvArgs := []string{"serve", "--db", cfg.DB}
+	if cfg.Namespace != config.DefaultNamespace {
+		srvArgs = append(srvArgs, "--namespace", cfg.Namespace)
+	}
+	if cfg.Embed.Enabled() {
+		srvArgs = append(srvArgs, "--embed-url", cfg.Embed.URL, "--embed-model", cfg.Embed.Model)
+	}
+
+	switch strings.ToLower(pos[0]) {
+	case "antigravity", "claude-desktop":
+		out := map[string]any{
+			"mcpServers": map[string]any{
+				"llm-memory": map[string]any{
+					"command": bin,
+					"args":    srvArgs,
+				},
+			},
+		}
+		return writeJSON(a.stdout, out)
+	case "vscode":
+		out := map[string]any{
+			"servers": map[string]any{
+				"llm-memory": map[string]any{
+					"type":    "stdio",
+					"command": bin,
+					"args":    srvArgs,
+				},
+			},
+		}
+		return writeJSON(a.stdout, out)
+	case "claude-code":
+		fmt.Fprintf(a.stdout, "claude mcp add llm-memory -- %s %s\n", bin, strings.Join(srvArgs, " "))
+		return nil
+	default:
+		fmt.Fprintf(a.stderr, "unknown client %q (expected antigravity, claude-desktop, claude-code or vscode)\n", pos[0])
+		return errUsage
+	}
+}
+
+func (a app) cmdUI(ctx context.Context, args []string) error {
+	fs := a.newFlagSet("ui")
+	flags := config.Register(fs)
+	addr := fs.String("addr", "127.0.0.1:8765", "listen address")
+	if _, err := parse(fs, args, 0, 0); err != nil {
+		return err
+	}
+	st, cfg, err := a.openStore(ctx, flags)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = st.Close() }()
+
+	logger := slog.New(slog.NewTextHandler(a.stderr, &slog.HandlerOptions{Level: cfg.LogLevel}))
+	eng, err := newEngine(st, cfg, logger)
+	if err != nil {
+		return err
+	}
+	var searcher ui.Searcher = st
+	if eng != nil {
+		searcher = eng
+	}
+
+	ln, err := net.Listen("tcp", *addr)
+	if err != nil {
+		return fmt.Errorf("listen %s: %w", *addr, err)
+	}
+	fmt.Fprintf(a.stdout, "llm-memory UI listening on http://%s\n", ln.Addr().String())
+	srv := &http.Server{
+		Handler:           ui.NewHandler(st, searcher),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	go func() {
+		<-ctx.Done()
+		shutCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutCtx)
+	}()
+	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return err
+	}
+	return nil
 }

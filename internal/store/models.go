@@ -59,10 +59,16 @@ type Memory struct {
 	UpdatedAt  time.Time  `json:"updated_at"`
 	UpdatedBy  string     `json:"updated_by"`
 	ArchivedAt *time.Time `json:"archived_at,omitempty"`
+	ExpiresAt  *time.Time `json:"expires_at,omitempty"`
 }
 
 // Archived reports whether the memory is archived.
 func (m Memory) Archived() bool { return m.ArchivedAt != nil }
+
+// Expired reports whether the memory has an expiration timestamp in the past.
+func (m Memory) Expired(now time.Time) bool {
+	return m.ExpiresAt != nil && !m.ExpiresAt.After(now)
+}
 
 // Action is a history action.
 type Action string

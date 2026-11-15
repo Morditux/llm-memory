@@ -233,3 +233,24 @@ func TestHandoffTruncatedOnSmallBudget(t *testing.T) {
 		t.Errorf("truncated handoff should point to get_memory:\n%s", out)
 	}
 }
+
+func TestBuildFocus(t *testing.T) {
+	s := newStore(t)
+	note := mustCreate(t, s, store.NewMemory{
+		Namespace: "demo",
+		Kind:      store.KindNote,
+		Title:     "Redis cache",
+		Content:   "Redis cluster runs on port 6379 with TLS",
+	})
+	out := build(t, s, Options{Namespace: "demo", Focus: "redis"})
+	if !strings.Contains(out, `## Relevant to "redis"`) {
+		t.Fatalf("missing focus section in:\n%s", out)
+	}
+	if !strings.Contains(out, fmt.Sprintf("#%d", note.ID)) {
+		t.Errorf("missing focused note #%d in:\n%s", note.ID, out)
+	}
+	// Focused note should not be counted as unshown note.
+	if strings.Contains(out, "not shown: use recall (kinds: note)") {
+		t.Errorf("focused note should be marked shown:\n%s", out)
+	}
+}

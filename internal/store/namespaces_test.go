@@ -87,3 +87,68 @@ func TestNamespaces(t *testing.T) {
 		t.Errorf("last activity %v, want archive time %v", demo.LastActivity, archived.UpdatedAt)
 	}
 }
+
+func TestNamespaceRenameMergeArchive(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+
+	// Cannot rename or merge global.
+	if _, err := s.RenameNamespace(ctx, "global", "other"); err == nil {
+		t.Error("expected error renaming global")
+	}
+	if _, err := s.MergeNamespace(ctx, "global", "other", "cli"); err == nil {
+		t.Error("expected error merging global")
+	}
+
+	// Create two namespaces with memories and handoffs.
+	m1, err := s.Create(ctx, NewMemory{Namespace: "alpha", Kind: KindFact, Content: "fact alpha"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h1, err := s.Create(ctx, NewMemory{Namespace: "alpha", Kind: KindHandoff, Content: "handoff alpha"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.Create(ctx, NewMemory{Namespace: "beta", Kind: KindHandoff, Content: "handoff beta"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Rename alpha -> gamma.
+	got, err := s.RenameNamespace(ctx, "alpha", "gamma")
+	if err != nil || got != "gamma" {
+		t.Fatalf("RenameNamespace = %q, %v", got, err)
+	}
+	m1After, err := s.Get(ctx, m1.ID)
+	if err != nil || m1After.Namespace != "gamma" {
+		t.Fatalf("m1 namespace = %q, %v", m1After.Namespace, err)
+	}
+	// Cannot rename onto existing beta.
+	if _, err := s.RenameNamespace(ctx, "gamma", "beta"); err == nil {
+		t.Error("expected error renaming onto existing namespace")
+	}
+
+	// Merge gamma into beta: h1 and beta's handoff -> only one active handoff remains.
+	moved, err := s.MergeNamespace(ctx, "gamma", "beta", "cli")
+	if err != nil || moved != 2 {
+		t.Fatalf("MergeNamespace = %d, %v", moved, err)
+	}
+	if _, err := s.RequireNamespace(ctx, "gamma"); err == nil {
+		t.Error("gamma should have been deleted after merge")
+	}
+	handoffs, err := s.List(ctx, ListFilter{Namespace: "beta", Kinds: []Kind{KindHandoff}})
+	if err != nil || len(handoffs) != 1 {
+		t.Fatalf("active handoffs in beta = %d, %v", len(handoffs), err)
+	}
+	_ = h1
+
+	// Archive all active memories in beta.
+	archivedCount, err := s.ArchiveNamespace(ctx, "beta", "cli", "")
+	if err != nil || archivedCount != 2 {
+		t.Fatalf("ArchiveNamespace = %d, %v", archivedCount, err)
+	}
+	active, err := s.List(ctx, ListFilter{Namespace: "beta"})
+	if err != nil || len(active) != 0 {
+		t.Fatalf("active in beta after archive = %d, %v", len(active), err)
+	}
+}

@@ -26,6 +26,7 @@ const (
 type Options struct {
 	Namespace string // default "global"
 	MaxChars  int    // default 6000, minimum 400
+	Focus     string // optional topic/query to prioritize relevant memories
 }
 
 // Build loads the namespace and renders its briefing. If a valid namespace does
@@ -40,7 +41,7 @@ func Build(ctx context.Context, st *store.Store, opt Options) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	d := data{namespace: ns}
+	d := data{namespace: ns, focus: strings.TrimSpace(opt.Focus)}
 	_, reqErr := st.RequireNamespace(ctx, ns)
 	var nf *store.NamespaceNotFoundError
 	switch {
@@ -54,6 +55,14 @@ func Build(ctx context.Context, st *store.Store, opt Options) (string, error) {
 		}
 		if len(last) > 0 {
 			d.last = &last[0]
+		}
+		if d.focus != "" {
+			res, serr := st.Search(ctx, store.SearchQuery{Query: d.focus, Namespace: ns, Limit: maxRecent})
+			if serr == nil {
+				for _, r := range res {
+					d.relevant = append(d.relevant, r.Memory)
+				}
+			}
 		}
 	case errors.As(reqErr, &nf):
 		// Namespace has no memories yet: render an empty briefing without creating it.
@@ -80,8 +89,10 @@ func Build(ctx context.Context, st *store.Store, opt Options) (string, error) {
 // data is everything render needs; render itself does no I/O.
 type data struct {
 	namespace string
+	focus     string
 	active    []store.Memory // active memories of the namespace, most recent first
 	global    []store.Memory // active memories of "global" (empty when namespace is global)
+	relevant  []store.Memory // active memories matching focus
 	last      *store.Memory  // most recently written memory of the namespace, archived included
 	others    []store.Namespace
 }
@@ -139,6 +150,18 @@ func render(d data, maxChars int) string {
 		}
 	}
 	w.section("Essential (importance 3)", imp, 0, "")
+
+	// 3b. Contextualized focus results, if requested.
+	if d.focus != "" && len(d.relevant) > 0 {
+		var rel []string
+		for _, m := range d.relevant {
+			if !shown[m.ID] {
+				shown[m.ID] = true
+				rel = append(rel, item(m, fmt.Sprintf("[%s] ", m.Kind), false))
+			}
+		}
+		w.section(fmt.Sprintf("Relevant to %q", d.focus), rel, 0, "")
+	}
 
 	// 4. Active task states.
 	tasks, _ := pick(d.active, store.KindTaskState, shown, -1, false)

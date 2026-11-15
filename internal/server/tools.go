@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -32,6 +33,7 @@ type MemoryView struct {
 	UpdatedAt  string   `json:"updated_at"`
 	UpdatedBy  string   `json:"updated_by" jsonschema:"Client that last changed the memory."`
 	ArchivedAt string   `json:"archived_at,omitempty" jsonschema:"Set when the memory is archived (forgotten)."`
+	ExpiresAt  string   `json:"expires_at,omitempty" jsonschema:"Optional expiration timestamp (RFC 3339)."`
 }
 
 func viewOf(m store.Memory) MemoryView {
@@ -46,6 +48,9 @@ func viewOf(m store.Memory) MemoryView {
 	if m.ArchivedAt != nil {
 		v.ArchivedAt = ts(*m.ArchivedAt)
 	}
+	if m.ExpiresAt != nil {
+		v.ExpiresAt = ts(*m.ExpiresAt)
+	}
 	return v
 }
 
@@ -57,11 +62,12 @@ func ts(t time.Time) string { return t.UTC().Format(time.RFC3339) }
 type GetContextInput struct {
 	Namespace string `json:"namespace,omitempty" jsonschema:"Project namespace (e.g. the repository name). Omit to use the server default."`
 	MaxChars  int    `json:"max_chars,omitempty" jsonschema:"Character budget of the briefing. Default 6000."`
+	Focus     string `json:"focus,omitempty" jsonschema:"Optional topic or query to surface relevant memories in the briefing."`
 }
 
 func (s *srv) getContext(ctx context.Context, req *mcp.CallToolRequest, in GetContextInput) (*mcp.CallToolResult, any, error) {
 	ns := s.namespace(in.Namespace)
-	text, err := briefing.Build(ctx, s.store, briefing.Options{Namespace: ns, MaxChars: in.MaxChars})
+	text, err := briefing.Build(ctx, s.store, briefing.Options{Namespace: ns, MaxChars: in.MaxChars, Focus: in.Focus})
 	if err != nil {
 		return nil, nil, s.toolError(ctx, req, "get_context", err)
 	}
@@ -80,6 +86,8 @@ type RememberInput struct {
 	Tags       []string `json:"tags,omitempty" jsonschema:"Lowercase keywords that help recall."`
 	Importance int      `json:"importance,omitempty" jsonschema:"1 = low, 2 = normal (default), 3 = essential: always shown by get_context. Use 3 sparingly."`
 	Supersedes []int64  `json:"supersedes,omitempty" jsonschema:"IDs of memories this one replaces; they are archived in the same operation."`
+	ExpiresIn  string   `json:"expires_in,omitempty" jsonschema:"Optional TTL duration (e.g. 24h, 7d) after which the memory expires."`
+	ExpiresAt  string   `json:"expires_at,omitempty" jsonschema:"Optional RFC 3339 expiration timestamp."`
 }
 
 // DuplicateView is a probable duplicate reported by remember.
@@ -103,18 +111,32 @@ func (s *srv) remember(ctx context.Context, req *mcp.CallToolRequest, in Remembe
 	ns := s.namespace(in.Namespace)
 	src := s.source(req)
 
+	exp, err := parseExpiration(in.ExpiresIn, in.ExpiresAt)
+	if err != nil {
+		return nil, RememberOutput{}, s.toolError(ctx, req, "remember", err)
+	}
+
 	// Duplicates are searched before insertion, among active memories of the
 	// target namespace, ignoring the ones being superseded.
-	sims, err := s.store.FindSimilar(ctx, in.Title+" "+in.Content, ns, 3, 0)
+	queryText := strings.TrimSpace(in.Title + " " + in.Content)
+	sims, err := s.store.FindSimilar(ctx, queryText, ns, 3, 0)
 	if err != nil {
 		var ve *store.ValidationError
 		if !errors.As(err, &ve) { // invalid namespace is reported by Create below
 			return nil, RememberOutput{}, s.toolError(ctx, req, "remember", err)
 		}
 	}
+	if sf, ok := s.search.(interface {
+		FindSimilar(ctx context.Context, text, namespace string, minScore float64, limit int) ([]store.Similar, error)
+	}); ok && s.semantic {
+		if sems, serr := sf.FindSimilar(ctx, queryText, ns, 0, 3); serr == nil {
+			sims = mergeSimilar(sims, sems, 3)
+		}
+	}
 	m, archived, err := s.store.CreateDetailed(ctx, store.NewMemory{
 		Namespace: ns, Kind: store.Kind(in.Kind), Title: in.Title, Content: in.Content,
 		Tags: in.Tags, Importance: in.Importance, Source: src, Supersedes: in.Supersedes,
+		ExpiresAt: exp,
 	})
 	if err != nil {
 		return nil, RememberOutput{}, s.toolError(ctx, req, "remember", err)
@@ -257,13 +279,16 @@ func (s *srv) getMemory(ctx context.Context, req *mcp.CallToolRequest, in GetMem
 
 // UpdateMemoryInput is the input of update_memory. Omitted fields are unchanged.
 type UpdateMemoryInput struct {
-	ID         int64     `json:"id" jsonschema:"Memory ID to change."`
-	Content    *string   `json:"content,omitempty" jsonschema:"New full content (replaces the old one; the old version stays in history)."`
-	Title      *string   `json:"title,omitempty" jsonschema:"New one-line title; empty string removes it."`
-	Tags       *[]string `json:"tags,omitempty" jsonschema:"New complete tag list (replaces the old one)."`
-	Importance *int      `json:"importance,omitempty" jsonschema:"1 = low, 2 = normal, 3 = always shown by get_context."`
-	Kind       *string   `json:"kind,omitempty" jsonschema:"New kind."`
-	Namespace  *string   `json:"namespace,omitempty" jsonschema:"Move to this namespace (created if new)."`
+	ID           int64     `json:"id" jsonschema:"Memory ID to change."`
+	Content      *string   `json:"content,omitempty" jsonschema:"New full content (replaces the old one; the old version stays in history)."`
+	Title        *string   `json:"title,omitempty" jsonschema:"New one-line title; empty string removes it."`
+	Tags         *[]string `json:"tags,omitempty" jsonschema:"New complete tag list (replaces the old one)."`
+	Importance   *int      `json:"importance,omitempty" jsonschema:"1 = low, 2 = normal, 3 = always shown by get_context."`
+	Kind         *string   `json:"kind,omitempty" jsonschema:"New kind."`
+	Namespace    *string   `json:"namespace,omitempty" jsonschema:"Move to this namespace (created if new)."`
+	ExpiresIn    string    `json:"expires_in,omitempty" jsonschema:"New TTL duration (e.g. 24h, 7d)."`
+	ExpiresAt    string    `json:"expires_at,omitempty" jsonschema:"New RFC 3339 expiration timestamp."`
+	ClearExpires bool      `json:"clear_expires,omitempty" jsonschema:"Remove any expiration timestamp."`
 }
 
 // UpdateMemoryOutput is the output of update_memory.
@@ -273,11 +298,19 @@ type UpdateMemoryOutput struct {
 }
 
 func (s *srv) updateMemory(ctx context.Context, req *mcp.CallToolRequest, in UpdateMemoryInput) (*mcp.CallToolResult, UpdateMemoryOutput, error) {
-	p := store.Patch{Content: in.Content, Title: in.Title, Tags: in.Tags, Importance: in.Importance, Namespace: in.Namespace}
+	p := store.Patch{Content: in.Content, Title: in.Title, Tags: in.Tags, Importance: in.Importance, Namespace: in.Namespace, ClearExpiresAt: in.ClearExpires}
+	exp, err := parseExpiration(in.ExpiresIn, in.ExpiresAt)
+	if err != nil {
+		return nil, UpdateMemoryOutput{}, s.toolError(ctx, req, "update_memory", err)
+	}
+	if exp != nil {
+		p.ExpiresAt = exp
+	}
 	changed := []string{}
 	for name, set := range map[string]bool{
 		"content": in.Content != nil, "title": in.Title != nil, "tags": in.Tags != nil,
 		"importance": in.Importance != nil, "kind": in.Kind != nil, "namespace": in.Namespace != nil,
+		"expires_at": exp != nil || in.ClearExpires,
 	} {
 		if set {
 			changed = append(changed, name)
@@ -519,6 +552,80 @@ func writableKinds() []store.Kind {
 		if k != store.KindHandoff {
 			out = append(out, k)
 		}
+	}
+	return out
+}
+
+// parseExpiration parses either expiresIn (e.g. "24h", "7d") or expiresAt (RFC 3339).
+func parseExpiration(expiresIn, expiresAt string) (*time.Time, error) {
+	in := strings.TrimSpace(expiresIn)
+	at := strings.TrimSpace(expiresAt)
+	if in != "" && at != "" {
+		return nil, &store.ValidationError{Field: "expires", Msg: "provide either expires_in or expires_at, not both"}
+	}
+	if in != "" {
+		if strings.HasSuffix(in, "d") {
+			days, err := strconv.Atoi(strings.TrimSuffix(in, "d"))
+			if err != nil || days <= 0 {
+				return nil, &store.ValidationError{Field: "expires_in", Msg: fmt.Sprintf("invalid duration %q", expiresIn)}
+			}
+			t := time.Now().UTC().Add(time.Duration(days) * 24 * time.Hour)
+			return &t, nil
+		}
+		d, err := time.ParseDuration(in)
+		if err != nil || d <= 0 {
+			return nil, &store.ValidationError{Field: "expires_in", Msg: fmt.Sprintf("invalid duration %q", expiresIn)}
+		}
+		t := time.Now().UTC().Add(d)
+		return &t, nil
+	}
+	if at != "" {
+		t, err := time.Parse(time.RFC3339, at)
+		if err != nil {
+			return nil, &store.ValidationError{Field: "expires_at", Msg: fmt.Sprintf("invalid RFC 3339 timestamp %q", expiresAt)}
+		}
+		utc := t.UTC()
+		return &utc, nil
+	}
+	return nil, nil
+}
+
+// mergeSimilar combines FTS and semantic duplicate candidates, keeping the
+// highest similarity score per memory ID, up to limit.
+func mergeSimilar(fts, sem []store.Similar, limit int) []store.Similar {
+	if len(sem) == 0 {
+		return fts
+	}
+	byID := make(map[int64]store.Similar, len(fts)+len(sem))
+	for _, s := range fts {
+		byID[s.ID] = s
+	}
+	for _, s := range sem {
+		if cur, ok := byID[s.ID]; !ok || s.Similarity > cur.Similarity {
+			byID[s.ID] = s
+		}
+	}
+	out := make([]store.Similar, 0, len(byID))
+	for _, s := range byID {
+		out = append(out, s)
+	}
+	slices.SortFunc(out, func(a, b store.Similar) int {
+		if a.Similarity > b.Similarity {
+			return -1
+		}
+		if a.Similarity < b.Similarity {
+			return 1
+		}
+		if a.ID > b.ID {
+			return -1
+		}
+		if a.ID < b.ID {
+			return 1
+		}
+		return 0
+	})
+	if len(out) > limit {
+		out = out[:limit]
 	}
 	return out
 }

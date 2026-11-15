@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 )
 
 // queryer is satisfied by *sql.DB and *sql.Tx.
@@ -17,7 +18,9 @@ type queryer interface {
 }
 
 const memoryColumns = `id, namespace, kind, title, content, tags, importance, source,
-	created_at, updated_at, updated_by, archived_at`
+	created_at, updated_at, updated_by, archived_at, expires_at`
+
+const notExpiredSQL = "(expires_at IS NULL OR expires_at > " + sqlNow + ")"
 
 type scanner interface{ Scan(dest ...any) error }
 
@@ -27,9 +30,10 @@ func scanMemory(sc scanner) (Memory, error) {
 		kind, tags       string
 		created, updated string
 		archived         sql.NullString
+		expires          sql.NullString
 	)
 	if err := sc.Scan(&m.ID, &m.Namespace, &kind, &m.Title, &m.Content, &tags, &m.Importance,
-		&m.Source, &created, &updated, &m.UpdatedBy, &archived); err != nil {
+		&m.Source, &created, &updated, &m.UpdatedBy, &archived, &expires); err != nil {
 		return Memory{}, err
 	}
 	m.Kind = Kind(kind)
@@ -47,6 +51,13 @@ func scanMemory(sc scanner) (Memory, error) {
 			return Memory{}, err
 		}
 		m.ArchivedAt = &t
+	}
+	if expires.Valid {
+		t, err := parseTime(expires.String)
+		if err != nil {
+			return Memory{}, err
+		}
+		m.ExpiresAt = &t
 	}
 	return m, nil
 }
@@ -95,9 +106,10 @@ type NewMemory struct {
 	Title                string
 	Content              string
 	Tags                 []string
-	Importance           int     // 0 means default (2)
-	Source               string  // author; "unknown" if empty
-	Supersedes           []int64 // memories archived in the same transaction
+	Importance           int        // 0 means default (2)
+	Source               string     // author; "unknown" if empty
+	Supersedes           []int64    // memories archived in the same transaction
+	ExpiresAt            *time.Time // optional TTL expiration
 }
 
 // Create inserts a memory, creating its namespace if needed, and archives
@@ -157,10 +169,14 @@ func (s *Store) CreateDetailed(ctx context.Context, in NewMemory) (Memory, []int
 				return fmt.Errorf("describe namespace %q: %w", ns, err)
 			}
 		}
+		var expires any
+		if in.ExpiresAt != nil {
+			expires = FormatTime(*in.ExpiresAt)
+		}
 		res, err := tx.ExecContext(ctx,
-			`INSERT INTO memories(namespace, kind, title, content, tags, importance, source, updated_by)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-			ns, string(in.Kind), title, content, joinTags(in.Tags), imp, src, src)
+			`INSERT INTO memories(namespace, kind, title, content, tags, importance, source, updated_by, expires_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			ns, string(in.Kind), title, content, joinTags(in.Tags), imp, src, src, expires)
 		if err != nil {
 			return fmt.Errorf("insert memory: %w", err)
 		}
@@ -206,17 +222,19 @@ func (s *Store) Get(ctx context.Context, id int64) (Memory, error) {
 
 // Patch lists the fields to change; nil means unchanged.
 type Patch struct {
-	Content    *string
-	Title      *string
-	Tags       *[]string
-	Importance *int
-	Kind       *Kind
-	Namespace  *string // created if missing
+	Content        *string
+	Title          *string
+	Tags           *[]string
+	Importance     *int
+	Kind           *Kind
+	Namespace      *string // created if missing
+	ExpiresAt      *time.Time
+	ClearExpiresAt bool
 }
 
 func (p Patch) empty() bool {
 	return p.Content == nil && p.Title == nil && p.Tags == nil && p.Importance == nil &&
-		p.Kind == nil && p.Namespace == nil
+		p.Kind == nil && p.Namespace == nil && p.ExpiresAt == nil && !p.ClearExpiresAt
 }
 
 // Update modifies the given fields of an active memory. The previous version
@@ -270,6 +288,11 @@ func (s *Store) Update(ctx context.Context, id int64, p Patch, by string) (Memor
 			return Memory{}, err
 		}
 		sets, args = append(sets, "namespace = ?"), append(args, ns)
+	}
+	if p.ClearExpiresAt {
+		sets = append(sets, "expires_at = NULL")
+	} else if p.ExpiresAt != nil {
+		sets, args = append(sets, "expires_at = ?"), append(args, FormatTime(*p.ExpiresAt))
 	}
 	by = normalizeActor(by)
 	sets = append(sets, "updated_at = "+sqlNow, "updated_by = ?")
@@ -450,7 +473,7 @@ func (s *Store) List(ctx context.Context, f ListFilter) ([]Memory, error) {
 	}
 	switch f.Archived {
 	case ActiveOnly:
-		where = append(where, "archived_at IS NULL")
+		where = append(where, "archived_at IS NULL", notExpiredSQL)
 	case ArchivedOnly:
 		where = append(where, "archived_at IS NOT NULL")
 	case IncludeArchived:
@@ -485,4 +508,48 @@ func queryMemories(ctx context.Context, q queryer, query string, args ...any) ([
 		return nil, fmt.Errorf("query memories: %w", err)
 	}
 	return out, nil
+}
+
+func collectIDs(ctx context.Context, q queryer, query string, args ...any) ([]int64, error) {
+	rows, err := q.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+// ArchiveExpired archives all active memories whose expires_at is <= now and
+// returns the number of archived memories.
+func (s *Store) ArchiveExpired(ctx context.Context, now time.Time, by string) (int64, error) {
+	by = normalizeActor(by)
+	cutoff := FormatTime(now)
+	var count int64
+	err := s.withTx(ctx, func(tx *sql.Tx) error {
+		ids, err := collectIDs(ctx, tx,
+			"SELECT id FROM memories WHERE archived_at IS NULL AND expires_at IS NOT NULL AND expires_at <= ? ORDER BY id",
+			cutoff)
+		if err != nil {
+			return fmt.Errorf("list expired memories: %w", err)
+		}
+		for _, id := range ids {
+			res, err := archive(ctx, tx, id, by, "expired (TTL)", true)
+			if err != nil {
+				return err
+			}
+			if res.changed {
+				count++
+			}
+		}
+		return nil
+	})
+	return count, err
 }

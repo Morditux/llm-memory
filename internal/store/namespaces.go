@@ -126,3 +126,127 @@ func (s *Store) ListNamespaces(ctx context.Context) ([]Namespace, error) {
 	}
 	return out, nil
 }
+
+// RenameNamespace renames oldName to newName (updating all memories via ON UPDATE CASCADE).
+// The "global" namespace cannot be renamed, and newName must not already exist.
+func (s *Store) RenameNamespace(ctx context.Context, oldName, newName string) (string, error) {
+	oldNS, err := NormalizeNamespace(oldName)
+	if err != nil {
+		return "", err
+	}
+	newNS, err := NormalizeNamespace(newName)
+	if err != nil {
+		return "", err
+	}
+	if oldNS == DefaultNamespace {
+		return "", &ValidationError{Field: "namespace", Msg: "cannot rename the global namespace"}
+	}
+	if oldNS == newNS {
+		return "", &ValidationError{Field: "namespace", Msg: "source and target namespaces are identical"}
+	}
+	err = s.withTx(ctx, func(tx *sql.Tx) error {
+		if err := requireNamespace(ctx, tx, oldNS); err != nil {
+			return err
+		}
+		var exists int
+		err := tx.QueryRowContext(ctx, "SELECT 1 FROM namespaces WHERE name = ?", newNS).Scan(&exists)
+		if err == nil {
+			return &ValidationError{Field: "namespace", Msg: fmt.Sprintf("namespace %q already exists (use merge instead)", newNS)}
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("check namespace %q: %w", newNS, err)
+		}
+		if _, err := tx.ExecContext(ctx, "UPDATE namespaces SET name = ? WHERE name = ?", newNS, oldNS); err != nil {
+			return fmt.Errorf("rename namespace %q to %q: %w", oldNS, newNS, err)
+		}
+		return nil
+	})
+	return newNS, err
+}
+
+// MergeNamespace moves all memories from src into dst, enforces at most one
+// active handoff in dst (keeping the most recent), and removes src.
+// The "global" namespace cannot be merged away.
+func (s *Store) MergeNamespace(ctx context.Context, src, dst, by string) (int64, error) {
+	srcNS, err := NormalizeNamespace(src)
+	if err != nil {
+		return 0, err
+	}
+	dstNS, err := NormalizeNamespace(dst)
+	if err != nil {
+		return 0, err
+	}
+	if srcNS == DefaultNamespace {
+		return 0, &ValidationError{Field: "namespace", Msg: "cannot merge the global namespace"}
+	}
+	if srcNS == dstNS {
+		return 0, &ValidationError{Field: "namespace", Msg: "source and target namespaces are identical"}
+	}
+	by = normalizeActor(by)
+	var moved int64
+	err = s.withTx(ctx, func(tx *sql.Tx) error {
+		if err := requireNamespace(ctx, tx, srcNS); err != nil {
+			return err
+		}
+		if err := ensureNamespace(ctx, tx, dstNS); err != nil {
+			return err
+		}
+		res, err := tx.ExecContext(ctx, "UPDATE memories SET namespace = ? WHERE namespace = ?", dstNS, srcNS)
+		if err != nil {
+			return fmt.Errorf("move memories from %q to %q: %w", srcNS, dstNS, err)
+		}
+		moved, _ = res.RowsAffected()
+
+		var keepID int64
+		err = tx.QueryRowContext(ctx,
+			"SELECT id FROM memories WHERE namespace = ? AND kind = 'handoff' AND archived_at IS NULL ORDER BY updated_at DESC, id DESC LIMIT 1",
+			dstNS).Scan(&keepID)
+		if err == nil {
+			if _, err := archiveOtherHandoffs(ctx, tx, dstNS, keepID, by); err != nil {
+				return err
+			}
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("check active handoffs in %q: %w", dstNS, err)
+		}
+
+		if _, err := tx.ExecContext(ctx, "DELETE FROM namespaces WHERE name = ?", srcNS); err != nil {
+			return fmt.Errorf("delete namespace %q: %w", srcNS, err)
+		}
+		return nil
+	})
+	return moved, err
+}
+
+// ArchiveNamespace archives all active memories in name and returns how many were archived.
+func (s *Store) ArchiveNamespace(ctx context.Context, name, by, reason string) (int64, error) {
+	ns, err := NormalizeNamespace(name)
+	if err != nil {
+		return 0, err
+	}
+	by = normalizeActor(by)
+	if reason == "" {
+		reason = fmt.Sprintf("namespace %q archived", ns)
+	}
+	var count int64
+	err = s.withTx(ctx, func(tx *sql.Tx) error {
+		if err := requireNamespace(ctx, tx, ns); err != nil {
+			return err
+		}
+		ids, err := collectIDs(ctx, tx, "SELECT id FROM memories WHERE namespace = ? AND archived_at IS NULL ORDER BY id", ns)
+		if err != nil {
+			return fmt.Errorf("list active memories in %q: %w", ns, err)
+		}
+
+		for _, id := range ids {
+			res, err := archive(ctx, tx, id, by, reason, true)
+			if err != nil {
+				return err
+			}
+			if res.changed {
+				count++
+			}
+		}
+		return nil
+	})
+	return count, err
+}

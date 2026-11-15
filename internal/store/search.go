@@ -144,7 +144,7 @@ func filterSQL(ns string, kinds []Kind, tags []string, includeArchived bool, exc
 		args = append(args, t)
 	}
 	if !includeArchived {
-		where = append(where, "m.archived_at IS NULL")
+		where = append(where, "m.archived_at IS NULL", "(m.expires_at IS NULL OR m.expires_at > "+sqlNow+")")
 	}
 	if excludeID > 0 {
 		where, args = append(where, "m.id <> ?"), append(args, excludeID)
@@ -156,7 +156,7 @@ func filterSQL(ns string, kinds []Kind, tags []string, includeArchived bool, exc
 }
 
 const prefixedColumns = `m.id, m.namespace, m.kind, m.title, m.content, m.tags, m.importance, m.source,
-	m.created_at, m.updated_at, m.updated_by, m.archived_at`
+	m.created_at, m.updated_at, m.updated_by, m.archived_at, m.expires_at`
 
 func (s *Store) match(ctx context.Context, expr, ns string, kinds []Kind, tags []string, includeArchived bool, excludeID int64, limit int) ([]SearchResult, error) {
 	filter, fargs := filterSQL(ns, kinds, tags, includeArchived, excludeID)

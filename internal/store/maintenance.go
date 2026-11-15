@@ -118,3 +118,19 @@ func (s *Store) Count(ctx context.Context) (int, error) {
 	}
 	return n, nil
 }
+
+// IntegrityCheck runs SQLite PRAGMA integrity_check and verifies FTS5 is queryable.
+func (s *Store) IntegrityCheck(ctx context.Context) error {
+	var res string
+	if err := s.db.QueryRowContext(ctx, "PRAGMA integrity_check").Scan(&res); err != nil {
+		return fmt.Errorf("integrity_check: %w", err)
+	}
+	if res != "ok" {
+		return fmt.Errorf("integrity_check failed: %s", res)
+	}
+	var cnt int
+	if err := s.db.QueryRowContext(ctx, "SELECT count(*) FROM memories_fts").Scan(&cnt); err != nil {
+		return fmt.Errorf("fts5 check: %w", err)
+	}
+	return nil
+}
