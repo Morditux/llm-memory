@@ -3,8 +3,11 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -133,4 +136,38 @@ func (s *Store) IntegrityCheck(ctx context.Context) error {
 		return fmt.Errorf("fts5 check: %w", err)
 	}
 	return nil
+}
+
+// Backup creates a consistent, standalone SQLite snapshot at destPath using
+// VACUUM INTO. The parent directory is created with mode 0700 and the backup
+// file is restricted to mode 0600. It returns the backup file size in bytes.
+func (s *Store) Backup(ctx context.Context, destPath string) (int64, error) {
+	if strings.TrimSpace(destPath) == "" {
+		return 0, fmt.Errorf("backup destination path must not be empty")
+	}
+	abs, err := filepath.Abs(destPath)
+	if err != nil {
+		return 0, fmt.Errorf("resolve backup path %q: %w", destPath, err)
+	}
+	if abs == s.path {
+		return 0, fmt.Errorf("backup destination %q must differ from active database", abs)
+	}
+	if _, err := os.Stat(abs); err == nil {
+		return 0, fmt.Errorf("backup destination %q already exists", abs)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return 0, fmt.Errorf("stat backup destination %q: %w", abs, err)
+	}
+	if err := os.MkdirAll(filepath.Dir(abs), 0o700); err != nil {
+		return 0, fmt.Errorf("create backup directory: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, "VACUUM INTO ?", abs); err != nil {
+		_ = os.Remove(abs)
+		return 0, fmt.Errorf("vacuum into %s: %w", abs, err)
+	}
+	_ = os.Chmod(abs, 0o600)
+	fi, err := os.Stat(abs)
+	if err != nil {
+		return 0, fmt.Errorf("stat backup %s: %w", abs, err)
+	}
+	return fi.Size(), nil
 }

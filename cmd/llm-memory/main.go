@@ -9,11 +9,14 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"runtime"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -33,7 +36,8 @@ const cliSource = "cli"
 const usage = `llm-memory — shared memory for LLM clients (MCP server over stdio)
 
 Usage:
-  llm-memory [serve] [flags]                 start the MCP server on stdio (default)
+  llm-memory [serve] [--listen ADDR] [--stateless] [--read-only] [flags]
+                                             start the MCP server (stdio by default, or Streamable HTTP with --listen)
   llm-memory context [--namespace X] [--max-chars N] [--focus Q] [--json]
                                              print the briefing get_context would return
   llm-memory remember --kind K [--title T] [--tag T[,T]] [--importance N] [--supersedes ID[,ID]] [--expires-in D] [--json] <content|->
@@ -59,6 +63,8 @@ Usage:
                                              manage namespaces
   llm-memory gc                              archive expired (TTL) memories
   llm-memory doctor                          check database integrity and embeddings endpoint
+  llm-memory backup [--keep N] [--verify] [--json] [<dest>]
+                                             hot SQLite backup via VACUUM INTO
   llm-memory setup <client>                  print MCP configuration for a client
   llm-memory ui [--addr 127.0.0.1:8765]      start local web explorer
   llm-memory version                         version and schema version
@@ -136,6 +142,7 @@ func run(ctx context.Context, args []string, a app) error {
 		"namespace": a.cmdNamespace,
 		"gc":        a.cmdGC,
 		"doctor":    a.cmdDoctor,
+		"backup":    a.cmdBackup,
 		"setup":     a.cmdSetup,
 		"ui":        a.cmdUI,
 		"version":   a.cmdVersion,
@@ -224,6 +231,9 @@ func (nopWriteCloser) Close() error { return nil }
 func (a app) cmdServe(ctx context.Context, args []string) error {
 	fs := a.newFlagSet("serve")
 	flags := config.Register(fs)
+	listen := fs.String("listen", "", "serve Streamable HTTP MCP on this address instead of stdio (e.g. 127.0.0.1:8766)")
+	stateless := fs.Bool("stateless", false, "disable MCP session tracking in Streamable HTTP mode")
+	readOnly := fs.Bool("read-only", false, "expose only read-only tools (get_context, recall, get_memory, list_namespaces)")
 	if _, err := parse(fs, args, 0, 0); err != nil {
 		return err
 	}
@@ -243,11 +253,44 @@ func (a app) cmdServe(ctx context.Context, args []string) error {
 		DefaultNamespace: cfg.Namespace,
 		Source:           cfg.Source,
 		Logger:           logger,
+		ReadOnly:         *readOnly,
 	}
 	if engine != nil {
 		opts.Searcher = engine
 		logger.Info("semantic search enabled", "url", cfg.Embed.URL, "settings", engine.Describe())
 	}
+	if strings.TrimSpace(*listen) != "" {
+		handler, err := server.NewHTTPHandler(st, opts, &mcp.StreamableHTTPOptions{
+			Stateless: *stateless,
+			Logger:    logger,
+		})
+		if err != nil {
+			return err
+		}
+		ln, err := net.Listen("tcp", *listen)
+		if err != nil {
+			return fmt.Errorf("listen %s: %w", *listen, err)
+		}
+		httpSrv := &http.Server{
+			Handler:           handler,
+			ReadHeaderTimeout: 5 * time.Second,
+		}
+		go func() {
+			<-ctx.Done()
+			shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = httpSrv.Shutdown(shutCtx)
+		}()
+		logger.Info("starting", "transport", "streamable-http", "addr", ln.Addr().String(),
+			"stateless", *stateless, "read_only", *readOnly, "version", version,
+			"db", st.Path(), "namespace", cfg.Namespace, "source", cfg.Source)
+		if err := httpSrv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return fmt.Errorf("serve http: %w", err)
+		}
+		logger.Info("stopped")
+		return nil
+	}
+
 	srv, err := server.New(st, opts)
 	if err != nil {
 		return err
@@ -256,7 +299,7 @@ func (a app) cmdServe(ctx context.Context, args []string) error {
 	if a.stdin != os.Stdin { // tests drive serve through pipes
 		transport = &mcp.IOTransport{Reader: io.NopCloser(a.stdin), Writer: nopWriteCloser{a.stdout}}
 	}
-	logger.Info("starting", "version", version, "db", st.Path(), "namespace", cfg.Namespace, "source", cfg.Source)
+	logger.Info("starting", "transport", "stdio", "read_only", *readOnly, "version", version, "db", st.Path(), "namespace", cfg.Namespace, "source", cfg.Source)
 	err = srv.Run(ctx, transport)
 	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, io.EOF) {
 		return fmt.Errorf("serve: %w", err)

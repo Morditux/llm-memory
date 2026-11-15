@@ -629,3 +629,29 @@ func TestCLIAxes1And2(t *testing.T) {
 		t.Errorf("setup claude-code output:\n%s", setupCC)
 	}
 }
+
+func TestCLIBackup(t *testing.T) {
+	dir := t.TempDir()
+	db := filepath.Join(dir, "mem.db")
+	cliOK(t, "remember", "--db", db, "--kind", "fact", "important backup fact")
+
+	dest := filepath.Join(dir, "manual.db")
+	out := cliOK(t, "backup", "--db", db, "--json", dest)
+	var res struct {
+		Path     string `json:"path"`
+		Bytes    int64  `json:"bytes"`
+		Verified bool   `json:"verified"`
+	}
+	if err := json.Unmarshal([]byte(out), &res); err != nil {
+		t.Fatalf("unmarshal backup json: %v\n%s", err, out)
+	}
+	if res.Path != dest || res.Bytes <= 0 || !res.Verified {
+		t.Errorf("unexpected backup json: %+v", res)
+	}
+
+	// Verify data is present in the backed-up database.
+	listOut := cliOK(t, "list", "--db", dest)
+	if !strings.Contains(listOut, "important backup fact") {
+		t.Errorf("backup missing memory:\n%s", listOut)
+	}
+}

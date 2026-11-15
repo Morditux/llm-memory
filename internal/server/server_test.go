@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -515,5 +517,77 @@ func TestResourcesAndPrompts(t *testing.T) {
 	}
 	if tc, ok := ph.Messages[0].Content.(*mcp.TextContent); !ok || !strings.Contains(tc.Text, "supersedes") || !strings.Contains(tc.Text, `"demo"`) {
 		t.Errorf("handoff prompt content = %#v", ph.Messages[0].Content)
+	}
+}
+
+func TestReadOnlyServer(t *testing.T) {
+	ctx := context.Background()
+	st := openStore(t, filepath.Join(t.TempDir(), "mem.db"))
+	if _, err := st.Create(ctx, store.NewMemory{Kind: store.KindFact, Content: "read-only visible"}); err != nil {
+		t.Fatal(err)
+	}
+	cs := connect(t, st, Options{ReadOnly: true}, "reader")
+	tools, err := cs.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	names := make([]string, len(tools.Tools))
+	for i, tool := range tools.Tools {
+		names[i] = tool.Name
+	}
+	for _, want := range []string{"get_context", "recall", "get_memory", "list_namespaces"} {
+		if !slices.Contains(names, want) {
+			t.Errorf("missing read tool %q in %v", want, names)
+		}
+	}
+	for _, forbid := range []string{"remember", "update_memory", "forget", "handoff"} {
+		if slices.Contains(names, forbid) {
+			t.Errorf("write tool %q should not be registered in read-only mode", forbid)
+		}
+	}
+	rc := callOK[RecallOutput](t, cs, "recall", map[string]any{"query": "visible"})
+	if len(rc.Results) != 1 {
+		t.Errorf("recall in read-only mode = %+v", rc)
+	}
+}
+
+func TestStreamableHTTP(t *testing.T) {
+	ctx := context.Background()
+	st := openStore(t, filepath.Join(t.TempDir(), "mem.db"))
+	h, err := NewHTTPHandler(st, Options{Version: "test"}, &mcp.StreamableHTTPOptions{Stateless: true})
+	if err != nil {
+		t.Fatalf("NewHTTPHandler: %v", err)
+	}
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+
+	// Liveness probe
+	resp, err := http.Get(ts.URL + "/healthz")
+	if err != nil {
+		t.Fatalf("GET /healthz: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("/healthz status = %d, want 200", resp.StatusCode)
+	}
+
+	// Connect an MCP client over Streamable HTTP
+	client := mcp.NewClient(&mcp.Implementation{Name: "http-client", Version: "1.0"}, nil)
+	cs, err := client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: ts.URL + "/mcp"}, nil)
+	if err != nil {
+		t.Fatalf("StreamableClientTransport connect: %v", err)
+	}
+	defer func() { _ = cs.Close() }()
+
+	mem := callOK[RememberOutput](t, cs, "remember", map[string]any{
+		"kind":    "fact",
+		"content": "stored over streamable HTTP",
+	})
+	if mem.Memory.Source != "http-client" {
+		t.Errorf("source = %q, want http-client", mem.Memory.Source)
+	}
+	b := briefingText(t, cs, nil)
+	if !strings.Contains(b, "stored over streamable HTTP") {
+		t.Errorf("briefing missing HTTP memory:\n%s", b)
 	}
 }

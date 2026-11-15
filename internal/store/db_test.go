@@ -175,3 +175,55 @@ func TestLoadMigrationsValidation(t *testing.T) {
 		}
 	}
 }
+
+func TestBackup(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	created, err := s.Create(ctx, NewMemory{Kind: KindFact, Content: "backup payload", Title: "snap"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	dest := filepath.Join(t.TempDir(), "nested", "snap.db")
+	size, err := s.Backup(ctx, dest)
+	if err != nil {
+		t.Fatalf("Backup: %v", err)
+	}
+	if size <= 0 {
+		t.Fatalf("expected positive backup size, got %d", size)
+	}
+	if runtime.GOOS != "windows" {
+		st, err := os.Stat(dest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if st.Mode().Perm() != 0o600 {
+			t.Errorf("backup mode = %o, want 600", st.Mode().Perm())
+		}
+	}
+
+	// Refuse overwriting existing destination or active DB.
+	if _, err := s.Backup(ctx, dest); err == nil {
+		t.Errorf("expected error when overwriting existing backup")
+	}
+	if _, err := s.Backup(ctx, s.Path()); err == nil {
+		t.Errorf("expected error when backing up onto active DB")
+	}
+
+	// Verify restored backup can be opened, passes integrity check, and contains data.
+	bak, err := Open(ctx, dest)
+	if err != nil {
+		t.Fatalf("Open backup: %v", err)
+	}
+	defer func() { _ = bak.Close() }()
+	if err := bak.IntegrityCheck(ctx); err != nil {
+		t.Fatalf("IntegrityCheck on backup: %v", err)
+	}
+	got, err := bak.Get(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("Get from backup: %v", err)
+	}
+	if got.Content != "backup payload" || got.Title != "snap" {
+		t.Errorf("unexpected backup content: %+v", got)
+	}
+}

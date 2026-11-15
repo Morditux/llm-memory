@@ -111,7 +111,10 @@ llm-memory purge --archived-before 2026-01-01 [--yes]   # permanent deletion
 llm-memory export [--namespace X] [--history] [-o dump.json]
 llm-memory import [--dry-run] dump.json  # or - for stdin; exact duplicates are skipped
 llm-memory stats [--json]                # per namespace, kind, source; file size
+llm-memory backup [--keep N] [--verify] [--json] [<dest>] # hot SQLite backup (VACUUM INTO)
 llm-memory reindex [--all]               # embeddings (semantic search only)
+llm-memory ui [--addr 127.0.0.1:8765]    # local web explorer (create/edit, diff history, similar/supersede, GC)
+llm-memory serve [--listen 127.0.0.1:8766] [--stateless] [--read-only] # stdio (default) or Streamable HTTP (/mcp, /healthz)
 ```
 
 ## Semantic search (optional)

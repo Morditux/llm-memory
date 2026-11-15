@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"strings"
 
 	"github.com/google/jsonschema-go/jsonschema"
@@ -28,6 +29,11 @@ const Instructions = `Persistent memory shared with other AI assistants (Claude 
 - When the user stops or switches tools, or at the end of a long task, call handoff with the state, next steps and open questions.
 - Never store secrets (passwords, API keys, tokens).`
 
+// ReadOnlyInstructions is advertised when Options.ReadOnly is true.
+const ReadOnlyInstructions = `Read-only access to the persistent memory shared by AI assistants.
+- At the start of every task, call get_context (with the project namespace if known) before answering.
+- Before asking the user for context, search it with recall and call get_memory for full details.`
+
 // Options configures the server.
 type Options struct {
 	Version          string
@@ -37,6 +43,8 @@ type Options struct {
 	// Searcher replaces the full-text engine of recall (semantic search,
 	// phase 6). nil = store.Search, the v1 behaviour.
 	Searcher Searcher
+	// ReadOnly omits write tools (remember, update_memory, forget, handoff).
+	ReadOnly bool
 }
 
 // Searcher runs a recall query.
@@ -48,15 +56,16 @@ type srv struct {
 	store     *store.Store
 	search    Searcher
 	semantic  bool
+	readOnly  bool
 	defaultNS string
 	source0   string
 	log       *slog.Logger
 }
 
-// New builds the MCP server with its eight tools.
+// New builds the MCP server with its tools (8 by default, 4 when ReadOnly is true).
 func New(st *store.Store, opts Options) (*mcp.Server, error) {
 	s := &srv{store: st, search: opts.Searcher, semantic: opts.Searcher != nil,
-		defaultNS: opts.DefaultNamespace, source0: strings.TrimSpace(opts.Source), log: opts.Logger}
+		readOnly: opts.ReadOnly, defaultNS: opts.DefaultNamespace, source0: strings.TrimSpace(opts.Source), log: opts.Logger}
 	if s.search == nil {
 		s.search = st
 	}
@@ -75,14 +84,38 @@ func New(st *store.Store, opts Options) (*mcp.Server, error) {
 		opts.Version = "dev"
 	}
 
+	instructions := Instructions
+	if s.readOnly {
+		instructions = ReadOnlyInstructions
+	}
 	server := mcp.NewServer(
 		&mcp.Implementation{Name: Name, Version: opts.Version},
-		&mcp.ServerOptions{Instructions: Instructions},
+		&mcp.ServerOptions{Instructions: instructions},
 	)
 	if err := s.register(server); err != nil {
 		return nil, err
 	}
 	return server, nil
+}
+
+// NewHTTPHandler builds an HTTP handler serving the Streamable HTTP MCP
+// endpoint on /mcp and a liveness probe on /healthz.
+func NewHTTPHandler(st *store.Store, opts Options, httpOpts *mcp.StreamableHTTPOptions) (http.Handler, error) {
+	mcpSrv, err := New(st, opts)
+	if err != nil {
+		return nil, err
+	}
+	if httpOpts == nil {
+		httpOpts = &mcp.StreamableHTTPOptions{Logger: opts.Logger}
+	}
+	mux := http.NewServeMux()
+	mux.Handle("/mcp", mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return mcpSrv }, httpOpts))
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	})
+	return mux, nil
 }
 
 func ptr[T any](v T) *T { return &v }
@@ -148,15 +181,6 @@ func (s *srv) register(server *mcp.Server) error {
 		Annotations: readOnly("Session briefing"),
 	}, s.getContext)
 
-	mcp.AddTool(server, &mcp.Tool{
-		Name: "remember",
-		Description: "Store one durable memory shared with other assistants: a decision and its reason, a lasting user preference, " +
-			"or a stable project fact. One idea per call. Returns possible_duplicates: if one already says the same thing, " +
-			"forget the new memory or update the old one. Never store secrets.",
-		InputSchema: rememberSchema,
-		Annotations: writes("Remember", false),
-	}, s.remember)
-
 	recallDesc := "Full-text search in the shared memory. Use it before asking the user for context they may have given before. " +
 		"Returns ranked excerpts; call get_memory for the full text."
 	if s.semantic {
@@ -177,33 +201,44 @@ func (s *srv) register(server *mcp.Server) error {
 	}, s.getMemory)
 
 	mcp.AddTool(server, &mcp.Tool{
-		Name: "update_memory",
-		Description: "Correct an active memory: only the fields you provide change; the previous version stays in history. " +
-			"To replace a memory by a different statement, prefer remember with supersedes.",
-		InputSchema: updateSchema,
-		Annotations: writes("Update memory", true),
-	}, s.updateMemory)
-
-	mcp.AddTool(server, &mcp.Tool{
-		Name: "forget",
-		Description: "Archive a memory that is wrong, obsolete or duplicated. It disappears from get_context and recall " +
-			"but is kept and can be restored by the user.",
-		InputSchema: forgetSchema,
-		Annotations: writes("Forget memory", false),
-	}, s.forget)
-
-	mcp.AddTool(server, &mcp.Tool{
-		Name: "handoff",
-		Description: "Leave the work state for the next assistant: call it when the user stops, switches tools, or at the end of a long task. " +
-			"Replaces the previous handoff of the namespace; get_context shows it first.",
-		Annotations: writes("Hand off", false),
-	}, s.handoff)
-
-	mcp.AddTool(server, &mcp.Tool{
 		Name:        "list_namespaces",
 		Description: "List namespaces (projects) with their number of active memories and last activity.",
 		Annotations: readOnly("List namespaces"),
 	}, s.listNamespaces)
+
+	if !s.readOnly {
+		mcp.AddTool(server, &mcp.Tool{
+			Name: "remember",
+			Description: "Store one durable memory shared with other assistants: a decision and its reason, a lasting user preference, " +
+				"or a stable project fact. One idea per call. Returns possible_duplicates: if one already says the same thing, " +
+				"forget the new memory or update the old one. Never store secrets.",
+			InputSchema: rememberSchema,
+			Annotations: writes("Remember", false),
+		}, s.remember)
+
+		mcp.AddTool(server, &mcp.Tool{
+			Name: "update_memory",
+			Description: "Correct an active memory: only the fields you provide change; the previous version stays in history. " +
+				"To replace a memory by a different statement, prefer remember with supersedes.",
+			InputSchema: updateSchema,
+			Annotations: writes("Update memory", true),
+		}, s.updateMemory)
+
+		mcp.AddTool(server, &mcp.Tool{
+			Name: "forget",
+			Description: "Archive a memory that is wrong, obsolete or duplicated. It disappears from get_context and recall " +
+				"but is kept and can be restored by the user.",
+			InputSchema: forgetSchema,
+			Annotations: writes("Forget memory", false),
+		}, s.forget)
+
+		mcp.AddTool(server, &mcp.Tool{
+			Name: "handoff",
+			Description: "Leave the work state for the next assistant: call it when the user stops, switches tools, or at the end of a long task. " +
+				"Replaces the previous handoff of the namespace; get_context shows it first.",
+			Annotations: writes("Hand off", false),
+		}, s.handoff)
+	}
 
 	s.registerResourcesAndPrompts(server)
 	return nil

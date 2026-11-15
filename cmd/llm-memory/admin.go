@@ -12,6 +12,8 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"text/tabwriter"
@@ -1056,6 +1058,87 @@ func (a app) cmdUI(ctx context.Context, args []string) error {
 	}()
 	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
+	}
+	return nil
+}
+
+func (a app) cmdBackup(ctx context.Context, args []string) error {
+	fs := a.newFlagSet("backup")
+	flags := config.Register(fs)
+	keep := fs.Int("keep", 0, "keep only the N most recent auto-named backups (0 = keep all)")
+	verify := fs.Bool("verify", true, "verify backup integrity after creation")
+	asJSON := fs.Bool("json", false, "output as JSON")
+	pos, err := parse(fs, args, 0, 1)
+	if err != nil {
+		return err
+	}
+	if *keep < 0 {
+		fmt.Fprintln(a.stderr, "--keep must be >= 0")
+		return errUsage
+	}
+	st, _, err := a.openStore(ctx, flags)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = st.Close() }()
+
+	autoNamed := len(pos) == 0
+	var dest string
+	if autoNamed {
+		dest = fmt.Sprintf("%s.backup-%s.db", st.Path(), time.Now().UTC().Format("20060102-150405"))
+	} else {
+		dest = pos[0]
+	}
+
+	size, err := st.Backup(ctx, dest)
+	if err != nil {
+		return err
+	}
+	absDest, err := filepath.Abs(dest)
+	if err != nil {
+		absDest = dest
+	}
+
+	if *verify {
+		bak, err := store.Open(ctx, absDest)
+		if err != nil {
+			return fmt.Errorf("verify backup open: %w", err)
+		}
+		checkErr := bak.IntegrityCheck(ctx)
+		_ = bak.Close()
+		if checkErr != nil {
+			return fmt.Errorf("verify backup integrity: %w", checkErr)
+		}
+	}
+
+	var pruned []string
+	if autoNamed && *keep > 0 {
+		matches, _ := filepath.Glob(st.Path() + ".backup-*.db")
+		sort.Sort(sort.Reverse(sort.StringSlice(matches)))
+		if len(matches) > *keep {
+			for _, old := range matches[*keep:] {
+				if err := os.Remove(old); err == nil {
+					pruned = append(pruned, old)
+				}
+			}
+		}
+	}
+
+	if *asJSON {
+		return writeJSON(a.stdout, struct {
+			Path     string   `json:"path"`
+			Bytes    int64    `json:"bytes"`
+			Verified bool     `json:"verified"`
+			Pruned   []string `json:"pruned,omitempty"`
+		}{Path: absDest, Bytes: size, Verified: *verify, Pruned: pruned})
+	}
+	fmt.Fprintf(a.stdout, "backup written to %s (%d bytes", absDest, size)
+	if *verify {
+		fmt.Fprint(a.stdout, ", verified")
+	}
+	fmt.Fprintln(a.stdout, ")")
+	if len(pruned) > 0 {
+		fmt.Fprintf(a.stdout, "pruned %d old backup(s)\n", len(pruned))
 	}
 	return nil
 }
