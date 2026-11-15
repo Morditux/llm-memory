@@ -89,14 +89,15 @@ func writeHistory(ctx context.Context, tx *sql.Tx, id int64, action Action, by, 
 
 // NewMemory is the input of Create.
 type NewMemory struct {
-	Namespace  string // created if missing; default "global"
-	Kind       Kind
-	Title      string
-	Content    string
-	Tags       []string
-	Importance int     // 0 means default (2)
-	Source     string  // author; "unknown" if empty
-	Supersedes []int64 // memories archived in the same transaction
+	Namespace            string // created if missing; default "global"
+	NamespaceDescription string // optional description for the namespace
+	Kind                 Kind
+	Title                string
+	Content              string
+	Tags                 []string
+	Importance           int     // 0 means default (2)
+	Source               string  // author; "unknown" if empty
+	Supersedes           []int64 // memories archived in the same transaction
 }
 
 // Create inserts a memory, creating its namespace if needed, and archives
@@ -126,8 +127,14 @@ func (s *Store) CreateDetailed(ctx context.Context, in NewMemory) (Memory, []int
 	if err != nil {
 		return Memory{}, nil, err
 	}
+	if err := checkNoSecrets("content", content); err != nil {
+		return Memory{}, nil, err
+	}
 	title, err := normalizeTitle(in.Title)
 	if err != nil {
+		return Memory{}, nil, err
+	}
+	if err := checkNoSecrets("title", title); err != nil {
 		return Memory{}, nil, err
 	}
 	imp := in.Importance
@@ -144,6 +151,11 @@ func (s *Store) CreateDetailed(ctx context.Context, in NewMemory) (Memory, []int
 	err = s.withTx(ctx, func(tx *sql.Tx) error {
 		if err := ensureNamespace(ctx, tx, ns); err != nil {
 			return err
+		}
+		if desc := strings.TrimSpace(in.NamespaceDescription); desc != "" {
+			if _, err := tx.ExecContext(ctx, "UPDATE namespaces SET description = ? WHERE name = ?", desc, ns); err != nil {
+				return fmt.Errorf("describe namespace %q: %w", ns, err)
+			}
 		}
 		res, err := tx.ExecContext(ctx,
 			`INSERT INTO memories(namespace, kind, title, content, tags, importance, source, updated_by)
@@ -174,17 +186,11 @@ func (s *Store) CreateDetailed(ctx context.Context, in NewMemory) (Memory, []int
 		if in.Kind != KindHandoff {
 			return nil
 		}
-		olds, err := queryMemories(ctx, tx, "SELECT "+memoryColumns+
-			" FROM memories WHERE namespace = ? AND kind = 'handoff' AND archived_at IS NULL AND id <> ?", ns, id)
+		replaced, err := archiveOtherHandoffs(ctx, tx, ns, id, src)
 		if err != nil {
 			return err
 		}
-		for _, o := range olds {
-			if _, err := archive(ctx, tx, o.ID, src, fmt.Sprintf("replaced by handoff #%d", id), true); err != nil {
-				return err
-			}
-			archived = append(archived, o.ID)
-		}
+		archived = append(archived, replaced...)
 		return nil
 	})
 	if err != nil {
@@ -205,7 +211,7 @@ type Patch struct {
 	Tags       *[]string
 	Importance *int
 	Kind       *Kind
-	Namespace  *string // must already exist
+	Namespace  *string // created if missing
 }
 
 func (p Patch) empty() bool {
@@ -227,11 +233,17 @@ func (s *Store) Update(ctx context.Context, id int64, p Patch, by string) (Memor
 		if err != nil {
 			return Memory{}, err
 		}
+		if err := checkNoSecrets("content", c); err != nil {
+			return Memory{}, err
+		}
 		sets, args = append(sets, "content = ?"), append(args, c)
 	}
 	if p.Title != nil {
 		t, err := normalizeTitle(*p.Title)
 		if err != nil {
+			return Memory{}, err
+		}
+		if err := checkNoSecrets("title", t); err != nil {
 			return Memory{}, err
 		}
 		sets, args = append(sets, "title = ?"), append(args, t)
@@ -273,12 +285,25 @@ func (s *Store) Update(ctx context.Context, id int64, p Patch, by string) (Memor
 			return &StateError{ID: id, Msg: "is archived; restore it first (llm-memory restore) or create a new memory"}
 		}
 		if p.Namespace != nil {
-			if err := requireNamespace(ctx, tx, ns); err != nil {
+			if err := ensureNamespace(ctx, tx, ns); err != nil {
 				return err
 			}
 		}
 		if _, err := tx.ExecContext(ctx, "UPDATE memories SET "+strings.Join(sets, ", ")+" WHERE id = ?", args...); err != nil {
 			return fmt.Errorf("update memory #%d: %w", id, err)
+		}
+		targetNS := cur.Namespace
+		if p.Namespace != nil {
+			targetNS = ns
+		}
+		targetKind := cur.Kind
+		if p.Kind != nil {
+			targetKind = *p.Kind
+		}
+		if targetKind == KindHandoff {
+			if _, err := archiveOtherHandoffs(ctx, tx, targetNS, id, by); err != nil {
+				return err
+			}
 		}
 		out, err = writeHistory(ctx, tx, id, ActionUpdate, by, "")
 		return err
@@ -329,6 +354,23 @@ func archive(ctx context.Context, tx *sql.Tx, id int64, by, reason string, lenie
 	return archiveResult{Memory: m, changed: true}, err
 }
 
+// archiveOtherHandoffs archives any active handoffs in ns other than keepID.
+func archiveOtherHandoffs(ctx context.Context, tx *sql.Tx, ns string, keepID int64, by string) ([]int64, error) {
+	olds, err := queryMemories(ctx, tx, "SELECT "+memoryColumns+
+		" FROM memories WHERE namespace = ? AND kind = 'handoff' AND archived_at IS NULL AND id <> ?", ns, keepID)
+	if err != nil {
+		return nil, err
+	}
+	var archived []int64
+	for _, o := range olds {
+		if _, err := archive(ctx, tx, o.ID, by, fmt.Sprintf("replaced by handoff #%d", keepID), true); err != nil {
+			return nil, err
+		}
+		archived = append(archived, o.ID)
+	}
+	return archived, nil
+}
+
 // Restore un-archives a memory.
 func (s *Store) Restore(ctx context.Context, id int64, by string) (Memory, error) {
 	by = normalizeActor(by)
@@ -345,6 +387,11 @@ func (s *Store) Restore(ctx context.Context, id int64, by string) (Memory, error
 			"UPDATE memories SET archived_at = NULL, updated_at = "+sqlNow+", updated_by = ? WHERE id = ?",
 			by, id); err != nil {
 			return fmt.Errorf("restore memory #%d: %w", id, err)
+		}
+		if cur.Kind == KindHandoff {
+			if _, err := archiveOtherHandoffs(ctx, tx, cur.Namespace, id, by); err != nil {
+				return err
+			}
 		}
 		out, err = writeHistory(ctx, tx, id, ActionRestore, by, "")
 		return err
@@ -366,6 +413,7 @@ const (
 type ListFilter struct {
 	Namespace string // exact (normalised) name; must exist if set
 	Kinds     []Kind
+	Tags      []string
 	Archived  ArchiveFilter
 	Limit     int // 0 = unlimited
 	Offset    int
@@ -395,6 +443,10 @@ func (s *Store) List(ctx context.Context, f ListFilter) ([]Memory, error) {
 			args = append(args, string(k))
 		}
 		where = append(where, "kind IN ("+strings.Join(ph, ", ")+")")
+	}
+	for _, t := range NormalizeTags(f.Tags) {
+		where = append(where, "instr(' ' || tags || ' ', ' ' || ? || ' ') > 0")
+		args = append(args, t)
 	}
 	switch f.Archived {
 	case ActiveOnly:

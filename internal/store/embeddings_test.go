@@ -112,6 +112,24 @@ func TestEmbeddingsStorage(t *testing.T) {
 	}
 }
 
+func TestMissingEmbeddingsPrioritizesActive(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	active, _ := s.Create(ctx, NewMemory{Kind: KindFact, Content: "active old"})
+	arch, _ := s.Create(ctx, NewMemory{Kind: KindFact, Content: "archived newer"})
+	if _, err := s.Archive(ctx, arch.ID, "t", ""); err != nil {
+		t.Fatal(err)
+	}
+	missing, err := s.MissingEmbeddings(ctx, "m", 1)
+	if err != nil || len(missing) != 1 || missing[0].ID != active.ID {
+		t.Fatalf("MissingEmbeddings(limit=1) = %+v, %v; want active #%d first", missing, err, active.ID)
+	}
+	all, err := s.MissingEmbeddings(ctx, "m", 0)
+	if err != nil || len(all) != 2 || all[0].ID != active.ID || all[1].ID != arch.ID {
+		t.Fatalf("MissingEmbeddings(all) = %+v, %v", all, err)
+	}
+}
+
 func TestGetManyAndHelpers(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()

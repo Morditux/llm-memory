@@ -34,12 +34,18 @@ const usage = `llm-memory — shared memory for LLM clients (MCP server over std
 
 Usage:
   llm-memory [serve] [flags]                 start the MCP server on stdio (default)
-  llm-memory context [--namespace X] [--max-chars N]
+  llm-memory context [--namespace X] [--max-chars N] [--json]
                                              print the briefing get_context would return
-  llm-memory list [--namespace X] [--kind K[,K]] [--archived] [--limit N]
+  llm-memory remember --kind K [--title T] [--tag T[,T]] [--importance N] [--supersedes ID[,ID]] [--json] <content|->
+                                             create a memory from the command line
+  llm-memory handoff [--next S[,S]] [--questions Q[,Q]] [--supersedes ID[,ID]] [--description D] [--json] <summary|->
+                                             write a handoff for the next assistant
+  llm-memory forget [--reason R] [--json] <id>...
+                                             archive one or more memories
+  llm-memory list [--namespace X] [--kind K[,K]] [--tag T[,T]] [--archived] [--limit N] [--json]
                                              list memories, most recent first
-  llm-memory show <id>                       full content and history of a memory
-  llm-memory search [--namespace X] [--kind K] [--archived] [--limit N] <query>
+  llm-memory show [--json] <id>              full content and history of a memory
+  llm-memory search [--namespace X] [--kind K] [--tag T[,T]] [--archived] [--limit N] [--json] <query>
                                              full-text search (same engine as recall)
   llm-memory restore <id>                    un-archive a memory
   llm-memory purge --archived-before DATE [--yes]
@@ -47,14 +53,14 @@ Usage:
   llm-memory export [--namespace X] [--history] [-o FILE]
                                              JSON export (stdout by default)
   llm-memory import [--dry-run] <FILE|->     import a JSON export; exact duplicates are skipped
-  llm-memory stats                           counts by namespace, kind and source; file size
+  llm-memory stats [--json]                  counts by namespace, kind and source; file size
   llm-memory reindex [--all]                 compute missing embeddings (semantic search only)
   llm-memory version                         version and schema version
 
 Common flags (all commands):
   --db PATH          SQLite file (env LLM_MEMORY_DB, default ~/.llm-memory/memory.db)
   --namespace NAME   default namespace (env LLM_MEMORY_NAMESPACE, default global)
-  --source NAME      client name recorded as author by serve (env LLM_MEMORY_SOURCE)
+  --source NAME      client name recorded as author (env LLM_MEMORY_SOURCE)
   --log-level LEVEL  debug|info|warn|error (env LLM_MEMORY_LOG_LEVEL, default info)
 
 Optional semantic search (disabled unless both are set; used by serve, search, reindex):
@@ -107,18 +113,21 @@ func run(ctx context.Context, args []string, a app) error {
 		cmd, args = args[0], args[1:]
 	}
 	commands := map[string]func(context.Context, []string) error{
-		"serve":   a.cmdServe,
-		"context": a.cmdContext,
-		"list":    a.cmdList,
-		"show":    a.cmdShow,
-		"search":  a.cmdSearch,
-		"restore": a.cmdRestore,
-		"purge":   a.cmdPurge,
-		"export":  a.cmdExport,
-		"import":  a.cmdImport,
-		"stats":   a.cmdStats,
-		"reindex": a.cmdReindex,
-		"version": a.cmdVersion,
+		"serve":    a.cmdServe,
+		"context":  a.cmdContext,
+		"remember": a.cmdRemember,
+		"forget":   a.cmdForget,
+		"handoff":  a.cmdHandoff,
+		"list":     a.cmdList,
+		"show":     a.cmdShow,
+		"search":   a.cmdSearch,
+		"restore":  a.cmdRestore,
+		"purge":    a.cmdPurge,
+		"export":   a.cmdExport,
+		"import":   a.cmdImport,
+		"stats":    a.cmdStats,
+		"reindex":  a.cmdReindex,
+		"version":  a.cmdVersion,
 	}
 	if cmd == "help" {
 		fmt.Fprint(a.stdout, usage)
@@ -259,6 +268,7 @@ func (a app) cmdContext(ctx context.Context, args []string) error {
 	fs := a.newFlagSet("context")
 	flags := config.Register(fs)
 	maxChars := fs.Int("max-chars", briefing.DefaultMaxChars, "character budget of the briefing")
+	asJSON := fs.Bool("json", false, "output as JSON")
 	if _, err := parse(fs, args, 0, 0); err != nil {
 		return err
 	}
@@ -270,6 +280,13 @@ func (a app) cmdContext(ctx context.Context, args []string) error {
 	text, err := briefing.Build(ctx, st, briefing.Options{Namespace: cfg.Namespace, MaxChars: *maxChars})
 	if err != nil {
 		return err
+	}
+	if *asJSON {
+		ns, _ := store.NormalizeNamespace(cfg.Namespace)
+		return writeJSON(a.stdout, struct {
+			Namespace string `json:"namespace"`
+			Briefing  string `json:"briefing"`
+		}{Namespace: ns, Briefing: text})
 	}
 	fmt.Fprint(a.stdout, text)
 	return nil

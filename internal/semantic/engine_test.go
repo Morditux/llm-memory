@@ -117,6 +117,9 @@ func TestSemanticFilters(t *testing.T) {
 	if res := search(t, e, store.SearchQuery{Query: "token login", Namespace: "api"}); len(res) != 1 || res[0].ID != f.auth.ID {
 		t.Errorf("namespace api: %v", ids(res))
 	}
+	if res := search(t, e, store.SearchQuery{Query: "database", Tags: []string{"nonexistent"}}); len(res) != 0 {
+		t.Errorf("tag filter leaked: %v", ids(res))
+	}
 	if res := search(t, e, store.SearchQuery{Query: "database", Kinds: []store.Kind{store.KindFact}}); len(res) != 0 {
 		t.Errorf("kind filter leaked: %v", ids(res))
 	}

@@ -488,3 +488,103 @@ func TestServeWithSemanticSearch(t *testing.T) {
 		t.Errorf("serve: %+v", r)
 	}
 }
+
+func TestCLIWriteCommandsAndJSON(t *testing.T) {
+	db := filepath.Join(t.TempDir(), "mem.db")
+
+	// remember requires --kind and positional content.
+	if r := cli(t, "", "remember", "--db", db, "missing kind"); !errors.Is(r.err, errUsage) {
+		t.Errorf("remember without kind: %+v", r)
+	}
+	if r := cli(t, "", "remember", "--db", db, "--kind", "handoff", "x"); r.err == nil {
+		t.Error("remember --kind handoff should fail")
+	}
+
+	out := cliOK(t, "remember", "--db", db, "--namespace", "demo", "--kind", "decision",
+		"--title", "DB choice", "--tag", "db, postgres", "--importance", "3", "Use PostgreSQL for JSONB.")
+	if !strings.Contains(out, "Created #1 (demo, decision): DB choice") {
+		t.Fatalf("remember output: %q", out)
+	}
+
+	// remember from stdin with --json and --supersedes.
+	r := cli(t, "Use SQLite in WAL mode.", "remember", "--db", db, "--namespace", "demo",
+		"--kind", "decision", "--tag", "db,sqlite", "--supersedes", "#1", "--json", "-")
+	if r.err != nil {
+		t.Fatalf("remember stdin json: %v\n%s", r.err, r.errOut)
+	}
+	var remJSON struct {
+		Memory     store.Memory `json:"memory"`
+		Superseded []int64      `json:"superseded"`
+	}
+	if err := json.Unmarshal([]byte(r.out), &remJSON); err != nil {
+		t.Fatalf("remember json decode: %v\n%s", err, r.out)
+	}
+	if remJSON.Memory.ID != 2 || len(remJSON.Superseded) != 1 || remJSON.Superseded[0] != 1 {
+		t.Fatalf("remember json = %+v", remJSON)
+	}
+
+	// handoff with --next, --questions, --description, --supersedes, --json.
+	out = cliOK(t, "handoff", "--db", db, "--namespace", "demo", "--description", "Demo repo",
+		"--next", "write docs, run tests", "--questions", "release date?", "--json", "Core features done.")
+	var hoJSON struct {
+		Memory store.Memory `json:"memory"`
+	}
+	if err := json.Unmarshal([]byte(out), &hoJSON); err != nil {
+		t.Fatalf("handoff json decode: %v\n%s", err, out)
+	}
+	if hoJSON.Memory.Kind != store.KindHandoff || !strings.Contains(hoJSON.Memory.Content, "- write docs") {
+		t.Fatalf("handoff json = %+v", hoJSON)
+	}
+
+	// --tag filter and --json on list, search, show, stats, context.
+	listOut := cliOK(t, "list", "--db", db, "--tag", "sqlite", "--json")
+	var listRes []store.Memory
+	if err := json.Unmarshal([]byte(listOut), &listRes); err != nil || len(listRes) != 1 || listRes[0].ID != 2 {
+		t.Fatalf("list --tag --json: %v %+v", err, listRes)
+	}
+
+	searchOut := cliOK(t, "search", "--db", db, "--tag", "sqlite", "--json", "WAL")
+	var searchRes []store.SearchResult
+	if err := json.Unmarshal([]byte(searchOut), &searchRes); err != nil || len(searchRes) != 1 || searchRes[0].ID != 2 {
+		t.Fatalf("search --tag --json: %v %+v", err, searchRes)
+	}
+
+	showOut := cliOK(t, "show", "--db", db, "--json", "2")
+	var showRes struct {
+		Memory  store.Memory         `json:"memory"`
+		History []store.HistoryEntry `json:"history"`
+	}
+	if err := json.Unmarshal([]byte(showOut), &showRes); err != nil || showRes.Memory.ID != 2 || len(showRes.History) != 1 {
+		t.Fatalf("show --json: %v %+v", err, showRes)
+	}
+
+	statsOut := cliOK(t, "stats", "--db", db, "--json")
+	var statsRes store.Stats
+	if err := json.Unmarshal([]byte(statsOut), &statsRes); err != nil || statsRes.Active != 2 || statsRes.Archived != 1 {
+		t.Fatalf("stats --json: %v %+v", err, statsRes)
+	}
+
+	ctxOut := cliOK(t, "context", "--db", db, "--namespace", "demo", "--json")
+	var ctxRes struct {
+		Namespace string `json:"namespace"`
+		Briefing  string `json:"briefing"`
+	}
+	if err := json.Unmarshal([]byte(ctxOut), &ctxRes); err != nil || ctxRes.Namespace != "demo" || !strings.Contains(ctxRes.Briefing, "Core features done.") {
+		t.Fatalf("context --json: %v %+v", err, ctxRes)
+	}
+
+	// forget with --reason and --json.
+	forgetOut := cliOK(t, "forget", "--db", db, "--reason", "done", "--json", "2")
+	var forgetRes []store.Memory
+	if err := json.Unmarshal([]byte(forgetOut), &forgetRes); err != nil || len(forgetRes) != 1 || !forgetRes[0].Archived() {
+		t.Fatalf("forget --json: %v %+v", err, forgetRes)
+	}
+
+	// Empty list/search with --json returns [] not null.
+	if emptyList := cliOK(t, "list", "--db", db, "--tag", "nope", "--json"); strings.TrimSpace(emptyList) != "[]" {
+		t.Errorf("empty list --json = %q", emptyList)
+	}
+	if emptySearch := cliOK(t, "search", "--db", db, "--tag", "nope", "--json", "WAL"); strings.TrimSpace(emptySearch) != "[]" {
+		t.Errorf("empty search --json = %q", emptySearch)
+	}
+}

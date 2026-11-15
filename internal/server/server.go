@@ -204,6 +204,8 @@ func (s *srv) register(server *mcp.Server) error {
 		Description: "List namespaces (projects) with their number of active memories and last activity.",
 		Annotations: readOnly("List namespaces"),
 	}, s.listNamespaces)
+
+	s.registerResourcesAndPrompts(server)
 	return nil
 }
 

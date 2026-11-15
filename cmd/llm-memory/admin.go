@@ -28,13 +28,17 @@ const (
 // filterFlags are shared by list and search.
 type filterFlags struct {
 	kinds    string
+	tags     string
 	archived bool
+	asJSON   bool
 	limit    int
 }
 
 func registerFilters(fs *flag.FlagSet, f *filterFlags, defLimit int, archivedHelp string) {
 	fs.StringVar(&f.kinds, "kind", "", "comma-separated kinds: "+kindNames())
+	fs.StringVar(&f.tags, "tag", "", "comma-separated tags (all must match)")
 	fs.BoolVar(&f.archived, "archived", false, archivedHelp)
+	fs.BoolVar(&f.asJSON, "json", false, "output as JSON")
 	fs.IntVar(&f.limit, "limit", defLimit, "maximum number of rows")
 }
 
@@ -42,6 +46,16 @@ func kindNames() string {
 	n := make([]string, len(store.Kinds))
 	for i, k := range store.Kinds {
 		n[i] = string(k)
+	}
+	return strings.Join(n, ", ")
+}
+
+func writableKindNames() string {
+	var n []string
+	for _, k := range store.Kinds {
+		if k != store.KindHandoff {
+			n = append(n, string(k))
+		}
 	}
 	return strings.Join(n, ", ")
 }
@@ -54,6 +68,69 @@ func parseKinds(s string) []store.Kind {
 		}
 	}
 	return out
+}
+
+func parseTags(s string) []string {
+	if strings.TrimSpace(s) == "" {
+		return nil
+	}
+	return store.NormalizeTags(strings.Split(s, ","))
+}
+
+func parseIDList(s string) ([]int64, error) {
+	if strings.TrimSpace(s) == "" {
+		return nil, nil
+	}
+	var ids []int64
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		id, err := parseID(part)
+		if err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, nil
+}
+
+func parseItems(s string) []string {
+	var out []string
+	for _, part := range strings.FieldsFunc(s, func(r rune) bool { return r == ',' || r == '\n' }) {
+		if part = strings.TrimSpace(part); part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
+}
+
+func readPositionalOrStdin(pos []string, r io.Reader) (string, error) {
+	if len(pos) == 1 && pos[0] == "-" {
+		b, err := io.ReadAll(r)
+		if err != nil {
+			return "", fmt.Errorf("read stdin: %w", err)
+		}
+		return string(b), nil
+	}
+	return strings.Join(pos, " "), nil
+}
+
+func cliActor(cfg config.Config) string {
+	if cfg.Source != "" {
+		return cfg.Source
+	}
+	return cliSource
+}
+
+func writeJSON(w io.Writer, v any) error {
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(v); err != nil {
+		return fmt.Errorf("encode json: %w", err)
+	}
+	return nil
 }
 
 // namespaceFilter returns the namespace to filter on: only when --namespace
@@ -106,13 +183,21 @@ func (a app) cmdList(ctx context.Context, args []string) error {
 		return err
 	}
 	defer func() { _ = st.Close() }()
-	filter := store.ListFilter{Namespace: namespaceFilter(fs, cfg), Kinds: parseKinds(f.kinds), Limit: f.limit}
+	filter := store.ListFilter{
+		Namespace: namespaceFilter(fs, cfg),
+		Kinds:     parseKinds(f.kinds),
+		Tags:      parseTags(f.tags),
+		Limit:     f.limit,
+	}
 	if f.archived {
 		filter.Archived = store.IncludeArchived
 	}
 	ms, err := st.List(ctx, filter)
 	if err != nil {
 		return err
+	}
+	if f.asJSON {
+		return writeJSON(a.stdout, ms)
 	}
 	if len(ms) == 0 {
 		fmt.Fprintln(a.stdout, "No memories.")
@@ -131,6 +216,7 @@ func (a app) cmdList(ctx context.Context, args []string) error {
 func (a app) cmdShow(ctx context.Context, args []string) error {
 	fs := a.newFlagSet("show")
 	flags := config.Register(fs)
+	asJSON := fs.Bool("json", false, "output as JSON")
 	pos, err := parse(fs, args, 1, 1)
 	if err != nil {
 		return err
@@ -151,6 +237,12 @@ func (a app) cmdShow(ctx context.Context, args []string) error {
 	hs, err := st.History(ctx, id)
 	if err != nil {
 		return err
+	}
+	if *asJSON {
+		return writeJSON(a.stdout, struct {
+			Memory  store.Memory         `json:"memory"`
+			History []store.HistoryEntry `json:"history"`
+		}{Memory: m, History: hs})
 	}
 	w := a.stdout
 	fmt.Fprintf(w, "#%d  %s  [%s]\n", m.ID, m.Namespace, kindLabel(m))
@@ -208,11 +300,18 @@ func (a app) cmdSearch(ctx context.Context, args []string) error {
 		engine = e
 	}
 	res, err := engine.Search(ctx, store.SearchQuery{
-		Query: strings.Join(pos, " "), Namespace: namespaceFilter(fs, cfg), Kinds: parseKinds(f.kinds),
-		IncludeArchived: f.archived, Limit: f.limit,
+		Query:           strings.Join(pos, " "),
+		Namespace:       namespaceFilter(fs, cfg),
+		Kinds:           parseKinds(f.kinds),
+		Tags:            parseTags(f.tags),
+		IncludeArchived: f.archived,
+		Limit:           f.limit,
 	})
 	if err != nil {
 		return err
+	}
+	if f.asJSON {
+		return writeJSON(a.stdout, res)
 	}
 	if len(res) == 0 {
 		fmt.Fprintln(a.stdout, "No results.")
@@ -412,6 +511,7 @@ func (a app) cmdImport(ctx context.Context, args []string) error {
 func (a app) cmdStats(ctx context.Context, args []string) error {
 	fs := a.newFlagSet("stats")
 	flags := config.Register(fs)
+	asJSON := fs.Bool("json", false, "output as JSON")
 	if _, err := parse(fs, args, 0, 0); err != nil {
 		return err
 	}
@@ -423,6 +523,9 @@ func (a app) cmdStats(ctx context.Context, args []string) error {
 	s, err := st.Stats(ctx)
 	if err != nil {
 		return err
+	}
+	if *asJSON {
+		return writeJSON(a.stdout, s)
 	}
 	w := a.stdout
 	fmt.Fprintf(w, "Database: %s\nSize:     %s (schema %d)\nMemories: %d active, %d archived\n",
@@ -491,6 +594,157 @@ func (a app) cmdReindex(ctx context.Context, args []string) error {
 		return fmt.Errorf("reindex stopped after %d memories: %w", n, err)
 	}
 	fmt.Fprintf(a.stdout, "Indexed %d memor%s with model %s.\n", n, plural(n, "y", "ies"), engine.Model())
+	return nil
+}
+
+// ---- remember / forget / handoff -------------------------------------------
+
+func (a app) cmdRemember(ctx context.Context, args []string) error {
+	fs := a.newFlagSet("remember")
+	flags := config.Register(fs)
+	kind := fs.String("kind", "", "memory kind: "+writableKindNames())
+	title := fs.String("title", "", "one-line summary")
+	tags := fs.String("tag", "", "comma-separated tags")
+	importance := fs.Int("importance", store.DefaultImportance, "1 (low), 2 (normal), 3 (essential)")
+	supersedes := fs.String("supersedes", "", "comma-separated IDs to archive")
+	asJSON := fs.Bool("json", false, "output as JSON")
+	pos, err := parse(fs, args, 1, -1)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(*kind) == "" {
+		fmt.Fprintln(a.stderr, "remember requires --kind")
+		return errUsage
+	}
+	if store.Kind(*kind) == store.KindHandoff {
+		return errors.New("use `llm-memory handoff` for handoffs")
+	}
+	supIDs, err := parseIDList(*supersedes)
+	if err != nil {
+		return err
+	}
+	content, err := readPositionalOrStdin(pos, a.stdin)
+	if err != nil {
+		return err
+	}
+	st, cfg, err := a.openStore(ctx, flags)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = st.Close() }()
+	m, archived, err := st.CreateDetailed(ctx, store.NewMemory{
+		Namespace:  cfg.Namespace,
+		Kind:       store.Kind(*kind),
+		Title:      *title,
+		Content:    content,
+		Tags:       parseTags(*tags),
+		Importance: *importance,
+		Source:     cliActor(cfg),
+		Supersedes: supIDs,
+	})
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		return writeJSON(a.stdout, struct {
+			Memory     store.Memory `json:"memory"`
+			Superseded []int64      `json:"superseded,omitempty"`
+		}{Memory: m, Superseded: archived})
+	}
+	fmt.Fprintf(a.stdout, "Created #%d (%s, %s): %s\n", m.ID, m.Namespace, m.Kind, summary(m))
+	return nil
+}
+
+func (a app) cmdForget(ctx context.Context, args []string) error {
+	fs := a.newFlagSet("forget")
+	flags := config.Register(fs)
+	reason := fs.String("reason", "", "why the memory is archived")
+	asJSON := fs.Bool("json", false, "output as JSON")
+	pos, err := parse(fs, args, 1, -1)
+	if err != nil {
+		return err
+	}
+	ids := make([]int64, len(pos))
+	for i, p := range pos {
+		id, err := parseID(p)
+		if err != nil {
+			return err
+		}
+		ids[i] = id
+	}
+	st, cfg, err := a.openStore(ctx, flags)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = st.Close() }()
+	actor := cliActor(cfg)
+	archived := make([]store.Memory, 0, len(ids))
+	for _, id := range ids {
+		m, err := st.Archive(ctx, id, actor, *reason)
+		if err != nil {
+			return err
+		}
+		archived = append(archived, m)
+	}
+	if *asJSON {
+		return writeJSON(a.stdout, archived)
+	}
+	for _, m := range archived {
+		fmt.Fprintf(a.stdout, "Archived #%d (%s, %s): %s\n", m.ID, m.Namespace, m.Kind, summary(m))
+	}
+	return nil
+}
+
+func (a app) cmdHandoff(ctx context.Context, args []string) error {
+	fs := a.newFlagSet("handoff")
+	flags := config.Register(fs)
+	next := fs.String("next", "", "comma- or newline-separated next steps")
+	questions := fs.String("questions", "", "comma- or newline-separated open questions")
+	supersedes := fs.String("supersedes", "", "comma-separated IDs to archive")
+	desc := fs.String("description", "", "optional namespace description")
+	asJSON := fs.Bool("json", false, "output as JSON")
+	pos, err := parse(fs, args, 1, -1)
+	if err != nil {
+		return err
+	}
+	supIDs, err := parseIDList(*supersedes)
+	if err != nil {
+		return err
+	}
+	rawSummary, err := readPositionalOrStdin(pos, a.stdin)
+	if err != nil {
+		return err
+	}
+	sum := strings.TrimSpace(rawSummary)
+	if sum == "" {
+		return errors.New("summary must not be empty")
+	}
+	st, cfg, err := a.openStore(ctx, flags)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = st.Close() }()
+	title, content := server.FormatHandoff(sum, parseItems(*next), parseItems(*questions))
+	m, replaced, err := st.CreateDetailed(ctx, store.NewMemory{
+		Namespace:            cfg.Namespace,
+		NamespaceDescription: *desc,
+		Kind:                 store.KindHandoff,
+		Title:                title,
+		Content:              content,
+		Importance:           store.DefaultImportance,
+		Source:               cliActor(cfg),
+		Supersedes:           supIDs,
+	})
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		return writeJSON(a.stdout, struct {
+			Memory   store.Memory `json:"memory"`
+			Replaced []int64      `json:"replaced,omitempty"`
+		}{Memory: m, Replaced: replaced})
+	}
+	fmt.Fprintf(a.stdout, "Handoff #%d (%s): %s\n", m.ID, m.Namespace, summary(m))
 	return nil
 }
 

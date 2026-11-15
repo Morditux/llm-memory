@@ -153,7 +153,7 @@ func (e *Engine) Search(ctx context.Context, q store.SearchQuery) ([]store.Searc
 		return truncate(fts, limit), nil
 	}
 	vecs, err := e.store.Vectors(ctx, e.emb.Model(), store.VectorFilter{
-		Namespace: q.Namespace, Kinds: q.Kinds, IncludeArchived: q.IncludeArchived,
+		Namespace: q.Namespace, Kinds: q.Kinds, Tags: q.Tags, IncludeArchived: q.IncludeArchived,
 	})
 	if err != nil {
 		return nil, err
@@ -235,7 +235,14 @@ func (e *Engine) fuse(ctx context.Context, fts []store.SearchResult, nearest []s
 	}
 	out := make([]store.SearchResult, 0, len(byID))
 	for id, r := range byID {
-		r.Score = -rrf[id] // keep "lower is better", like bm25
+		weight := 1.0
+		switch r.Importance {
+		case 3:
+			weight = 1.15
+		case 1:
+			weight = 0.90
+		}
+		r.Score = -(rrf[id] * weight) // keep "lower is better", like bm25
 		out = append(out, r)
 	}
 	sort.Slice(out, func(i, j int) bool {

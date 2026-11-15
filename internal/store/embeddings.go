@@ -47,10 +47,10 @@ func DecodeVector(b []byte) ([]float32, error) {
 const missingEmbeddingsWhere = ` FROM memories m
 	WHERE NOT EXISTS (SELECT 1 FROM memory_embeddings e WHERE e.memory_id = m.id AND e.model = ?)`
 
-// MissingEmbeddings returns up to limit memories (archived included, most
-// recent first) that have no embedding for model. limit <= 0 means all.
+// MissingEmbeddings returns up to limit memories (active first, then archived,
+// most recent first) that have no embedding for model. limit <= 0 means all.
 func (s *Store) MissingEmbeddings(ctx context.Context, model string, limit int) ([]EmbeddingSource, error) {
-	q := "SELECT m.id, m.title, m.content, m.tags" + missingEmbeddingsWhere + " ORDER BY m.id DESC"
+	q := "SELECT m.id, m.title, m.content, m.tags" + missingEmbeddingsWhere + " ORDER BY (m.archived_at IS NULL) DESC, m.id DESC"
 	args := []any{model}
 	if limit > 0 {
 		q += " LIMIT ?"
@@ -127,6 +127,7 @@ func (s *Store) DeleteEmbeddings(ctx context.Context, model string) (int, error)
 type VectorFilter struct {
 	Namespace       string
 	Kinds           []Kind
+	Tags            []string
 	IncludeArchived bool
 }
 
@@ -139,7 +140,7 @@ func (s *Store) Vectors(ctx context.Context, model string, f VectorFilter) ([]Ve
 			return nil, err
 		}
 	}
-	filter, fargs := filterSQL(ns, f.Kinds, f.IncludeArchived, 0)
+	filter, fargs := filterSQL(ns, f.Kinds, f.Tags, f.IncludeArchived, 0)
 	q := `SELECT e.memory_id, e.vector FROM memory_embeddings e JOIN memories m ON m.id = e.memory_id
 		WHERE e.model = ?` + filter + ` ORDER BY e.memory_id`
 	rows, err := s.db.QueryContext(ctx, q, append([]any{model}, fargs...)...)

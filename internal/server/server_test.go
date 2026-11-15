@@ -326,7 +326,11 @@ func TestToolErrors(t *testing.T) {
 	callErr(t, cs, "update_memory", map[string]any{"id": 999, "title": "x"}, "does not exist")
 	callErr(t, cs, "forget", map[string]any{"id": 999}, "does not exist")
 	callErr(t, cs, "recall", map[string]any{"query": "x", "namespace": "nowhere"}, "nowhere", "global", "list_namespaces")
-	callErr(t, cs, "get_context", map[string]any{"namespace": "nowhere"}, "nowhere", "global", "remember")
+	// Unknown valid namespace in get_context returns an empty briefing without error; invalid name returns error.
+	if b := briefingText(t, cs, map[string]any{"namespace": "nowhere"}); !strings.Contains(b, `namespace "nowhere"`) || !strings.Contains(b, "0 active memories") {
+		t.Errorf("get_context on uncreated namespace: %s", b)
+	}
+	callErr(t, cs, "get_context", map[string]any{"namespace": "-bad"}, "namespace")
 	callErr(t, cs, "remember", map[string]any{"content": "x", "kind": "opinion"})               // schema enum
 	callErr(t, cs, "remember", map[string]any{"content": "x", "kind": "handoff"})               // handoff tool only
 	callErr(t, cs, "remember", map[string]any{"kind": "fact"})                                  // missing content
@@ -334,11 +338,17 @@ func TestToolErrors(t *testing.T) {
 	callErr(t, cs, "remember", map[string]any{"content": "x", "kind": "fact", "importance": 7}) // bounds
 	callErr(t, cs, "remember", map[string]any{"content": "x", "kind": "fact", "namespace": "-x"}, "namespace")
 	callErr(t, cs, "remember", map[string]any{"content": strings.Repeat("a", 8001), "kind": "fact"})
+	callErr(t, cs, "remember", map[string]any{"content": "key: sk-proj-" + strings.Repeat("a", 28), "kind": "fact"}, "secret")
 	callErr(t, cs, "handoff", map[string]any{"summary": "  "}, "summary")
 
 	m := callOK[RememberOutput](t, cs, "remember", map[string]any{"content": "x", "kind": "fact"})
 	callErr(t, cs, "update_memory", map[string]any{"id": m.Memory.ID}, "no field to change")
-	callErr(t, cs, "update_memory", map[string]any{"id": m.Memory.ID, "namespace": "nowhere"}, "nowhere")
+	callErr(t, cs, "update_memory", map[string]any{"id": m.Memory.ID, "namespace": "-bad"}, "namespace")
+	callErr(t, cs, "update_memory", map[string]any{"id": m.Memory.ID, "content": "sk-proj-" + strings.Repeat("a", 28)}, "secret")
+	moved := callOK[UpdateMemoryOutput](t, cs, "update_memory", map[string]any{"id": m.Memory.ID, "namespace": "nowhere"})
+	if moved.Memory.Namespace != "nowhere" {
+		t.Errorf("update_memory should create namespace: %+v", moved)
+	}
 	callOK[ForgetOutput](t, cs, "forget", map[string]any{"id": m.Memory.ID})
 	callErr(t, cs, "forget", map[string]any{"id": m.Memory.ID}, "already archived")
 	callErr(t, cs, "update_memory", map[string]any{"id": m.Memory.ID, "title": "y"}, "archived")
@@ -409,5 +419,101 @@ func TestRecallUsesSearcher(t *testing.T) {
 	}
 	if strings.Contains(desc(v1), "Semantic") || !strings.Contains(desc(sem), "Semantic search is enabled") {
 		t.Errorf("recall descriptions:\nv1: %s\nsemantic: %s", desc(v1), desc(sem))
+	}
+}
+
+func TestRecallTagsAndHandoffSupersedesDescription(t *testing.T) {
+	cs := newSession(t, "a")
+	task := callOK[RememberOutput](t, cs, "remember", map[string]any{
+		"content": "Implémenter les filtres de recherche", "kind": "task_state", "namespace": "demo", "tags": []string{"search", "v2"},
+	})
+	_ = callOK[RememberOutput](t, cs, "remember", map[string]any{
+		"content": "Déploiement Docker", "kind": "fact", "namespace": "demo", "tags": []string{"infra"},
+	})
+
+	rc := callOK[RecallOutput](t, cs, "recall", map[string]any{"query": "", "tags": []string{"search", "v2"}})
+	if len(rc.Results) != 1 || rc.Results[0].ID != task.Memory.ID {
+		t.Fatalf("recall by tags: %+v", rc)
+	}
+
+	h := callOK[HandoffOutput](t, cs, "handoff", map[string]any{
+		"summary":               "Filtres terminés.",
+		"namespace":             "demo",
+		"namespace_description": "Projet de démonstration",
+		"supersedes":            []int64{task.Memory.ID},
+	})
+	if !slices.Equal(h.Replaced, []int64{task.Memory.ID}) {
+		t.Fatalf("handoff supersedes: %+v", h)
+	}
+	g := callOK[GetMemoryOutput](t, cs, "get_memory", map[string]any{"id": task.Memory.ID})
+	if g.Memory.ArchivedAt == "" {
+		t.Errorf("task_state #%d should be archived", task.Memory.ID)
+	}
+	ln := callOK[ListNamespacesOutput](t, cs, "list_namespaces", nil)
+	var foundDesc string
+	for _, n := range ln.Namespaces {
+		if n.Name == "demo" {
+			foundDesc = n.Description
+		}
+	}
+	if foundDesc != "Projet de démonstration" {
+		t.Errorf("namespace description = %q", foundDesc)
+	}
+}
+
+func TestResourcesAndPrompts(t *testing.T) {
+	st := openStore(t, filepath.Join(t.TempDir(), "mem.db"))
+	cs := connect(t, st, Options{DefaultNamespace: "global"}, "client-a")
+	ctx := context.Background()
+
+	callOK[RememberOutput](t, cs, "remember", map[string]any{
+		"content": "Préférer Go pour les CLI.", "kind": "preference", "namespace": "global",
+	})
+	callOK[RememberOutput](t, cs, "remember", map[string]any{
+		"content": "Base SQLite en mode WAL.", "kind": "decision", "namespace": "demo",
+	})
+
+	// ListResources & ListResourceTemplates
+	lr, err := cs.ListResources(ctx, nil)
+	if err != nil || len(lr.Resources) != 1 || lr.Resources[0].URI != contextResourceURI {
+		t.Fatalf("ListResources = %+v, %v", lr, err)
+	}
+	lt, err := cs.ListResourceTemplates(ctx, nil)
+	if err != nil || len(lt.ResourceTemplates) != 1 || lt.ResourceTemplates[0].URITemplate != contextResourceURITemplate {
+		t.Fatalf("ListResourceTemplates = %+v, %v", lt, err)
+	}
+
+	// Read default resource & templated resource
+	rDef, err := cs.ReadResource(ctx, &mcp.ReadResourceParams{URI: "memory://context"})
+	if err != nil || len(rDef.Contents) != 1 || !strings.Contains(rDef.Contents[0].Text, "Préférer Go") {
+		t.Fatalf("ReadResource default = %+v, %v", rDef, err)
+	}
+	rDemo, err := cs.ReadResource(ctx, &mcp.ReadResourceParams{URI: "memory://context/demo"})
+	if err != nil || len(rDemo.Contents) != 1 || !strings.Contains(rDemo.Contents[0].Text, "Base SQLite") {
+		t.Fatalf("ReadResource demo = %+v, %v", rDemo, err)
+	}
+	if _, err := cs.ReadResource(ctx, &mcp.ReadResourceParams{URI: "memory://context/-bad"}); err == nil {
+		t.Error("expected error reading invalid namespace resource")
+	}
+
+	// ListPrompts & GetPrompt
+	lp, err := cs.ListPrompts(ctx, nil)
+	if err != nil || len(lp.Prompts) != 2 {
+		t.Fatalf("ListPrompts = %+v, %v", lp, err)
+	}
+	pb, err := cs.GetPrompt(ctx, &mcp.GetPromptParams{Name: "briefing", Arguments: map[string]string{"namespace": "demo"}})
+	if err != nil || len(pb.Messages) != 1 {
+		t.Fatalf("GetPrompt briefing = %+v, %v", pb, err)
+	}
+	if tc, ok := pb.Messages[0].Content.(*mcp.TextContent); !ok || !strings.Contains(tc.Text, "Base SQLite") {
+		t.Errorf("briefing prompt content = %#v", pb.Messages[0].Content)
+	}
+
+	ph, err := cs.GetPrompt(ctx, &mcp.GetPromptParams{Name: "handoff", Arguments: map[string]string{"namespace": "demo"}})
+	if err != nil || len(ph.Messages) != 1 {
+		t.Fatalf("GetPrompt handoff = %+v, %v", ph, err)
+	}
+	if tc, ok := ph.Messages[0].Content.(*mcp.TextContent); !ok || !strings.Contains(tc.Text, "supersedes") || !strings.Contains(tc.Text, `"demo"`) {
+		t.Errorf("handoff prompt content = %#v", ph.Messages[0].Content)
 	}
 }

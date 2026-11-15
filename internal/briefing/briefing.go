@@ -4,6 +4,7 @@ package briefing
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -27,27 +28,37 @@ type Options struct {
 	MaxChars  int    // default 6000, minimum 400
 }
 
-// Build loads the namespace and renders its briefing. It returns a
-// *store.NamespaceNotFoundError if the namespace does not exist.
+// Build loads the namespace and renders its briefing. If a valid namespace does
+// not exist yet, it still renders an empty briefing (plus global memories and
+// existing namespaces) without creating the namespace in the store.
 func Build(ctx context.Context, st *store.Store, opt Options) (string, error) {
 	nsName := opt.Namespace
 	if strings.TrimSpace(nsName) == "" {
 		nsName = store.DefaultNamespace
 	}
-	ns, err := st.RequireNamespace(ctx, nsName)
+	ns, err := store.NormalizeNamespace(nsName)
 	if err != nil {
 		return "", err
 	}
 	d := data{namespace: ns}
-	if d.active, err = st.List(ctx, store.ListFilter{Namespace: ns}); err != nil {
-		return "", err
-	}
-	last, err := st.List(ctx, store.ListFilter{Namespace: ns, Archived: store.IncludeArchived, Limit: 1})
-	if err != nil {
-		return "", err
-	}
-	if len(last) > 0 {
-		d.last = &last[0]
+	_, reqErr := st.RequireNamespace(ctx, ns)
+	var nf *store.NamespaceNotFoundError
+	switch {
+	case reqErr == nil:
+		if d.active, err = st.List(ctx, store.ListFilter{Namespace: ns}); err != nil {
+			return "", err
+		}
+		last, err := st.List(ctx, store.ListFilter{Namespace: ns, Archived: store.IncludeArchived, Limit: 1})
+		if err != nil {
+			return "", err
+		}
+		if len(last) > 0 {
+			d.last = &last[0]
+		}
+	case errors.As(reqErr, &nf):
+		// Namespace has no memories yet: render an empty briefing without creating it.
+	default:
+		return "", reqErr
 	}
 	if ns != store.DefaultNamespace {
 		if d.global, err = st.List(ctx, store.ListFilter{Namespace: store.DefaultNamespace}); err != nil {

@@ -63,12 +63,6 @@ func (s *srv) getContext(ctx context.Context, req *mcp.CallToolRequest, in GetCo
 	ns := s.namespace(in.Namespace)
 	text, err := briefing.Build(ctx, s.store, briefing.Options{Namespace: ns, MaxChars: in.MaxChars})
 	if err != nil {
-		var nf *store.NamespaceNotFoundError
-		if errors.As(err, &nf) {
-			return nil, nil, fmt.Errorf("namespace %q has no memory yet. Existing namespaces: %s. "+
-				"Pick one of them, or start this one by calling remember or handoff with namespace=%q",
-				nf.Name, strings.Join(nf.Existing, ", "), nf.Name)
-		}
 		return nil, nil, s.toolError(ctx, req, "get_context", err)
 	}
 	s.logCall(ctx, req, "get_context", "namespace", ns)
@@ -155,6 +149,7 @@ type RecallInput struct {
 	Query           string   `json:"query" jsonschema:"Plain words to look for (no special syntax; accents and case are ignored, words match as prefixes). Empty returns the most recent memories."`
 	Namespace       string   `json:"namespace,omitempty" jsonschema:"Restrict to one namespace. Omit to search all namespaces."`
 	Kinds           []string `json:"kinds,omitempty" jsonschema:"Restrict to these kinds."`
+	Tags            []string `json:"tags,omitempty" jsonschema:"Restrict to memories having all of these tags."`
 	Limit           int      `json:"limit,omitempty" jsonschema:"Maximum number of results. Default 10, maximum 50."`
 	IncludeArchived bool     `json:"include_archived,omitempty" jsonschema:"Also search forgotten (archived) memories."`
 }
@@ -180,7 +175,7 @@ type RecallOutput struct {
 
 func (s *srv) recall(ctx context.Context, req *mcp.CallToolRequest, in RecallInput) (*mcp.CallToolResult, RecallOutput, error) {
 	res, err := s.search.Search(ctx, store.SearchQuery{
-		Query: in.Query, Namespace: in.Namespace, Kinds: kinds(in.Kinds),
+		Query: in.Query, Namespace: in.Namespace, Kinds: kinds(in.Kinds), Tags: in.Tags,
 		IncludeArchived: in.IncludeArchived, Limit: in.Limit,
 	})
 	if err != nil {
@@ -268,7 +263,7 @@ type UpdateMemoryInput struct {
 	Tags       *[]string `json:"tags,omitempty" jsonschema:"New complete tag list (replaces the old one)."`
 	Importance *int      `json:"importance,omitempty" jsonschema:"1 = low, 2 = normal, 3 = always shown by get_context."`
 	Kind       *string   `json:"kind,omitempty" jsonschema:"New kind."`
-	Namespace  *string   `json:"namespace,omitempty" jsonschema:"Move to this existing namespace."`
+	Namespace  *string   `json:"namespace,omitempty" jsonschema:"Move to this namespace (created if new)."`
 }
 
 // UpdateMemoryOutput is the output of update_memory.
@@ -331,32 +326,42 @@ func (s *srv) forget(ctx context.Context, req *mcp.CallToolRequest, in ForgetInp
 
 // HandoffInput is the input of handoff.
 type HandoffInput struct {
-	Summary       string   `json:"summary" jsonschema:"Where the work stands: what was done, what was decided, current state. Written for another assistant with no access to this conversation."`
-	NextSteps     []string `json:"next_steps,omitempty" jsonschema:"Concrete next actions, in order."`
-	OpenQuestions []string `json:"open_questions,omitempty" jsonschema:"Questions still waiting for the user or unresolved."`
-	Namespace     string   `json:"namespace,omitempty" jsonschema:"Project namespace. Omit for the server default."`
+	Summary              string   `json:"summary" jsonschema:"Where the work stands: what was done, what was decided, current state. Written for another assistant with no access to this conversation."`
+	NextSteps            []string `json:"next_steps,omitempty" jsonschema:"Concrete next actions, in order."`
+	OpenQuestions        []string `json:"open_questions,omitempty" jsonschema:"Questions still waiting for the user or unresolved."`
+	Namespace            string   `json:"namespace,omitempty" jsonschema:"Project namespace. Omit for the server default."`
+	NamespaceDescription string   `json:"namespace_description,omitempty" jsonschema:"Optional one-line description of the project namespace."`
+	Supersedes           []int64  `json:"supersedes,omitempty" jsonschema:"IDs of completed task_state or obsolete memories to archive along with this handoff."`
 }
 
 // HandoffOutput is the output of handoff.
 type HandoffOutput struct {
 	Memory   MemoryView `json:"memory"`
-	Replaced []int64    `json:"replaced,omitempty" jsonschema:"Previous handoff(s) of the namespace, now archived."`
+	Replaced []int64    `json:"replaced,omitempty" jsonschema:"Previous handoff(s) of the namespace and superseded memories, now archived."`
 }
 
 const maxHandoffTitle = 80
+
+// FormatHandoff builds the title and Markdown body of a handoff memory.
+func FormatHandoff(summary string, next, questions []string) (string, string) {
+	return handoffTitle(summary), handoffContent(summary, next, questions)
+}
 
 func (s *srv) handoff(ctx context.Context, req *mcp.CallToolRequest, in HandoffInput) (*mcp.CallToolResult, HandoffOutput, error) {
 	summary := strings.TrimSpace(in.Summary)
 	if summary == "" {
 		return nil, HandoffOutput{}, errors.New("summary must not be empty: describe where the work stands")
 	}
+	title, content := FormatHandoff(summary, in.NextSteps, in.OpenQuestions)
 	m, archived, err := s.store.CreateDetailed(ctx, store.NewMemory{
-		Namespace:  s.namespace(in.Namespace),
-		Kind:       store.KindHandoff,
-		Title:      handoffTitle(summary),
-		Content:    handoffContent(summary, in.NextSteps, in.OpenQuestions),
-		Importance: store.DefaultImportance,
-		Source:     s.source(req),
+		Namespace:            s.namespace(in.Namespace),
+		NamespaceDescription: in.NamespaceDescription,
+		Kind:                 store.KindHandoff,
+		Title:                title,
+		Content:              content,
+		Importance:           store.DefaultImportance,
+		Source:               s.source(req),
+		Supersedes:           in.Supersedes,
 	})
 	if err != nil {
 		return nil, HandoffOutput{}, s.toolError(ctx, req, "handoff", err)

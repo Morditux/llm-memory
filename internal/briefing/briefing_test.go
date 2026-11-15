@@ -201,10 +201,24 @@ func TestContentOrderAndDedup(t *testing.T) {
 
 func TestUnknownNamespace(t *testing.T) {
 	s := newStore(t)
-	_, err := Build(context.Background(), s, Options{Namespace: "nope"})
+	ctx := context.Background()
+	out, err := Build(ctx, s, Options{Namespace: "nope"})
+	if err != nil {
+		t.Fatalf("Build(nope): %v", err)
+	}
+	for _, want := range []string{`# Shared memory — namespace "nope"`, "0 active memories", "Other namespaces: global (0)"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q in:\n%s", want, out)
+		}
+	}
+	// Must not create the namespace in the database.
 	var nf *store.NamespaceNotFoundError
-	if !errors.As(err, &nf) {
-		t.Fatalf("err = %v, want NamespaceNotFoundError", err)
+	if _, err := s.RequireNamespace(ctx, "nope"); !errors.As(err, &nf) {
+		t.Errorf("Build created namespace nope unexpectedly: %v", err)
+	}
+
+	if _, err := Build(ctx, s, Options{Namespace: "-bad"}); err == nil {
+		t.Error("expected validation error for -bad")
 	}
 }
 

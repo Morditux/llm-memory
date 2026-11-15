@@ -29,6 +29,7 @@ type SearchQuery struct {
 	Query           string // free text; never interpreted as FTS5 syntax
 	Namespace       string // exact namespace; empty = all. Must exist if set.
 	Kinds           []Kind
+	Tags            []string
 	IncludeArchived bool
 	Limit           int // default 10, capped at 50
 }
@@ -113,18 +114,18 @@ func (s *Store) Search(ctx context.Context, q SearchQuery) ([]SearchResult, erro
 
 	terms := queryTerms(q.Query, maxQueryTerms)
 	if len(terms) == 0 {
-		return s.recent(ctx, ns, q.Kinds, q.IncludeArchived, limit)
+		return s.recent(ctx, ns, q.Kinds, q.Tags, q.IncludeArchived, limit)
 	}
-	res, err := s.match(ctx, buildMatch(terms, true, "AND"), ns, q.Kinds, q.IncludeArchived, 0, limit)
+	res, err := s.match(ctx, buildMatch(terms, true, "AND"), ns, q.Kinds, q.Tags, q.IncludeArchived, 0, limit)
 	if err != nil || len(res) > 0 || len(terms) == 1 {
 		return res, err
 	}
-	return s.match(ctx, buildMatch(terms, true, "OR"), ns, q.Kinds, q.IncludeArchived, 0, limit)
+	return s.match(ctx, buildMatch(terms, true, "OR"), ns, q.Kinds, q.Tags, q.IncludeArchived, 0, limit)
 }
 
 // filterSQL builds the WHERE fragments shared by search queries. Column
 // names are fixed; values are bound parameters.
-func filterSQL(ns string, kinds []Kind, includeArchived bool, excludeID int64) (string, []any) {
+func filterSQL(ns string, kinds []Kind, tags []string, includeArchived bool, excludeID int64) (string, []any) {
 	var where []string
 	var args []any
 	if ns != "" {
@@ -137,6 +138,10 @@ func filterSQL(ns string, kinds []Kind, includeArchived bool, excludeID int64) (
 			args = append(args, string(k))
 		}
 		where = append(where, "m.kind IN ("+strings.Join(ph, ", ")+")")
+	}
+	for _, t := range NormalizeTags(tags) {
+		where = append(where, "instr(' ' || m.tags || ' ', ' ' || ? || ' ') > 0")
+		args = append(args, t)
 	}
 	if !includeArchived {
 		where = append(where, "m.archived_at IS NULL")
@@ -153,11 +158,11 @@ func filterSQL(ns string, kinds []Kind, includeArchived bool, excludeID int64) (
 const prefixedColumns = `m.id, m.namespace, m.kind, m.title, m.content, m.tags, m.importance, m.source,
 	m.created_at, m.updated_at, m.updated_by, m.archived_at`
 
-func (s *Store) match(ctx context.Context, expr, ns string, kinds []Kind, includeArchived bool, excludeID int64, limit int) ([]SearchResult, error) {
-	filter, fargs := filterSQL(ns, kinds, includeArchived, excludeID)
+func (s *Store) match(ctx context.Context, expr, ns string, kinds []Kind, tags []string, includeArchived bool, excludeID int64, limit int) ([]SearchResult, error) {
+	filter, fargs := filterSQL(ns, kinds, tags, includeArchived, excludeID)
 	query := `SELECT ` + prefixedColumns + `,
 			snippet(memories_fts, -1, ?, ?, ?, ?),
-			bm25(memories_fts, 2.0, 1.0, 1.0) AS score
+			bm25(memories_fts, 2.0, 1.0, 1.0) * (CASE m.importance WHEN 3 THEN 1.25 WHEN 1 THEN 0.85 ELSE 1.0 END) AS score
 		FROM memories_fts JOIN memories m ON m.id = memories_fts.rowid
 		WHERE memories_fts MATCH ?` + filter + `
 		ORDER BY score, m.id DESC
@@ -196,8 +201,8 @@ type rowScanner struct {
 
 func (r rowScanner) Scan(dest ...any) error { return r.sc.Scan(append(dest, r.extra...)...) }
 
-func (s *Store) recent(ctx context.Context, ns string, kinds []Kind, includeArchived bool, limit int) ([]SearchResult, error) {
-	filter, args := filterSQL(ns, kinds, includeArchived, 0)
+func (s *Store) recent(ctx context.Context, ns string, kinds []Kind, tags []string, includeArchived bool, limit int) ([]SearchResult, error) {
+	filter, args := filterSQL(ns, kinds, tags, includeArchived, 0)
 	query := "SELECT " + prefixedColumns + " FROM memories m WHERE 1=1" + filter +
 		" ORDER BY m.updated_at DESC, m.id DESC LIMIT ?"
 	ms, err := queryMemories(ctx, s.db, query, append(args, limit)...)
@@ -265,7 +270,7 @@ func (s *Store) FindSimilar(ctx context.Context, text, ns string, n int, exclude
 		terms = terms[:maxSimilarTerms]
 	}
 
-	cands, err := s.match(ctx, buildMatch(terms, false, "OR"), ns, nil, false, excludeID, 4*n+6)
+	cands, err := s.match(ctx, buildMatch(terms, false, "OR"), ns, nil, nil, false, excludeID, 4*n+6)
 	if err != nil {
 		return nil, err
 	}
@@ -302,12 +307,12 @@ func overlap(a, b map[string]bool) float64 {
 }
 
 // significantWords returns the folded (lowercase, unaccented) words of at
-// least 3 characters that are not common French/English stop words.
+// least 2 characters that are not common French/English stop words.
 func significantWords(s string) map[string]bool {
 	out := map[string]bool{}
 	for _, w := range queryTerms(s, -1) {
 		f := fold(w)
-		if len([]rune(f)) < 3 || stopWords[f] {
+		if len([]rune(f)) < 2 || stopWords[f] {
 			continue
 		}
 		out[f] = true
@@ -346,9 +351,11 @@ var foldMap = map[rune]string{
 var stopWords = func() map[string]bool {
 	m := map[string]bool{}
 	for _, w := range strings.Fields(`
+		le la de du un au en et ou ni ne je tu il on ce se sa ma ta vu va as ai es
 		les des une pour par sur dans avec sans sous entre vers chez est sont etait ete etre avoir
 		qui que quoi dont ces cet cette ses son mes mon tes ton nos notre votre vos leur leurs
 		plus moins tres aussi mais donc car pas comme tout tous toute toutes fait faire peut
+		or to in at by of is it be do if so no up my we he me us
 		the and for with without from into onto that this these those are was were been being
 		have has had not but all any can will would should could our your their its they them
 		than then there here which what when where who why how also only just use used using`) {

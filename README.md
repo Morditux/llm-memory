@@ -72,18 +72,23 @@ Priority: flag > environment variable > default.
 | `--source` | `LLM_MEMORY_SOURCE` | `clientInfo.name` of the MCP client | Author recorded for writes |
 | `--log-level` | `LLM_MEMORY_LOG_LEVEL` | `info` | Logs on stderr (`debug`, `info`, `warn`, `error`) |
 
-## MCP tools
+## MCP tools, resources & prompts
 
 | Tool | Role |
 | --- | --- |
 | `get_context` | Start-of-session Markdown briefing: latest handoff, essential memories, tasks, preferences, recent decisions and facts |
-| `remember` | Creates a memory (`preference`, `fact`, `decision`, `task_state`, `note`); reports probable duplicates; `supersedes` archives the replaced memories |
-| `recall` | Full-text search (accents and case ignored, words matched as prefixes), namespace / kinds filters |
+| `remember` | Creates a memory (`preference`, `fact`, `decision`, `task_state`, `note`); reports probable duplicates; `supersedes` archives the replaced memories; rejects detected secrets |
+| `recall` | Full-text search (accents and case ignored, words matched as prefixes), namespace / kinds / tags filters |
 | `get_memory` | Full content, history optional |
 | `update_memory` | Modifies the given fields; the old version stays in history |
 | `forget` | Archives (reversible with `llm-memory restore`) |
-| `handoff` | Handoff for the next LLM (summary, next steps, open questions); one active per namespace |
+| `handoff` | Handoff for the next LLM (summary, next steps, open questions, optional `supersedes` and `namespace_description`); one active per namespace |
 | `list_namespaces` | Namespaces, number of active memories, last activity |
+
+Resources & prompts:
+
+- **Resources**: `memory://context` (default namespace briefing) and `memory://context/{namespace}` (Markdown).
+- **Prompts**: `briefing` and `handoff` (both accept an optional `namespace` argument).
 
 A namespace usually maps to a project; `global` holds what applies everywhere
 (the user's preferences). A namespace is created by the first `remember` or `handoff` in it.
@@ -91,18 +96,21 @@ A namespace usually maps to a project; `global` holds what applies everywhere
 ## Administration (CLI)
 
 Flags may be placed before or after arguments. Writes made from the CLI are
-recorded with the author `cli`.
+recorded with the author `cli` (overridable with `--source`).
 
 ```bash
-llm-memory list [--namespace X] [--kind decision,fact] [--archived] [--limit N]
-llm-memory show 42                       # full content and history
-llm-memory search postgres jsonb         # same engine as recall
-llm-memory context --namespace demo      # exactly what get_context would return
+llm-memory remember --kind decision [--namespace X] [--title T] [--tag t1,t2] [--importance 2] [--supersedes 1,2] [--json] <content|->
+llm-memory handoff [--namespace X] [--next "step 1,step 2"] [--questions "q1"] [--supersedes 3] [--description "..."] [--json] <summary|->
+llm-memory forget [--reason "..."] [--json] <id>...
+llm-memory list [--namespace X] [--kind decision,fact] [--tag db,api] [--archived] [--limit N] [--json]
+llm-memory show [--json] 42              # full content and history
+llm-memory search [--tag db] [--json] postgres jsonb   # same engine as recall
+llm-memory context --namespace demo [--json]           # exactly what get_context would return
 llm-memory restore 42                    # un-archives
 llm-memory purge --archived-before 2026-01-01 [--yes]   # permanent deletion
 llm-memory export [--namespace X] [--history] [-o dump.json]
 llm-memory import [--dry-run] dump.json  # or - for stdin; exact duplicates are skipped
-llm-memory stats                         # per namespace, kind, source; file size
+llm-memory stats [--json]                # per namespace, kind, source; file size
 llm-memory reindex [--all]               # embeddings (semantic search only)
 ```
 

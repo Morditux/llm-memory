@@ -305,6 +305,45 @@ func TestFindSimilarLongText(t *testing.T) {
 	}
 }
 
+func TestSearchTagsAndImportanceWeight(t *testing.T) {
+	s, _ := seedCorpus(t)
+	ctx := context.Background()
+
+	// Tag filter: exact tag match ("db" should match tagged entries, not partial).
+	res := search(t, s, SearchQuery{Query: "postgresql", Tags: []string{"#DB", "postgres"}})
+	if len(res) != 2 {
+		t.Errorf("tag filter query: got %d (%s)", len(res), contentsOf(res))
+	}
+	res = search(t, s, SearchQuery{Tags: []string{"security"}})
+	if len(res) != 2 {
+		t.Errorf("tag filter empty query: got %d (%s)", len(res), contentsOf(res))
+	}
+
+	// Importance weighting: identical text, importance 3 outranks 2 and 1.
+	low, _ := s.Create(ctx, NewMemory{Namespace: "imp", Kind: KindFact, Content: "alpha beta widget", Importance: 1})
+	norm, _ := s.Create(ctx, NewMemory{Namespace: "imp", Kind: KindFact, Content: "alpha beta widget", Importance: 2})
+	high, _ := s.Create(ctx, NewMemory{Namespace: "imp", Kind: KindFact, Content: "alpha beta widget", Importance: 3})
+	res = search(t, s, SearchQuery{Query: "widget", Namespace: "imp"})
+	if len(res) != 3 || res[0].ID != high.ID || res[1].ID != norm.ID || res[2].ID != low.ID {
+		t.Errorf("importance ranking order: got [%d, %d, %d], want [%d, %d, %d]",
+			res[0].ID, res[1].ID, res[2].ID, high.ID, norm.ID, low.ID)
+	}
+}
+
+func TestSignificantWordsIncludesTwoLetterTechTerms(t *testing.T) {
+	w := significantWords("Le service en Go utilise une DB et la CI sur OS Linux")
+	for _, want := range []string{"go", "db", "ci", "os", "service", "linux"} {
+		if !w[want] {
+			t.Errorf("missing significant word %q in %v", want, w)
+		}
+	}
+	for _, stop := range []string{"le", "en", "et", "la", "de"} {
+		if w[stop] {
+			t.Errorf("stop word %q should be excluded", stop)
+		}
+	}
+}
+
 func TestFold(t *testing.T) {
 	for in, want := range map[string]string{"Économie": "economie", "Cœur": "coeur", "école": "ecole", "Straße": "strasse"} {
 		if got := fold(in); got != want {

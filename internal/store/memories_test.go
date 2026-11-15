@@ -184,10 +184,9 @@ func TestUpdate(t *testing.T) {
 	if _, err := s.Update(ctx, 999, Patch{Title: ptr("x")}, "b"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("unknown id: %v", err)
 	}
-	var nsErr *NamespaceNotFoundError
-	_, err = s.Update(ctx, m.ID, Patch{Namespace: ptr("nowhere")}, "b")
-	if !errors.As(err, &nsErr) || len(nsErr.Existing) == 0 || nsErr.Existing[0] != "global" {
-		t.Errorf("unknown namespace: %v", err)
+	var ve *ValidationError
+	if _, err = s.Update(ctx, m.ID, Patch{Namespace: ptr("-bad")}, "b"); !errors.As(err, &ve) {
+		t.Errorf("invalid namespace: %v", err)
 	}
 	if _, err := s.Update(ctx, m.ID, Patch{Content: ptr("")}, "b"); err == nil {
 		t.Error("empty content accepted")
@@ -196,7 +195,11 @@ func TestUpdate(t *testing.T) {
 		t.Errorf("failed updates wrote history: %d rows, want 2", n)
 	}
 
-	// Move to an existing namespace.
+	// Move to a new namespace (created implicitly) and an existing namespace.
+	got, err = s.Update(ctx, m.ID, Patch{Namespace: ptr("brand-new")}, "b")
+	if err != nil || got.Namespace != "brand-new" {
+		t.Errorf("move to new namespace: %+v, %v", got, err)
+	}
 	if _, err := s.EnsureNamespace(ctx, "Other", "desc"); err != nil {
 		t.Fatal(err)
 	}
@@ -363,5 +366,70 @@ func TestOneActiveHandoffPerNamespace(t *testing.T) {
 	_, archived, _ = s.CreateDetailed(ctx, NewMemory{Kind: KindFact, Content: "y", Supersedes: []int64{n.ID, h1.ID}})
 	if len(archived) != 1 || archived[0] != n.ID {
 		t.Errorf("archived = %v, want [%d]", archived, n.ID)
+	}
+
+	// Restoring an archived handoff archives the currently active one.
+	if _, err := s.Restore(ctx, h1.ID, "cli"); err != nil {
+		t.Fatalf("Restore handoff: %v", err)
+	}
+	if g, _ := s.Get(ctx, h1.ID); g.Archived() {
+		t.Error("restored handoff should be active")
+	}
+	if g, _ := s.Get(ctx, h2.ID); !g.Archived() {
+		t.Error("previously active handoff should be archived on restore")
+	}
+
+	// Updating a non-handoff to KindHandoff or moving a handoff archives the target namespace's active handoff.
+	note, _ := s.Create(ctx, NewMemory{Namespace: "demo", Kind: KindNote, Content: "converted"})
+	if _, err := s.Update(ctx, note.ID, Patch{Kind: ptr(KindHandoff)}, "b"); err != nil {
+		t.Fatalf("Update to handoff: %v", err)
+	}
+	if g, _ := s.Get(ctx, h1.ID); !g.Archived() {
+		t.Error("h1 should be archived after Update to KindHandoff")
+	}
+	if _, err := s.Update(ctx, note.ID, Patch{Namespace: ptr("api")}, "b"); err != nil {
+		t.Fatalf("Move handoff: %v", err)
+	}
+	if g, _ := s.Get(ctx, other.ID); !g.Archived() {
+		t.Error("other namespace active handoff should be archived when handoff moves in")
+	}
+}
+
+func TestListTagsAndNamespaceDescription(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	m1, err := s.Create(ctx, NewMemory{
+		Namespace:            "demo",
+		NamespaceDescription: "Demo project",
+		Kind:                 KindFact,
+		Content:              "Uses Go",
+		Tags:                 []string{"go", "backend"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = s.Create(ctx, NewMemory{Namespace: "demo", Kind: KindFact, Content: "Uses Go modules", Tags: []string{"mygo"}})
+
+	nss, err := s.ListNamespaces(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var desc string
+	for _, ns := range nss {
+		if ns.Name == "demo" {
+			desc = ns.Description
+		}
+	}
+	if desc != "Demo project" {
+		t.Errorf("namespace description = %q, want %q", desc, "Demo project")
+	}
+
+	got, err := s.List(ctx, ListFilter{Tags: []string{"#GO"}})
+	if err != nil || len(got) != 1 || got[0].ID != m1.ID {
+		t.Errorf("List with tag filter = %+v, %v", got, err)
+	}
+	got, err = s.List(ctx, ListFilter{Tags: []string{"go", "backend"}})
+	if err != nil || len(got) != 1 || got[0].ID != m1.ID {
+		t.Errorf("List with multiple tags = %+v, %v", got, err)
 	}
 }
