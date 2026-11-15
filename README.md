@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.jpg" alt="llm-memory logo" width="160" />
+</p>
+
 # llm-memory
 
 [![CI](https://github.com/Morditux/llm-memory/actions/workflows/ci.yml/badge.svg)](https://github.com/Morditux/llm-memory/actions/workflows/ci.yml)
