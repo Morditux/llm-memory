@@ -41,7 +41,7 @@ The schema is in place, search works.
 - … 2 more, use recall (kinds: decision)
 
 ## Recent facts
-- #23 Un fait très long qui doit être coupé dans la liste. Un fait très long qui doit être coupé dans la liste. Un fait très long qui doit être coupé dans la liste. Un fait très long qui doit être coupé dans la liste. Un fait très long qui…
+- #23 Un fait très long qui doit être coupé dans la liste. Un fait très long qui doit être coupé dans la liste. Un fait très long qui doit être coupé dans la liste. Un fait très long qui doit être coupé dans la liste. Un f… (get_memory #23)
 - #7 Les migrations s'appliquent au démarrage via PRAGMA user_version.
 - #6 **Hébergement**
 

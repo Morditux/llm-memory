@@ -591,3 +591,56 @@ func TestStreamableHTTP(t *testing.T) {
 		t.Errorf("briefing missing HTTP memory:\n%s", b)
 	}
 }
+
+func TestDecisionClaimCaveatSourceSwitchClients(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "mem.db")
+
+	const (
+		claim    = "Use PostgreSQL 16 with transactional outbox for order state persistence so billing and fulfillment stay atomic."
+		caveat   = "Caveat: assumes shard write throughput stays below 4,000 TPS; above that, partition by tenant_id before enabling synchronous cross-region replication."
+		sourceID = "Source: ADR-042 / PR #184"
+	)
+	fullDecision := claim + " " + caveat + " " + sourceID
+
+	// Client A saves a decision (>240 runes) with claim, caveat and source ID, plus a handoff.
+	stA := openStore(t, path)
+	a := connect(t, stA, Options{}, "claude-desktop")
+	dec := callOK[RememberOutput](t, a, "remember", map[string]any{
+		"namespace": "orders",
+		"kind":      "decision",
+		"title":     "Order store engine (ADR-042)",
+		"content":   fullDecision,
+	})
+	callOK[HandoffOutput](t, a, "handoff", map[string]any{
+		"namespace":  "orders",
+		"summary":    "Recorded order store decision ADR-042 with throughput caveat.",
+		"next_steps": []string{"review ADR-042 before implementing partitioning"},
+	})
+	_ = stA.Close()
+
+	// Client B connects in a new process/client and reads via get_context, recall, and get_memory.
+	stB := openStore(t, path)
+	b := connect(t, stB, Options{DefaultNamespace: "orders"}, "vscode")
+
+	brief := briefingText(t, b, nil)
+	for _, want := range []string{claim, caveat, sourceID, "claude-desktop"} {
+		if !strings.Contains(brief, want) {
+			t.Errorf("get_context after client switch missing %q:\n%s", want, brief)
+		}
+	}
+
+	rc := callOK[RecallOutput](t, b, "recall", map[string]any{"query": "ADR-042", "namespace": "orders"})
+	if len(rc.Results) == 0 {
+		t.Fatalf("recall returned no results for ADR-042")
+	}
+
+	got := callOK[GetMemoryOutput](t, b, "get_memory", map[string]any{"id": dec.Memory.ID})
+	for _, want := range []string{claim, caveat, sourceID} {
+		if !strings.Contains(got.Memory.Content, want) {
+			t.Errorf("get_memory missing %q:\n%s", want, got.Memory.Content)
+		}
+	}
+	if got.Memory.Source != "claude-desktop" {
+		t.Errorf("source = %q, want claude-desktop", got.Memory.Source)
+	}
+}

@@ -254,3 +254,45 @@ func TestBuildFocus(t *testing.T) {
 		t.Errorf("focused note should be marked shown:\n%s", out)
 	}
 }
+
+func TestDecisionPreservesClaimCaveatSource(t *testing.T) {
+	s := newStore(t)
+	// > 240 runes (would previously be clipped), < maxDecisionLineRunes.
+	content := "Use PostgreSQL 16 with transactional outbox for order state persistence so billing and fulfillment stay atomic. " +
+		"Caveat: assumes shard write throughput stays below 4,000 TPS; above that, partition by tenant_id before enabling sync replication. " +
+		"Source: ADR-042 / PR #184."
+	if utf8.RuneCountInString(content) <= maxLineRunes {
+		t.Fatalf("test fixture too short (%d runes)", utf8.RuneCountInString(content))
+	}
+	d := mustCreate(t, s, store.NewMemory{
+		Namespace: "demo",
+		Kind:      store.KindDecision,
+		Title:     "Order store engine",
+		Content:   content,
+		Source:    "claude-desktop",
+	})
+
+	// Extra-long decision (> maxDecisionLineRunes) must advertise get_memory #<id>.
+	veryLong := mustCreate(t, s, store.NewMemory{
+		Namespace: "demo",
+		Kind:      store.KindDecision,
+		Title:     "Very long decision",
+		Content:   strings.Repeat("clause ", 200) + "Caveat: final tail.",
+		Source:    "claude-desktop",
+	})
+
+	out := build(t, s, Options{Namespace: "demo"})
+	for _, want := range []string{
+		"Use PostgreSQL 16 with transactional outbox",
+		"Caveat: assumes shard write throughput stays below 4,000 TPS",
+		"Source: ADR-042 / PR #184.",
+		fmt.Sprintf("… (get_memory #%d)", veryLong.ID),
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("briefing missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, fmt.Sprintf("get_memory #%d)", d.ID)) {
+		t.Errorf("decision #%d should not have been truncated:\n%s", d.ID, out)
+	}
+}

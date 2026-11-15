@@ -15,11 +15,12 @@ import (
 
 // Budget bounds (in characters).
 const (
-	DefaultMaxChars = 6000
-	MinMaxChars     = 400 // smaller budgets are raised to this value
-	maxLineRunes    = 240 // a single list item is cut beyond this length
-	maxRecent       = 10  // decisions and facts shown at most
-	dateLayout      = "2006-01-02 15:04 UTC"
+	DefaultMaxChars      = 6000
+	MinMaxChars          = 400  // smaller budgets are raised to this value
+	maxLineRunes         = 240  // a single list item is cut beyond this length
+	maxDecisionLineRunes = 1000 // decisions and importance-3 items keep full claim, caveat and source ID
+	maxRecent            = 10   // decisions and facts shown at most
+	dateLayout           = "2006-01-02 15:04 UTC"
 )
 
 // Options configures Build.
@@ -244,7 +245,11 @@ func item(m store.Memory, prefix string, titleOnly bool) string {
 	default:
 		body = content
 	}
-	return cut(fmt.Sprintf("- #%d %s%s", m.ID, prefix, body), maxLineRunes) + "\n"
+	limit := maxLineRunes
+	if m.Kind == store.KindDecision || m.Importance == 3 {
+		limit = maxDecisionLineRunes
+	}
+	return cutItem(fmt.Sprintf("- #%d %s%s", m.ID, prefix, body), limit, m.ID) + "\n"
 }
 
 // ---- Budgeted writer --------------------------------------------------------
@@ -363,12 +368,17 @@ func date(t time.Time) string { return t.UTC().Format(dateLayout) }
 
 func oneLine(s string) string { return strings.Join(strings.Fields(s), " ") }
 
-func cut(s string, n int) string {
+func cutItem(s string, n int, id int64) string {
 	r := []rune(s)
 	if len(r) <= n {
 		return s
 	}
-	return strings.TrimRight(string(r[:n-1]), " ") + "…"
+	tail := fmt.Sprintf("… (get_memory #%d)", id)
+	tailRunes := utf8.RuneCountInString(tail)
+	if n <= tailRunes {
+		return strings.TrimRight(string(r[:n-1]), " ") + "…"
+	}
+	return strings.TrimRight(string(r[:n-tailRunes]), " ") + tail
 }
 
 // plural renders "1 memory" / "0 memories" / "3 memories".
