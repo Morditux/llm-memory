@@ -5,6 +5,8 @@
 # llm-memory
 
 [![CI](https://github.com/Morditux/llm-memory/actions/workflows/ci.yml/badge.svg)](https://github.com/Morditux/llm-memory/actions/workflows/ci.yml)
+[![Go](https://img.shields.io/github/go-mod/go-version/Morditux/llm-memory?logo=go&logoColor=white)](https://go.dev/)
+[![SQLite](https://img.shields.io/badge/SQLite-FTS5-003B57?logo=sqlite&logoColor=white)](https://www.sqlite.org/)
 
 A local MCP server that stores a **memory shared by several LLMs** in a SQLite file
 (Claude Desktop, Claude Code, VS Code, an internal LLM…). When you switch from one client to
