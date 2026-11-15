@@ -63,6 +63,28 @@ do not call the memory reliably.
 
 On Windows, escape backslashes in JSON (`"C:\\tools\\llm-memory.exe"`).
 
+### Automatic briefing (session-start hooks)
+
+Clients that support hooks can inject the briefing themselves at the start of every session,
+so the memory no longer depends on the LLM remembering to call `get_context`:
+
+```bash
+llm-memory setup --hooks --write claude-code   # ~/.claude/settings.json
+llm-memory setup --hooks --write codex         # ~/.codex/hooks.json (then trust it with /hooks)
+llm-memory setup --hooks --write antigravity   # ~/.gemini/config/hooks.json
+```
+
+`llm-memory hook --write <client>` does the same patch from the hook command itself, and also keeps
+`--max-chars` and `--focus` in the installed command line (e.g.
+`llm-memory hook --write --max-chars 3000 claude-code`).
+
+Without `--write`, the JSON to add is printed. The hook runs `llm-memory hook <client> --namespace auto`:
+the namespace is detected from the session's directory (`cwd` or `workspacePaths` sent by the client),
+the hook also fires after `/clear` and compaction, and a database error never blocks the session
+(message on stderr, exit status 0). Rerunning the command replaces the previous entry and keeps your
+other hooks. Keep the instruction block anyway: it covers writes (`remember`, `handoff`) and the
+clients without hooks (Claude Desktop, VS Code, OpenCode).
+
 ### Parameters
 
 Priority: flag > environment variable > default.
@@ -116,6 +138,9 @@ llm-memory stats [--json]                # per namespace, kind, source; file siz
 llm-memory backup [--keep N] [--verify] [--json] [<dest>] # hot SQLite backup (VACUUM INTO)
 llm-memory doctor [--json]               # check database integrity, permissions and embeddings
 llm-memory setup [--ollama] [--write] [--config PATH] <client> # print or patch MCP config (antigravity, claude-desktop, claude-code, codex, opencode, vscode)
+llm-memory setup --hooks [--write] [--config PATH] <client>    # SessionStart hook injecting the briefing (antigravity, claude-code, codex)
+llm-memory hook [--focus Q] <client>     # hook entry point: prints the briefing in the client's hook format
+llm-memory hook --write [--config PATH] [--max-chars N] [--focus Q] <client>  # install the hook in the client config (flags are kept in the hook command)
 llm-memory reindex [--all]               # embeddings (semantic search only)
 llm-memory ui [--addr 127.0.0.1:8765]    # local web explorer (create/edit, diff history, similar/supersede, GC)
 llm-memory serve [--listen 127.0.0.1:8766] [--stateless] [--read-only] # stdio (default) or Streamable HTTP (/mcp, /healthz)

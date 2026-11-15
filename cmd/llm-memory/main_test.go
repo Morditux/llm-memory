@@ -811,3 +811,195 @@ func TestCLISetupWrite(t *testing.T) {
 		t.Errorf("vscode config unexpected:\n%s", vsData)
 	}
 }
+
+func TestHookCommand(t *testing.T) {
+	dir := t.TempDir()
+	db := filepath.Join(dir, "mem.db")
+	proj := filepath.Join(dir, "myproj")
+	if err := os.MkdirAll(filepath.Join(proj, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cliOK(t, "remember", "--db", db, "--namespace", "myproj", "--kind", "decision", "hooks pick the project namespace")
+
+	// Claude Code / Codex: namespace detected from the payload cwd.
+	for _, client := range []string{"claude-code", "codex"} {
+		r := cli(t, `{"cwd":"`+filepath.ToSlash(proj)+`","source":"startup"}`, "hook", "--db", db, "--namespace", "auto", client)
+		if r.err != nil {
+			t.Fatalf("%s: %v\n%s", client, r.err, r.errOut)
+		}
+		var out struct {
+			HookSpecificOutput struct {
+				HookEventName     string `json:"hookEventName"`
+				AdditionalContext string `json:"additionalContext"`
+			} `json:"hookSpecificOutput"`
+		}
+		if err := json.Unmarshal([]byte(r.out), &out); err != nil {
+			t.Fatalf("%s: invalid JSON %v\n%s", client, err, r.out)
+		}
+		ctx := out.HookSpecificOutput.AdditionalContext
+		if out.HookSpecificOutput.HookEventName != "SessionStart" ||
+			!strings.Contains(ctx, `namespace "myproj"`) || !strings.Contains(ctx, "hooks pick the project namespace") {
+			t.Errorf("%s output:\n%s", client, r.out)
+		}
+	}
+
+	// Antigravity: workspacePaths and injectSteps.
+	r := cli(t, `{"workspacePaths":["`+filepath.ToSlash(proj)+`"]}`, "hook", "--db", db, "--namespace", "auto", "antigravity")
+	if r.err != nil {
+		t.Fatal(r.err)
+	}
+	var agy struct {
+		InjectSteps []struct {
+			SystemMessage struct {
+				SystemMessage string `json:"systemMessage"`
+			} `json:"systemMessage"`
+		} `json:"injectSteps"`
+	}
+	if err := json.Unmarshal([]byte(r.out), &agy); err != nil || len(agy.InjectSteps) != 1 ||
+		!strings.Contains(agy.InjectSteps[0].SystemMessage.SystemMessage, `namespace "myproj"`) {
+		t.Errorf("antigravity output (%v):\n%s", err, r.out)
+	}
+
+	// Invalid payload: still succeeds, falls back to the default namespace.
+	r = cli(t, "not json", "hook", "--db", db, "claude-code")
+	if r.err != nil || !strings.Contains(r.out, `namespace \"global\"`) {
+		t.Errorf("invalid payload: err=%v out=%s", r.err, r.out)
+	}
+
+	// Broken database: exit status 0, nothing on stdout, error on stderr.
+	r = cli(t, "", "hook", "--db", dir, "claude-code")
+	if r.err != nil || r.out != "" || !strings.Contains(r.errOut, "llm-memory hook:") {
+		t.Errorf("broken db: err=%v out=%q stderr=%q", r.err, r.out, r.errOut)
+	}
+
+	// Unsupported client.
+	if r := cli(t, "", "hook", "vscode"); !errors.Is(r.err, errUsage) {
+		t.Errorf("vscode hook: err=%v", r.err)
+	}
+}
+
+func TestCLISetupHooks(t *testing.T) {
+	home := t.TempDir()
+	db := filepath.Join(home, "mem.db")
+	runHome := func(args ...string) result {
+		t.Helper()
+		var stdout, stderr bytes.Buffer
+		err := run(context.Background(), args, app{
+			stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr,
+			env: config.Env{
+				Getenv:      func(string) string { return "" },
+				UserHomeDir: func() (string, error) { return home, nil },
+			},
+		})
+		return result{stdout.String(), stderr.String(), err}
+	}
+
+	// Print mode.
+	r := runHome("setup", "--hooks", "--db", db, "claude-code")
+	if r.err != nil || !strings.Contains(r.out, `"SessionStart"`) || !strings.Contains(r.out, "hook claude-code") ||
+		!strings.Contains(r.out, "--namespace auto") {
+		t.Errorf("print claude-code hooks: err=%v\n%s", r.err, r.out)
+	}
+
+	// Claude Code: keeps other settings and hooks, idempotent.
+	ccPath := filepath.Join(home, ".claude", "settings.json")
+	if err := os.MkdirAll(filepath.Dir(ccPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	initial := `{"model":"opus","hooks":{"SessionStart":[{"matcher":"startup","hooks":[{"type":"command","command":"echo hi"}]}],"Stop":[]}}`
+	if err := os.WriteFile(ccPath, []byte(initial), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if r := runHome("setup", "--hooks", "--write", "--db", db, "--namespace", "work", "claude-code"); r.err != nil {
+			t.Fatalf("write claude-code: %v\n%s", r.err, r.errOut)
+		}
+	}
+	data, err := os.ReadFile(ccPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(data)
+	if !strings.Contains(s, `"model": "opus"`) || !strings.Contains(s, "echo hi") || !strings.Contains(s, `"Stop"`) ||
+		strings.Count(s, "hook claude-code") != 1 || !strings.Contains(s, "--namespace work") {
+		t.Errorf("claude-code settings:\n%s", s)
+	}
+	if runtime.GOOS != "windows" {
+		if fi, err := os.Stat(ccPath); err != nil || fi.Mode().Perm() != 0o600 {
+			t.Errorf("settings mode not preserved: %v %v", fi.Mode(), err)
+		}
+	}
+
+	// Codex: ~/.codex/hooks.json, trust reminder.
+	r = runHome("setup", "--hooks", "--write", "--db", db, "codex")
+	if r.err != nil || !strings.Contains(r.errOut, "/hooks") {
+		t.Fatalf("write codex: %v\n%s", r.err, r.errOut)
+	}
+	if data, err := os.ReadFile(filepath.Join(home, ".codex", "hooks.json")); err != nil || !strings.Contains(string(data), "hook codex") {
+		t.Errorf("codex hooks.json (%v):\n%s", err, data)
+	}
+
+	// Antigravity: named entry in ~/.gemini/config/hooks.json, others kept.
+	agyPath := filepath.Join(home, ".gemini", "config", "hooks.json")
+	if err := os.MkdirAll(filepath.Dir(agyPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(agyPath, []byte(`{"guard":{"PreToolUse":[]}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if r := runHome("setup", "--hooks", "--write", "--db", db, "antigravity"); r.err != nil {
+		t.Fatal(r.err)
+	}
+	data, _ = os.ReadFile(agyPath)
+	if !strings.Contains(string(data), `"guard"`) || !strings.Contains(string(data), "hook antigravity") {
+		t.Errorf("antigravity hooks.json:\n%s", data)
+	}
+
+	// Unsupported client and malformed config.
+	if r := runHome("setup", "--hooks", "opencode"); !errors.Is(r.err, errUsage) {
+		t.Errorf("opencode hooks: err=%v", r.err)
+	}
+	bad := filepath.Join(home, "bad.json")
+	if err := os.WriteFile(bad, []byte(`{"hooks":[]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if r := runHome("setup", "--hooks", "--write", "--config", bad, "claude-code"); r.err == nil {
+		t.Error("expected error on malformed hooks section")
+	}
+	// hook --write: same patch as setup --hooks --write, replaces the previous
+	// handler and passes --max-chars/--focus through.
+	r = runHome("hook", "--write", "--db", db, "--namespace", "work", "--max-chars", "3000", "--focus", "auth flow", "claude-code")
+	if r.err != nil || !strings.Contains(r.out, "Updated "+ccPath) {
+		t.Fatalf("hook --write: %v\n%s%s", r.err, r.out, r.errOut)
+	}
+	data, _ = os.ReadFile(ccPath)
+	s = string(data)
+	if strings.Count(s, "hook claude-code") != 1 || !strings.Contains(s, "echo hi") ||
+		!strings.Contains(s, "--max-chars 3000") || (runtime.GOOS != "windows" && !strings.Contains(s, "--focus 'auth flow'")) {
+		t.Errorf("hook --write settings:\n%s", s)
+	}
+	alt := filepath.Join(home, "alt", "hooks.json")
+	if r := runHome("hook", "--write", "--config", alt, "--db", db, "codex"); r.err != nil {
+		t.Fatalf("hook --write --config: %v", r.err)
+	}
+	if data, err := os.ReadFile(alt); err != nil || !strings.Contains(string(data), "--namespace auto") {
+		t.Errorf("hook --write --config (%v):\n%s", err, data)
+	}
+	if r := runHome("hook", "--config", alt, "claude-code"); !errors.Is(r.err, errUsage) {
+		t.Errorf("hook --config without --write: err=%v", r.err)
+	}
+	if r := runHome("hook", "--write", "opencode"); !errors.Is(r.err, errUsage) {
+		t.Errorf("hook --write opencode: err=%v", r.err)
+	}
+}
+
+func TestShellQuote(t *testing.T) {
+	if got := shellQuote("/usr/bin/llm-memory"); got != "/usr/bin/llm-memory" {
+		t.Errorf("plain path quoted: %s", got)
+	}
+	if runtime.GOOS != "windows" {
+		if got := shellQuote("/my dir/it's"); got != `'/my dir/it'\''s'` {
+			t.Errorf("got %s", got)
+		}
+	}
+}

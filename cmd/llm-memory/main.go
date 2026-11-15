@@ -67,6 +67,12 @@ Usage:
                                              hot SQLite backup via VACUUM INTO
   llm-memory setup [--ollama] [--write] [--config PATH] <client>
                                              print or write MCP configuration for a client
+  llm-memory setup --hooks [--write] [--config PATH] <antigravity|claude-code|codex>
+                                             print or write the SessionStart hook that injects the briefing
+  llm-memory hook [--namespace X] [--max-chars N] [--focus Q] <antigravity|claude-code|codex>
+                                             SessionStart hook entry point (reads the client payload on stdin)
+  llm-memory hook --write [--config PATH] [--namespace X] [--max-chars N] [--focus Q] <client>
+                                             install this hook in the client's configuration file
   llm-memory ui [--addr 127.0.0.1:8765]      start local web explorer
   llm-memory version                         version and schema version
 
@@ -128,6 +134,7 @@ func run(ctx context.Context, args []string, a app) error {
 	commands := map[string]func(context.Context, []string) error{
 		"serve":     a.cmdServe,
 		"context":   a.cmdContext,
+		"hook":      a.cmdHook,
 		"remember":  a.cmdRemember,
 		"forget":    a.cmdForget,
 		"handoff":   a.cmdHandoff,

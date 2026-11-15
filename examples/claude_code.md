@@ -14,4 +14,11 @@ claude mcp add --scope project llm-memory -- /absolute/path/llm-memory serve --n
 
 Check: `claude mcp list`, then `/mcp` inside a session.
 
+Optional, recommended: inject the briefing automatically at session start (SessionStart hook in
+`~/.claude/settings.json`):
+
+```bash
+/absolute/path/llm-memory setup --hooks --write claude-code
+```
+
 Then add the block from [instructions_client.md](instructions_client.md) to `~/.claude/CLAUDE.md`.

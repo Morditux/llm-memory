@@ -1236,6 +1236,7 @@ func (a app) cmdSetup(_ context.Context, args []string) error {
 	ollama := fs.Bool("ollama", false, "include local Ollama embeddings defaults ("+defaultOllamaModel+")")
 	write := fs.Bool("write", false, "patch the client configuration file directly")
 	cfgPath := fs.String("config", "", "override target config file path (with --write)")
+	hooks := fs.Bool("hooks", false, "configure the SessionStart hook that injects the briefing (antigravity, claude-code, codex)")
 	pos, err := parse(fs, args, 1, 1)
 	if err != nil {
 		return err
@@ -1252,10 +1253,12 @@ func (a app) cmdSetup(_ context.Context, args []string) error {
 			cfg.Embed.Model = defaultOllamaModel
 		}
 	}
-	bin, err := os.Executable()
-	if err != nil || bin == "" {
-		bin = "llm-memory"
+	bin := executablePath()
+	client := strings.ToLower(pos[0])
+	if *hooks {
+		return a.setupHooks(client, bin, cfg.DB, hookNamespace(fs, a.env), *write, *cfgPath)
 	}
+
 	srvArgs := []string{"serve", "--db", cfg.DB}
 	if cfg.Namespace != config.DefaultNamespace {
 		srvArgs = append(srvArgs, "--namespace", cfg.Namespace)
@@ -1264,7 +1267,6 @@ func (a app) cmdSetup(_ context.Context, args []string) error {
 		srvArgs = append(srvArgs, "--embed-url", cfg.Embed.URL, "--embed-model", cfg.Embed.Model)
 	}
 
-	client := strings.ToLower(pos[0])
 	if *write {
 		target := *cfgPath
 		if target == "" {
