@@ -2,7 +2,8 @@ BINARY   := llm-memory
 PKG      := ./cmd/llm-memory
 VERSION  ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS  := -s -w -X main.version=$(VERSION)
-GOLANGCI ?= $(shell command -v golangci-lint 2>/dev/null || echo $(shell go env GOPATH)/bin/golangci-lint)
+GOLANGCI     ?= $(shell command -v golangci-lint 2>/dev/null || echo $(shell go env GOPATH)/bin/golangci-lint)
+GOLANGCI_PKG := github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest
 PLATFORMS := linux/amd64 linux/arm64 darwin/arm64 windows/amd64
 
 .PHONY: all build test cover lint fmt release clean
@@ -21,6 +22,10 @@ cover:
 
 lint:
 	go vet ./...
+	@if [ ! -x "$(GOLANGCI)" ]; then \
+		echo "installing $(GOLANGCI_PKG)..."; \
+		go install $(GOLANGCI_PKG); \
+	fi
 	$(GOLANGCI) run ./...
 
 fmt:
