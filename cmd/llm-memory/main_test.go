@@ -625,7 +625,7 @@ func TestCLIAxes1And2(t *testing.T) {
 		t.Errorf("setup antigravity output:\n%s", setupOut)
 	}
 	setupCC := cliOK(t, "setup", "--db", db, "claude-code")
-	if !strings.Contains(setupCC, "claude mcp add llm-memory") {
+	if !strings.Contains(setupCC, "claude mcp add --scope user llm-memory") {
 		t.Errorf("setup claude-code output:\n%s", setupCC)
 	}
 }

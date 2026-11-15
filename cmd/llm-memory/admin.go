@@ -1330,7 +1330,7 @@ func (a app) cmdSetup(_ context.Context, args []string) error {
 		}
 		return writeJSON(a.stdout, out)
 	case "claude-code":
-		fmt.Fprintf(a.stdout, "claude mcp add llm-memory -- %s %s\n", bin, strings.Join(srvArgs, " "))
+		fmt.Fprintf(a.stdout, "claude mcp add --scope user llm-memory -- %s %s\n", bin, strings.Join(srvArgs, " "))
 		return nil
 	case "codex":
 		fmt.Fprintf(a.stdout, "[mcp_servers.llm-memory]\ncommand = %s\nargs = %s\n",
