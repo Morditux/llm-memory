@@ -34,15 +34,15 @@ func TestCheckNoSecrets(t *testing.T) {
 	}
 
 	good := []string{
-		"Jetons JWT signés en EdDSA, rotation des clés tous les 90 jours.",
-		"Ollama tourne sur http://localhost:11434/v1/embeddings.",
-		"Ne jamais stocker de secrets dans le dépôt.",
-		"DSN exemple : postgres://user:password@localhost:5432/app",
-		"Placeholder URL : https://user:<password>@example.com/repo",
-		"Env template : postgres://app:$DB_PASS@localhost/db",
-		"Mask example : https://user:***@example.com and user:pass@ placeholder",
-		"Clé publique ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... pour le déploiement.",
-		"Utiliser sk-foo pour un préfixe court de test.",
+		"JWT tokens signed with EdDSA, key rotation every 90 days.",
+		"Ollama runs on http://localhost:11434/v1/embeddings.",
+		"Never store secrets in the repository.",
+		"Example DSN: postgres://user:password@localhost:5432/app",
+		"Placeholder URL: https://user:<password>@example.com/repo",
+		"Env template: postgres://app:$DB_PASS@localhost/db",
+		"Mask example: https://user:***@example.com and user:pass@ placeholder",
+		"Public key ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... for deployment.",
+		"Use sk-foo for a short test prefix.",
 	}
 	for _, text := range good {
 		if err := checkNoSecrets("content", text); err != nil {
