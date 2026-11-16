@@ -21,6 +21,114 @@ task state and the handoff left by the previous assistant.
 - Sequential use (one LLM at a time); two clients open at the same time do not block each other.
 - LLMs never delete anything: `forget` archives, and the history of every memory is kept.
 
+## Why
+
+AI assistants have no lasting memory, and no shared memory at all.
+
+1. **Every session starts from scratch.** Decisions, conventions and pitfalls found the day before
+   are lost, and you have to explain everything again.
+2. **Each tool is a silo.** Start a task in Claude Desktop and continue it in Claude Code, VS Code
+   or Codex, and the new assistant knows nothing about what was done or what is left to do.
+3. **Existing options are a poor fit.**
+   - Built-in memories (ChatGPT, Claude.ai…) belong to one vendor, often live in the cloud, and
+     are not shared across tools.
+   - `CLAUDE.md`, `AGENTS.md` and `GEMINI.md` files belong to one client. They clutter the
+     repository, get duplicated from one tool to the next, cannot be searched, and grow with no
+     structure.
+   - The conversation context gets compacted or cleared (`/clear`), and whatever it held is gone.
+4. **The *why* gets lost.** Code shows what was done, rarely why a choice was made or why an
+   approach was dropped. Without that, the next assistant may make the same mistake again.
+
+llm-memory addresses this with:
+
+- **One memory for every client**, through the standard MCP protocol: any compatible assistant
+  can read and write it.
+- **Local and private storage**: a SQLite file on your machine, with no cloud and no account.
+- **Structure**: kinds, importance, per-project namespaces, links between memories and history,
+  rather than a loose text file.
+- **Explicit handoffs** (`handoff`) so one tool picks up the work where another left it.
+- **Automatic loading** through session-start hooks, so the memory does not depend on the model
+  remembering to read it.
+
+In short, you no longer have to be the memory between your AI assistants.
+
+## How it compares
+
+Compared with memory servers built on a vector database (Chroma, Qdrant…) or a knowledge graph
+(Neo4j, Graphiti…), llm-memory is simpler to deploy, easier to read and more predictable. In
+return, it is worse at finding a memory phrased with different words, and keeping memory
+structured takes more discipline from the model.
+
+### Strengths
+
+**1. Zero infrastructure**
+- A single Go binary with SQLite and FTS5 built in: no Docker, no Qdrant or Neo4j server, no
+  Python, no required embeddings model.
+- Full-text search works offline, with no GPU, no API key and no per-query cost.
+- Install with `go install` or by copying one file, and `setup --write` configures each client.
+
+**2. Deterministic, explainable results**
+- Full-text search finds what contains the words searched for, and you can see why a result
+  matched.
+- Vector search always returns the "k nearest" items, even when nothing is relevant. That brings
+  up noise, and the noise ends up in the model's context.
+- `llm-memory context` shows exactly what the assistant will receive.
+
+**3. Organized memory rather than a pile of fragments**
+- Many solutions split everything into chunks and embed them. Here, each memory has a kind
+  (preference, decision…), an importance, tags, a namespace, an expiry date and links.
+- The start-of-session briefing is ordered by these fields: essential memories first, then the
+  handoff, preferences and recent decisions. It does not depend on similarity to a query.
+- The handoff (`handoff`) is a first-class concept, which is rare elsewhere.
+
+**4. No hidden model calls**
+- Systems such as Mem0 call a model on every write to extract and merge "facts". That costs
+  money, adds latency, and memories can be rewritten or lost without you seeing it.
+- Here, the assistant explicitly decides what to remember, and the server only stores it.
+
+**5. Safety and traceability**
+- The model cannot delete anything: `forget` archives, every change is kept in history, and
+  memories can be restored.
+- Detected secrets are rejected, and the author of every write is recorded.
+- The file is local, with restricted permissions (0700/0600).
+- A vector database usually keeps only the latest version, with no history.
+
+**6. Easy to administer**
+- The data lives in a single SQLite file that any tool can read.
+- The CLI covers JSON export/import, hot backups, `doctor`, `stats`, `gc`, and merging and
+  renaming namespaces.
+- With embeddings, changing models forces a full reindex. Full-text search does not depend on
+  one.
+
+**7. Built for several clients**
+- Per-project namespaces, automatic namespace detection by the hooks, and handoffs between tools:
+  multi-client use is the main goal, not an add-on.
+
+### Limitations
+
+- **Synonyms and rephrasing**: a search for "database" will not find a memory that mentions
+  "PostgreSQL" without that word. This is where vectors win. The optional semantic search partly
+  fills the gap, with its own costs.
+- **Large volumes**: to query thousands of documents or a document base (RAG), a real vector
+  database is a better fit. llm-memory is a working memory: hundreds or a few thousand chosen
+  memories.
+- **Reasoning over relationships**: links are simple (supersedes, relates to, depends on). A
+  graph such as Graphiti or Zep supports queries over entities and how they change over time.
+- **Reliance on the model**: with no automatic extraction, memory quality depends on how
+  consistently the assistant calls `remember`. That is why the instruction block and the hooks
+  exist.
+- **Local, sequential use**: one user and one assistant at a time. It is not a team memory shared
+  over the network.
+
+### When to choose what
+
+| Need | Good fit |
+| --- | --- |
+| Personal working memory shared between several AI assistants, simple and safe | **llm-memory** |
+| Querying a large document corpus (RAG) | Vector database |
+| Memory extracted automatically from conversations, e.g. for agents or a product | Mem0 |
+| Reasoning about entities and their relationships over time | Knowledge graph (Zep/Graphiti) |
+
 ## Installation
 
 Prebuilt binaries are published on [GitHub Releases](https://github.com/Morditux/llm-memory/releases)
