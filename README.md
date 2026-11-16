@@ -219,7 +219,6 @@ Updating golden files: `go test ./internal/briefing ./cmd/llm-memory -update`.
 Architecture: `internal/store` (SQL, no MCP), `internal/briefing` (text of `get_context`),
 `internal/semantic` (embeddings client and hybrid search, optional),
 `internal/server` (thin MCP handlers, no SQL), `cmd/llm-memory` (binary and CLI).
-Contribution rules: [CLAUDE.md](CLAUDE.md).
 
 ## License
 
