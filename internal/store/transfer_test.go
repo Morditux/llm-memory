@@ -244,3 +244,34 @@ func TestImportIntoReopenedFile(t *testing.T) {
 		t.Errorf("FTS index not filled by import: %d", len(res))
 	}
 }
+
+func TestExportImportPreservesExpiresAt(t *testing.T) {
+	ctx := context.Background()
+	src := newTestStore(t)
+	exp := time.Now().UTC().Add(48 * time.Hour).Truncate(time.Millisecond)
+	m, err := src.Create(ctx, NewMemory{
+		Namespace: "ttl",
+		Kind:      KindNote,
+		Content:   "temporary note with TTL",
+		ExpiresAt: &exp,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, err := src.Export(ctx, ExportOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dst := newTestStore(t)
+	rep, err := dst.Import(ctx, d, false, "cli")
+	if err != nil || rep.Imported != 1 {
+		t.Fatalf("Import: %+v, %v", rep, err)
+	}
+	got, err := dst.Get(ctx, rep.ImportedIDs[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ExpiresAt == nil || !got.ExpiresAt.Equal(*m.ExpiresAt) {
+		t.Fatalf("ExpiresAt = %v, want %v", got.ExpiresAt, m.ExpiresAt)
+	}
+}

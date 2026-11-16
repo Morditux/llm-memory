@@ -296,3 +296,35 @@ func TestDecisionPreservesClaimCaveatSource(t *testing.T) {
 		t.Errorf("decision #%d should not have been truncated:\n%s", d.ID, out)
 	}
 }
+
+type stubSearcher struct {
+	results []store.SearchResult
+	called  bool
+	query   store.SearchQuery
+}
+
+func (s *stubSearcher) Search(_ context.Context, q store.SearchQuery) ([]store.SearchResult, error) {
+	s.called = true
+	s.query = q
+	return s.results, nil
+}
+
+func TestBuildFocusUsesCustomSearcher(t *testing.T) {
+	s := newStore(t)
+	note := mustCreate(t, s, store.NewMemory{
+		Namespace: "demo",
+		Kind:      store.KindNote,
+		Title:     "Semantic hit",
+		Content:   "PostgreSQL handles JSONB natively",
+	})
+	stub := &stubSearcher{
+		results: []store.SearchResult{{Memory: note}},
+	}
+	out := build(t, s, Options{Namespace: "demo", Focus: "SGBD", Searcher: stub})
+	if !stub.called || stub.query.Query != "SGBD" || stub.query.Namespace != "demo" {
+		t.Fatalf("custom searcher not called properly: %+v", stub)
+	}
+	if !strings.Contains(out, fmt.Sprintf("#%d", note.ID)) {
+		t.Errorf("briefing missing semantic focus hit #%d:\n%s", note.ID, out)
+	}
+}

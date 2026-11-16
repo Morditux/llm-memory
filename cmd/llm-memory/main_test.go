@@ -1003,3 +1003,161 @@ func TestShellQuote(t *testing.T) {
 		}
 	}
 }
+
+func TestCLIUpdateAndLinks(t *testing.T) {
+	db := filepath.Join(t.TempDir(), "mem.db")
+	r1 := cliOK(t, "remember", "--db", db, "--namespace", "demo", "--kind", "decision", "--title", "DB", "--json", "Use MySQL")
+	var cr1 struct {
+		Memory store.Memory `json:"memory"`
+	}
+	if err := json.Unmarshal([]byte(r1), &cr1); err != nil {
+		t.Fatal(err)
+	}
+	r2 := cliOK(t, "remember", "--db", db, "--namespace", "demo", "--kind", "fact", "--title", "Cache", "--json", "Use Redis")
+	var cr2 struct {
+		Memory store.Memory `json:"memory"`
+	}
+	if err := json.Unmarshal([]byte(r2), &cr2); err != nil {
+		t.Fatal(err)
+	}
+
+	upOut := cliOK(t, "update", "--db", db, "--title", "DB v2", "--tag", "db,pg", "--importance", "3",
+		"--expires-in", "24h", "--add-link", fmt.Sprintf("relates_to:%d", cr2.Memory.ID), "--json",
+		fmt.Sprintf("%d", cr1.Memory.ID), "Use PostgreSQL")
+	var up struct {
+		Memory store.Memory     `json:"memory"`
+		Links  []store.LinkView `json:"links"`
+	}
+	if err := json.Unmarshal([]byte(upOut), &up); err != nil {
+		t.Fatal(err)
+	}
+	if up.Memory.Title != "DB v2" || up.Memory.Content != "Use PostgreSQL" || up.Memory.Importance != 3 ||
+		up.Memory.ExpiresAt == nil || len(up.Links) != 1 || up.Links[0].ID != cr2.Memory.ID {
+		t.Fatalf("unexpected update output: %+v", up)
+	}
+
+	showOut := cliOK(t, "show", "--db", db, fmt.Sprintf("%d", cr1.Memory.ID))
+	if !strings.Contains(showOut, "Links:") || !strings.Contains(showOut, "relates_to") {
+		t.Errorf("show missing links:\n%s", showOut)
+	}
+
+	cliOK(t, "update", "--db", db, "--clear-expires", "--remove-link", fmt.Sprintf("relates_to:%d", cr2.Memory.ID),
+		fmt.Sprintf("%d", cr1.Memory.ID))
+	showJSON := cliOK(t, "show", "--db", db, "--json", fmt.Sprintf("%d", cr1.Memory.ID))
+	var shown struct {
+		Memory store.Memory     `json:"memory"`
+		Links  []store.LinkView `json:"links"`
+	}
+	if err := json.Unmarshal([]byte(showJSON), &shown); err != nil {
+		t.Fatal(err)
+	}
+	if shown.Memory.ExpiresAt != nil || len(shown.Links) != 0 {
+		t.Errorf("expected cleared expiry and links, got %+v", shown)
+	}
+}
+
+func TestMultiEventHooksAndRemoveAndDoctorChecks(t *testing.T) {
+	home := t.TempDir()
+	db := filepath.Join(home, "mem.db")
+	proj := filepath.Join(home, "myproj")
+	if err := os.MkdirAll(filepath.Join(proj, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	runHome := func(stdin string, args ...string) result {
+		t.Helper()
+		var stdout, stderr bytes.Buffer
+		err := run(context.Background(), args, app{
+			stdin: strings.NewReader(stdin), stdout: &stdout, stderr: &stderr,
+			env: config.Env{
+				Getenv:      func(string) string { return "" },
+				UserHomeDir: func() (string, error) { return home, nil },
+			},
+		})
+		return result{stdout.String(), stderr.String(), err}
+	}
+
+	// Create an active task_state so PreCompact / Stop surface it.
+	if r := runHome("", "remember", "--db", db, "--namespace", "myproj", "--kind", "task_state", "Finish refactoring hooks"); r.err != nil {
+		t.Fatal(r.err)
+	}
+
+	// PreCompact & Stop hook outputs.
+	r := runHome(`{"cwd":"`+filepath.ToSlash(proj)+`"}`, "hook", "--db", db, "--namespace", "auto", "--event", "PreCompact", "claude-code")
+	if r.err != nil || !strings.Contains(r.out, `"hookEventName": "PreCompact"`) || !strings.Contains(r.out, "Finish refactoring hooks") {
+		t.Fatalf("PreCompact hook: err=%v\n%s", r.err, r.out)
+	}
+	r = runHome(`{"cwd":"`+filepath.ToSlash(proj)+`"}`, "hook", "--db", db, "--namespace", "auto", "--event", "Stop", "claude-code")
+	if r.err != nil || !strings.Contains(r.out, `"systemMessage"`) || !strings.Contains(r.out, "Finish refactoring hooks") {
+		t.Fatalf("Stop hook: err=%v\n%s", r.err, r.out)
+	}
+
+	// Install multiple hook events, then remove.
+	if r := runHome("", "setup", "--hooks", "--events", "SessionStart,PreCompact,Stop", "--write", "--db", db, "claude-code"); r.err != nil {
+		t.Fatal(r.err)
+	}
+	ccSettings := filepath.Join(home, ".claude", "settings.json")
+	data, _ := os.ReadFile(ccSettings)
+	if !strings.Contains(string(data), `"PreCompact"`) || !strings.Contains(string(data), `"Stop"`) {
+		t.Fatalf("multi-event hooks missing:\n%s", data)
+	}
+	if r := runHome("", "hook", "--remove", "claude-code"); r.err != nil {
+		t.Fatal(r.err)
+	}
+	data, _ = os.ReadFile(ccSettings)
+	if strings.Contains(string(data), "llm-memory") {
+		t.Errorf("hook --remove left llm-memory in settings:\n%s", data)
+	}
+
+	// Install MCP configs for claude-code and codex, plus a broken binary path, then check doctor & --remove.
+	if r := runHome("", "setup", "--write", "--db", db, "codex"); r.err != nil {
+		t.Fatal(r.err)
+	}
+	agyCfg := filepath.Join(home, ".gemini", "config", "mcp_config.json")
+	if err := os.MkdirAll(filepath.Dir(agyCfg), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(agyCfg, []byte(`{"mcpServers":{"llm-memory":{"command":"/nonexistent/llm-memory","args":["serve"]}}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	doc := runHome("", "doctor", "--db", db, "--json")
+	if doc.err != nil {
+		t.Fatalf("doctor: %v\n%s", doc.err, doc.errOut)
+	}
+	var rep doctorReport
+	if err := json.Unmarshal([]byte(doc.out), &rep); err != nil {
+		t.Fatal(err)
+	}
+	if len(rep.Clients) < 2 {
+		t.Fatalf("expected client checks in doctor, got %+v", rep.Clients)
+	}
+	var sawBroken bool
+	for _, w := range rep.Warnings {
+		if strings.Contains(w, "/nonexistent/llm-memory") {
+			sawBroken = true
+		}
+	}
+	if !sawBroken {
+		t.Errorf("expected missing binary warning in doctor, got warnings=%v", rep.Warnings)
+	}
+
+	if r := runHome("", "setup", "--remove", "codex"); r.err != nil {
+		t.Fatal(r.err)
+	}
+	codexData, _ := os.ReadFile(filepath.Join(home, ".codex", "config.toml"))
+	if strings.Contains(string(codexData), "llm-memory") {
+		t.Errorf("setup --remove codex left entry:\n%s", codexData)
+	}
+}
+
+func TestCompletionCommand(t *testing.T) {
+	for _, sh := range []string{"bash", "zsh", "fish"} {
+		out := cliOK(t, "completion", sh)
+		if !strings.Contains(out, "llm-memory") {
+			t.Errorf("%s completion unexpected:\n%s", sh, out)
+		}
+	}
+	if r := cli(t, "", "completion", "powershell"); !errors.Is(r.err, errUsage) {
+		t.Errorf("expected errUsage for unsupported shell, got %v", r.err)
+	}
+}

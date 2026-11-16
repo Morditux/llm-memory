@@ -644,3 +644,79 @@ func TestDecisionClaimCaveatSourceSwitchClients(t *testing.T) {
 		t.Errorf("source = %q, want claude-desktop", got.Memory.Source)
 	}
 }
+
+type stubSemanticSearcher struct {
+	hit store.Memory
+}
+
+func (s *stubSemanticSearcher) Search(_ context.Context, _ store.SearchQuery) ([]store.SearchResult, error) {
+	return []store.SearchResult{{Memory: s.hit}}, nil
+}
+
+func TestGetContextFocusUsesCustomSearcher(t *testing.T) {
+	st := openStore(t, filepath.Join(t.TempDir(), "mem.db"))
+	note, err := st.Create(context.Background(), store.NewMemory{
+		Namespace: "demo",
+		Kind:      store.KindNote,
+		Title:     "Postgres JSONB",
+		Content:   "PostgreSQL stores flexible schemas in JSONB",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cs := connect(t, st, Options{DefaultNamespace: "demo", Searcher: &stubSemanticSearcher{hit: note}}, "client")
+	brief := briefingText(t, cs, map[string]any{"namespace": "demo", "focus": "SGBD"})
+	if !strings.Contains(brief, fmt.Sprintf("#%d", note.ID)) {
+		t.Errorf("get_context focus did not use custom searcher:\n%s", brief)
+	}
+}
+
+func TestMemoryLinksTools(t *testing.T) {
+	st := openStore(t, filepath.Join(t.TempDir(), "mem.db"))
+	cs := connect(t, st, Options{DefaultNamespace: "demo"}, "client")
+
+	m1 := callOK[RememberOutput](t, cs, "remember", map[string]any{
+		"kind":    "decision",
+		"title":   "Use MySQL",
+		"content": "Initial database choice",
+	})
+	m2 := callOK[RememberOutput](t, cs, "remember", map[string]any{
+		"kind":       "decision",
+		"title":      "Use PostgreSQL",
+		"content":    "PostgreSQL replaces MySQL",
+		"supersedes": []int64{m1.Memory.ID},
+	})
+	m3 := callOK[RememberOutput](t, cs, "remember", map[string]any{
+		"kind":       "fact",
+		"title":      "GIN index",
+		"content":    "JSONB uses GIN index",
+		"depends_on": []int64{m2.Memory.ID},
+	})
+
+	// update_memory with add_links only, then remove_links.
+	up := callOK[UpdateMemoryOutput](t, cs, "update_memory", map[string]any{
+		"id": m3.Memory.ID,
+		"add_links": []map[string]any{
+			{"target_id": m1.Memory.ID, "kind": "relates_to"},
+		},
+	})
+	if !slices.Contains(up.Changed, "links") {
+		t.Errorf("expected links in changed, got %v", up.Changed)
+	}
+
+	got3 := callOK[GetMemoryOutput](t, cs, "get_memory", map[string]any{"id": m3.Memory.ID})
+	if len(got3.Links) != 2 {
+		t.Fatalf("expected 2 links on m3, got %+v", got3.Links)
+	}
+
+	callOK[UpdateMemoryOutput](t, cs, "update_memory", map[string]any{
+		"id": m3.Memory.ID,
+		"remove_links": []map[string]any{
+			{"target_id": m1.Memory.ID, "kind": "relates_to"},
+		},
+	})
+	got2 := callOK[GetMemoryOutput](t, cs, "get_memory", map[string]any{"id": m2.Memory.ID})
+	if len(got2.Links) != 2 {
+		t.Fatalf("expected 2 links on m2 (supersedes m1, incoming depends_on m3), got %+v", got2.Links)
+	}
+}

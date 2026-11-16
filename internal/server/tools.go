@@ -67,7 +67,7 @@ type GetContextInput struct {
 
 func (s *srv) getContext(ctx context.Context, req *mcp.CallToolRequest, in GetContextInput) (*mcp.CallToolResult, any, error) {
 	ns := s.namespace(in.Namespace)
-	text, err := briefing.Build(ctx, s.store, briefing.Options{Namespace: ns, MaxChars: in.MaxChars, Focus: in.Focus})
+	text, err := briefing.Build(ctx, s.store, briefing.Options{Namespace: ns, MaxChars: in.MaxChars, Focus: in.Focus, Searcher: s.search})
 	if err != nil {
 		return nil, nil, s.toolError(ctx, req, "get_context", err)
 	}
@@ -86,6 +86,8 @@ type RememberInput struct {
 	Tags       []string `json:"tags,omitempty" jsonschema:"Lowercase keywords that help recall."`
 	Importance int      `json:"importance,omitempty" jsonschema:"1 = low, 2 = normal (default), 3 = essential: always shown by get_context. Use 3 sparingly."`
 	Supersedes []int64  `json:"supersedes,omitempty" jsonschema:"IDs of memories this one replaces; they are archived in the same operation."`
+	RelatedTo  []int64  `json:"related_to,omitempty" jsonschema:"IDs of related memories to link (relates_to)."`
+	DependsOn  []int64  `json:"depends_on,omitempty" jsonschema:"IDs of memories this one depends on (depends_on)."`
 	ExpiresIn  string   `json:"expires_in,omitempty" jsonschema:"Optional TTL duration (e.g. 24h, 7d) after which the memory expires."`
 	ExpiresAt  string   `json:"expires_at,omitempty" jsonschema:"Optional RFC 3339 expiration timestamp."`
 }
@@ -133,10 +135,17 @@ func (s *srv) remember(ctx context.Context, req *mcp.CallToolRequest, in Remembe
 			sims = mergeSimilar(sims, sems, 3)
 		}
 	}
+	var links []store.LinkRef
+	for _, id := range in.RelatedTo {
+		links = append(links, store.LinkRef{TargetID: id, Kind: store.LinkRelatesTo})
+	}
+	for _, id := range in.DependsOn {
+		links = append(links, store.LinkRef{TargetID: id, Kind: store.LinkDependsOn})
+	}
 	m, archived, err := s.store.CreateDetailed(ctx, store.NewMemory{
 		Namespace: ns, Kind: store.Kind(in.Kind), Title: in.Title, Content: in.Content,
 		Tags: in.Tags, Importance: in.Importance, Source: src, Supersedes: in.Supersedes,
-		ExpiresAt: exp,
+		Links: links, ExpiresAt: exp,
 	})
 	if err != nil {
 		return nil, RememberOutput{}, s.toolError(ctx, req, "remember", err)
@@ -243,10 +252,22 @@ type HistoryView struct {
 	Reason    string `json:"reason,omitempty"`
 }
 
+// LinkView is one directed link attached to a memory.
+type LinkView struct {
+	Direction  string `json:"direction" jsonschema:"outgoing (this -> target) or incoming (source -> this)."`
+	Kind       string `json:"kind" jsonschema:"supersedes, relates_to or depends_on."`
+	ID         int64  `json:"id"`
+	MemoryKind string `json:"memory_kind"`
+	Namespace  string `json:"namespace"`
+	Title      string `json:"title,omitempty"`
+	Archived   bool   `json:"archived,omitempty"`
+}
+
 // GetMemoryOutput is the output of get_memory.
 type GetMemoryOutput struct {
 	Memory  MemoryView    `json:"memory"`
 	History []HistoryView `json:"history,omitempty" jsonschema:"Oldest first."`
+	Links   []LinkView    `json:"links,omitempty" jsonschema:"Relationships with other memories (supersedes, relates_to, depends_on)."`
 }
 
 func (s *srv) getMemory(ctx context.Context, req *mcp.CallToolRequest, in GetMemoryInput) (*mcp.CallToolResult, GetMemoryOutput, error) {
@@ -255,6 +276,21 @@ func (s *srv) getMemory(ctx context.Context, req *mcp.CallToolRequest, in GetMem
 		return nil, GetMemoryOutput{}, s.toolError(ctx, req, "get_memory", err)
 	}
 	out := GetMemoryOutput{Memory: viewOf(m)}
+	ls, err := s.store.Links(ctx, in.ID)
+	if err != nil {
+		return nil, GetMemoryOutput{}, s.toolError(ctx, req, "get_memory", err)
+	}
+	for _, l := range ls {
+		out.Links = append(out.Links, LinkView{
+			Direction:  l.Direction,
+			Kind:       string(l.Kind),
+			ID:         l.ID,
+			MemoryKind: string(l.MemoryKind),
+			Namespace:  l.Namespace,
+			Title:      l.Title,
+			Archived:   l.Archived,
+		})
+	}
 	if in.WithHistory {
 		hs, err := s.store.History(ctx, in.ID)
 		if err != nil {
@@ -277,18 +313,26 @@ func (s *srv) getMemory(ctx context.Context, req *mcp.CallToolRequest, in GetMem
 
 // ---- update_memory ----------------------------------------------------------
 
+// LinkInput identifies a directed link to add or remove on a memory.
+type LinkInput struct {
+	TargetID int64  `json:"target_id" jsonschema:"Target memory ID."`
+	Kind     string `json:"kind" jsonschema:"Relationship kind: relates_to, depends_on or supersedes."`
+}
+
 // UpdateMemoryInput is the input of update_memory. Omitted fields are unchanged.
 type UpdateMemoryInput struct {
-	ID           int64     `json:"id" jsonschema:"Memory ID to change."`
-	Content      *string   `json:"content,omitempty" jsonschema:"New full content (replaces the old one; the old version stays in history)."`
-	Title        *string   `json:"title,omitempty" jsonschema:"New one-line title; empty string removes it."`
-	Tags         *[]string `json:"tags,omitempty" jsonschema:"New complete tag list (replaces the old one)."`
-	Importance   *int      `json:"importance,omitempty" jsonschema:"1 = low, 2 = normal, 3 = always shown by get_context."`
-	Kind         *string   `json:"kind,omitempty" jsonschema:"New kind."`
-	Namespace    *string   `json:"namespace,omitempty" jsonschema:"Move to this namespace (created if new)."`
-	ExpiresIn    string    `json:"expires_in,omitempty" jsonschema:"New TTL duration (e.g. 24h, 7d)."`
-	ExpiresAt    string    `json:"expires_at,omitempty" jsonschema:"New RFC 3339 expiration timestamp."`
-	ClearExpires bool      `json:"clear_expires,omitempty" jsonschema:"Remove any expiration timestamp."`
+	ID           int64       `json:"id" jsonschema:"Memory ID to change."`
+	Content      *string     `json:"content,omitempty" jsonschema:"New full content (replaces the old one; the old version stays in history)."`
+	Title        *string     `json:"title,omitempty" jsonschema:"New one-line title; empty string removes it."`
+	Tags         *[]string   `json:"tags,omitempty" jsonschema:"New complete tag list (replaces the old one)."`
+	Importance   *int        `json:"importance,omitempty" jsonschema:"1 = low, 2 = normal, 3 = always shown by get_context."`
+	Kind         *string     `json:"kind,omitempty" jsonschema:"New kind."`
+	Namespace    *string     `json:"namespace,omitempty" jsonschema:"Move to this namespace (created if new)."`
+	ExpiresIn    string      `json:"expires_in,omitempty" jsonschema:"New TTL duration (e.g. 24h, 7d)."`
+	ExpiresAt    string      `json:"expires_at,omitempty" jsonschema:"New RFC 3339 expiration timestamp."`
+	ClearExpires bool        `json:"clear_expires,omitempty" jsonschema:"Remove any expiration timestamp."`
+	AddLinks     []LinkInput `json:"add_links,omitempty" jsonschema:"Links to add from this memory to other memories."`
+	RemoveLinks  []LinkInput `json:"remove_links,omitempty" jsonschema:"Links to remove from this memory."`
 }
 
 // UpdateMemoryOutput is the output of update_memory.
@@ -311,6 +355,7 @@ func (s *srv) updateMemory(ctx context.Context, req *mcp.CallToolRequest, in Upd
 		"content": in.Content != nil, "title": in.Title != nil, "tags": in.Tags != nil,
 		"importance": in.Importance != nil, "kind": in.Kind != nil, "namespace": in.Namespace != nil,
 		"expires_at": exp != nil || in.ClearExpires,
+		"links":      len(in.AddLinks) > 0 || len(in.RemoveLinks) > 0,
 	} {
 		if set {
 			changed = append(changed, name)
@@ -321,9 +366,34 @@ func (s *srv) updateMemory(ctx context.Context, req *mcp.CallToolRequest, in Upd
 		k := store.Kind(*in.Kind)
 		p.Kind = &k
 	}
-	m, err := s.store.Update(ctx, in.ID, p, s.source(req))
-	if err != nil {
-		return nil, UpdateMemoryOutput{}, s.toolError(ctx, req, "update_memory", err)
+	hasFieldPatch := in.Content != nil || in.Title != nil || in.Tags != nil ||
+		in.Importance != nil || in.Kind != nil || in.Namespace != nil ||
+		exp != nil || in.ClearExpires
+
+	var m store.Memory
+	if hasFieldPatch || (len(in.AddLinks) == 0 && len(in.RemoveLinks) == 0) {
+		m, err = s.store.Update(ctx, in.ID, p, s.source(req))
+		if err != nil {
+			return nil, UpdateMemoryOutput{}, s.toolError(ctx, req, "update_memory", err)
+		}
+	} else {
+		m, err = s.store.Get(ctx, in.ID)
+		if err != nil {
+			return nil, UpdateMemoryOutput{}, s.toolError(ctx, req, "update_memory", err)
+		}
+		if m.Archived() {
+			return nil, UpdateMemoryOutput{}, s.toolError(ctx, req, "update_memory", &store.StateError{ID: in.ID, Msg: "is archived; restore it first (llm-memory restore) or create a new memory"})
+		}
+	}
+	for _, l := range in.AddLinks {
+		if err := s.store.AddLink(ctx, in.ID, l.TargetID, store.LinkKind(l.Kind)); err != nil {
+			return nil, UpdateMemoryOutput{}, s.toolError(ctx, req, "update_memory", err)
+		}
+	}
+	for _, l := range in.RemoveLinks {
+		if err := s.store.RemoveLink(ctx, in.ID, l.TargetID, store.LinkKind(l.Kind)); err != nil {
+			return nil, UpdateMemoryOutput{}, s.toolError(ctx, req, "update_memory", err)
+		}
 	}
 	s.logCall(ctx, req, "update_memory", "id", in.ID, "changed", changed)
 	return nil, UpdateMemoryOutput{Memory: viewOf(m), Changed: changed}, nil

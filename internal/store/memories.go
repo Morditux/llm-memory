@@ -109,6 +109,7 @@ type NewMemory struct {
 	Importance           int        // 0 means default (2)
 	Source               string     // author; "unknown" if empty
 	Supersedes           []int64    // memories archived in the same transaction
+	Links                []LinkRef  // additional links created in the same transaction
 	ExpiresAt            *time.Time // optional TTL expiration
 }
 
@@ -197,6 +198,14 @@ func (s *Store) CreateDetailed(ctx context.Context, in NewMemory) (Memory, []int
 			}
 			if prev.changed {
 				archived = append(archived, old)
+			}
+			if err := insertLink(ctx, tx, id, old, LinkSupersedes); err != nil {
+				return err
+			}
+		}
+		for _, lnk := range in.Links {
+			if err := insertLink(ctx, tx, id, lnk.TargetID, lnk.Kind); err != nil {
+				return err
 			}
 		}
 		if in.Kind != KindHandoff {
@@ -387,6 +396,9 @@ func archiveOtherHandoffs(ctx context.Context, tx *sql.Tx, ns string, keepID int
 	var archived []int64
 	for _, o := range olds {
 		if _, err := archive(ctx, tx, o.ID, by, fmt.Sprintf("replaced by handoff #%d", keepID), true); err != nil {
+			return nil, err
+		}
+		if err := insertLink(ctx, tx, keepID, o.ID, LinkSupersedes); err != nil {
 			return nil, err
 		}
 		archived = append(archived, o.ID)

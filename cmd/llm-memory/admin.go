@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -245,11 +246,16 @@ func (a app) cmdShow(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	links, err := st.Links(ctx, id)
+	if err != nil {
+		return err
+	}
 	if *asJSON {
 		return writeJSON(a.stdout, struct {
 			Memory  store.Memory         `json:"memory"`
 			History []store.HistoryEntry `json:"history"`
-		}{Memory: m, History: hs})
+			Links   []store.LinkView     `json:"links,omitempty"`
+		}{Memory: m, History: hs, Links: links})
 	}
 	w := a.stdout
 	fmt.Fprintf(w, "#%d  %s  [%s]\n", m.ID, m.Namespace, kindLabel(m))
@@ -264,6 +270,24 @@ func (a app) cmdShow(ctx context.Context, args []string) error {
 	fmt.Fprintf(w, "Updated:    %s by %s\n", m.UpdatedAt.Format(cliDate), m.UpdatedBy)
 	if m.ArchivedAt != nil {
 		fmt.Fprintf(w, "Archived:   %s (restore with: llm-memory restore %d)\n", m.ArchivedAt.Format(cliDate), m.ID)
+	}
+	if len(links) > 0 {
+		fmt.Fprintln(w, "Links:")
+		for _, l := range links {
+			dir := "->"
+			if l.Direction == "incoming" {
+				dir = "<-"
+			}
+			arch := ""
+			if l.Archived {
+				arch = " (archived)"
+			}
+			title := ""
+			if l.Title != "" {
+				title = " " + l.Title
+			}
+			fmt.Fprintf(w, "  %s %-10s #%d [%s]%s%s\n", dir, l.Kind, l.ID, l.MemoryKind, title, arch)
+		}
 	}
 	fmt.Fprintf(w, "\n%s\n\nHistory:\n", m.Content)
 	for _, h := range hs {
@@ -668,6 +692,159 @@ func (a app) cmdRemember(ctx context.Context, args []string) error {
 	return nil
 }
 
+func parseLinkSpecs(raw string) ([]store.LinkRef, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	var out []store.LinkRef
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		kindStr, idStr, ok := strings.Cut(part, ":")
+		if !ok {
+			return nil, fmt.Errorf("invalid link spec %q (expected kind:id, e.g. relates_to:42)", part)
+		}
+		k := store.LinkKind(strings.TrimSpace(kindStr))
+		if !k.Valid() {
+			return nil, fmt.Errorf("invalid link kind %q (expected supersedes, relates_to or depends_on)", kindStr)
+		}
+		id, err := parseID(strings.TrimSpace(idStr))
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, store.LinkRef{TargetID: id, Kind: k})
+	}
+	return out, nil
+}
+
+func (a app) cmdUpdate(ctx context.Context, args []string) error {
+	fs := a.newFlagSet("update")
+	flags := config.Register(fs)
+	kind := fs.String("kind", "", "new kind: "+writableKindNames())
+	title := fs.String("title", "", "new one-line summary (empty string clears)")
+	contentFlag := fs.String("content", "", "new content")
+	tagsFlag := fs.String("tag", "", "new comma-separated tags (replaces existing)")
+	importance := fs.Int("importance", 0, "1 (low), 2 (normal), 3 (essential)")
+	expiresIn := fs.String("expires-in", "", "new TTL duration (e.g. 24h, 7d)")
+	clearExpires := fs.Bool("clear-expires", false, "remove expiration timestamp")
+	addLink := fs.String("add-link", "", "comma-separated links to add (kind:id, e.g. relates_to:5)")
+	removeLink := fs.String("remove-link", "", "comma-separated links to remove (kind:id)")
+	asJSON := fs.Bool("json", false, "output as JSON")
+	pos, err := parse(fs, args, 1, -1)
+	if err != nil {
+		return err
+	}
+	id, err := parseID(pos[0])
+	if err != nil {
+		return err
+	}
+	var patch store.Patch
+	if isSet(fs, "kind") {
+		k := store.Kind(*kind)
+		if k == store.KindHandoff {
+			return errors.New("use `llm-memory handoff` for handoffs")
+		}
+		patch.Kind = &k
+	}
+	if isSet(fs, "title") {
+		patch.Title = title
+	}
+	if isSet(fs, "content") {
+		patch.Content = contentFlag
+	} else if len(pos) > 1 {
+		c, err := readPositionalOrStdin(pos[1:], a.stdin)
+		if err != nil {
+			return err
+		}
+		patch.Content = &c
+	}
+	if isSet(fs, "tag") {
+		t := parseTags(*tagsFlag)
+		patch.Tags = &t
+	}
+	if isSet(fs, "importance") {
+		patch.Importance = importance
+	}
+	if isSet(fs, "namespace") {
+		nsVal := fs.Lookup("namespace").Value.String()
+		patch.Namespace = &nsVal
+	}
+	if *clearExpires {
+		patch.ClearExpiresAt = true
+	} else if isSet(fs, "expires-in") {
+		exp, err := parseCLIExpiration(*expiresIn)
+		if err != nil {
+			return err
+		}
+		patch.ExpiresAt = exp
+	}
+	adds, err := parseLinkSpecs(*addLink)
+	if err != nil {
+		return err
+	}
+	rems, err := parseLinkSpecs(*removeLink)
+	if err != nil {
+		return err
+	}
+
+	hasFieldPatch := patch.Content != nil || patch.Title != nil || patch.Tags != nil ||
+		patch.Importance != nil || patch.Kind != nil || patch.Namespace != nil ||
+		patch.ExpiresAt != nil || patch.ClearExpiresAt
+	if !hasFieldPatch && len(adds) == 0 && len(rems) == 0 {
+		fmt.Fprintln(a.stderr, "update requires at least one field flag, content argument, or link change")
+		return errUsage
+	}
+
+	st, cfg, err := a.openStore(ctx, flags)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = st.Close() }()
+
+	if patch.Namespace != nil {
+		*patch.Namespace = cfg.Namespace
+	}
+	var m store.Memory
+	if hasFieldPatch {
+		m, err = st.Update(ctx, id, patch, cliActor(cfg))
+		if err != nil {
+			return err
+		}
+	} else {
+		m, err = st.Get(ctx, id)
+		if err != nil {
+			return err
+		}
+		if m.Archived() {
+			return &store.StateError{ID: id, Msg: "is archived; restore it first (llm-memory restore)"}
+		}
+	}
+	for _, l := range adds {
+		if err := st.AddLink(ctx, id, l.TargetID, l.Kind); err != nil {
+			return err
+		}
+	}
+	for _, l := range rems {
+		if err := st.RemoveLink(ctx, id, l.TargetID, l.Kind); err != nil {
+			return err
+		}
+	}
+	if *asJSON {
+		links, err := st.Links(ctx, id)
+		if err != nil {
+			return err
+		}
+		return writeJSON(a.stdout, struct {
+			Memory store.Memory     `json:"memory"`
+			Links  []store.LinkView `json:"links,omitempty"`
+		}{Memory: m, Links: links})
+	}
+	fmt.Fprintf(a.stdout, "Updated #%d (%s, %s): %s\n", m.ID, m.Namespace, m.Kind, summary(m))
+	return nil
+}
+
 func (a app) cmdForget(ctx context.Context, args []string) error {
 	fs := a.newFlagSet("forget")
 	flags := config.Register(fs)
@@ -917,25 +1094,35 @@ func (a app) cmdGC(ctx context.Context, args []string) error {
 	return nil
 }
 
+type clientCheck struct {
+	Client  string `json:"client"`
+	Kind    string `json:"kind"` // "mcp" or "hook"
+	Path    string `json:"path"`
+	Command string `json:"command"`
+	OK      bool   `json:"ok"`
+	Warning string `json:"warning,omitempty"`
+}
+
 type doctorReport struct {
-	OK                bool     `json:"ok"`
-	Binary            string   `json:"binary"`
-	Database          string   `json:"database"`
-	FileBytes         int64    `json:"file_bytes"`
-	Permissions       string   `json:"permissions"`
-	PermissionsWarn   string   `json:"permissions_warning,omitempty"`
-	SchemaVersion     int      `json:"schema_version"`
-	LatestSchema      int      `json:"latest_schema"`
-	Integrity         string   `json:"integrity"`
-	Active            int      `json:"active"`
-	Archived          int      `json:"archived"`
-	ExpiredPendingGC  int      `json:"expired_pending_gc"`
-	Namespace         string   `json:"namespace"`
-	Embeddings        string   `json:"embeddings"`
-	EmbeddingsURL     string   `json:"embeddings_url,omitempty"`
-	EmbeddingsModel   string   `json:"embeddings_model,omitempty"`
-	MissingEmbeddings int      `json:"missing_embeddings,omitempty"`
-	Warnings          []string `json:"warnings,omitempty"`
+	OK                bool          `json:"ok"`
+	Binary            string        `json:"binary"`
+	Database          string        `json:"database"`
+	FileBytes         int64         `json:"file_bytes"`
+	Permissions       string        `json:"permissions"`
+	PermissionsWarn   string        `json:"permissions_warning,omitempty"`
+	SchemaVersion     int           `json:"schema_version"`
+	LatestSchema      int           `json:"latest_schema"`
+	Integrity         string        `json:"integrity"`
+	Active            int           `json:"active"`
+	Archived          int           `json:"archived"`
+	ExpiredPendingGC  int           `json:"expired_pending_gc"`
+	Namespace         string        `json:"namespace"`
+	Embeddings        string        `json:"embeddings"`
+	EmbeddingsURL     string        `json:"embeddings_url,omitempty"`
+	EmbeddingsModel   string        `json:"embeddings_model,omitempty"`
+	MissingEmbeddings int           `json:"missing_embeddings,omitempty"`
+	Clients           []clientCheck `json:"clients,omitempty"`
+	Warnings          []string      `json:"warnings,omitempty"`
 }
 
 func checkPrivatePerms(dbPath string) (summary, warning string) {
@@ -1020,6 +1207,12 @@ func (a app) cmdDoctor(ctx context.Context, args []string) error {
 	if expired > 0 {
 		rep.Warnings = append(rep.Warnings, fmt.Sprintf("%d expired memories pending gc (run `llm-memory gc`)", expired))
 	}
+	rep.Clients = checkClientConfigs(a.env)
+	for _, c := range rep.Clients {
+		if c.Warning != "" {
+			rep.Warnings = append(rep.Warnings, c.Warning)
+		}
+	}
 
 	var checkErr error
 	if err := st.IntegrityCheck(ctx); err != nil {
@@ -1077,10 +1270,201 @@ func (a app) cmdDoctor(ctx context.Context, args []string) error {
 	} else {
 		fmt.Fprintf(a.stdout, "Embeddings:  %s\n", rep.Embeddings)
 	}
+	for _, c := range rep.Clients {
+		status := "ok"
+		if !c.OK {
+			status = "broken"
+		}
+		fmt.Fprintf(a.stdout, "Client:      %s (%s) -> %s [%s]\n", c.Client, c.Kind, c.Command, status)
+	}
 	for _, w := range rep.Warnings {
 		fmt.Fprintf(a.stdout, "Warning:     %s\n", w)
 	}
 	return checkErr
+}
+
+func checkClientConfigs(env config.Env) []clientCheck {
+	var checks []clientCheck
+	for _, client := range []string{"antigravity", "claude-desktop", "claude-code", "codex", "opencode"} {
+		path, err := clientConfigPath(client, env)
+		if err != nil {
+			continue
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		var cmd string
+		if client == "codex" {
+			cmd = extractCodexCommand(string(data))
+		} else {
+			cmd = extractJSONMCPCommand(client, data)
+		}
+		if cmd == "" {
+			continue
+		}
+		checks = append(checks, verifyCommand(client, "mcp", path, cmd))
+	}
+	for _, client := range hookClients {
+		path, err := hookConfigPath(client, env)
+		if err != nil {
+			continue
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		for _, cmdLine := range extractHookCommands(client, data) {
+			bin := firstShellToken(cmdLine)
+			checks = append(checks, verifyCommand(client, "hook", path, bin))
+		}
+	}
+	return checks
+}
+
+func verifyCommand(client, kind, path, cmd string) clientCheck {
+	chk := clientCheck{Client: client, Kind: kind, Path: path, Command: cmd, OK: true}
+	if cmd == "" {
+		chk.OK = false
+		chk.Warning = fmt.Sprintf("%s %s config (%s) has empty command", client, kind, path)
+		return chk
+	}
+	if strings.ContainsAny(cmd, `/\`) {
+		fi, err := os.Stat(cmd)
+		if err != nil || fi.IsDir() {
+			chk.OK = false
+			chk.Warning = fmt.Sprintf("%s %s config (%s) points to missing binary %q", client, kind, path, cmd)
+		}
+		return chk
+	}
+	if _, err := exec.LookPath(cmd); err != nil {
+		chk.OK = false
+		chk.Warning = fmt.Sprintf("%s %s config (%s): %q not found in PATH", client, kind, path, cmd)
+	}
+	return chk
+}
+
+func extractJSONMCPCommand(client string, data []byte) string {
+	var root map[string]any
+	if err := json.Unmarshal(data, &root); err != nil {
+		return ""
+	}
+	key := "mcpServers"
+	if client == "opencode" {
+		key = "mcp"
+	}
+	sec, _ := root[key].(map[string]any)
+	entry, _ := sec["llm-memory"].(map[string]any)
+	if entry == nil {
+		return ""
+	}
+	if s, ok := entry["command"].(string); ok {
+		return s
+	}
+	if arr, ok := entry["command"].([]any); ok && len(arr) > 0 {
+		s, _ := arr[0].(string)
+		return s
+	}
+	return ""
+}
+
+func extractCodexCommand(content string) string {
+	inSection := false
+	for _, line := range strings.Split(strings.ReplaceAll(content, "\r\n", "\n"), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "[") {
+			inSection = trimmed == "[mcp_servers.llm-memory]"
+			continue
+		}
+		if !inSection {
+			continue
+		}
+		if k, v, ok := strings.Cut(trimmed, "="); ok && strings.TrimSpace(k) == "command" {
+			val := strings.TrimSpace(v)
+			if unq, err := strconv.Unquote(val); err == nil {
+				return unq
+			}
+			return strings.Trim(val, `"'`)
+		}
+	}
+	return ""
+}
+
+func extractHookCommands(client string, data []byte) []string {
+	var root map[string]any
+	if err := json.Unmarshal(data, &root); err != nil {
+		return nil
+	}
+	var cmds []string
+	if client == "antigravity" {
+		entry, _ := root["llm-memory"].(map[string]any)
+		for _, rawList := range entry {
+			list, _ := rawList.([]any)
+			for _, item := range list {
+				if hm, ok := item.(map[string]any); ok {
+					if c, _ := hm["command"].(string); isOurHook(c) {
+						cmds = append(cmds, c)
+					}
+				}
+			}
+		}
+		return cmds
+	}
+	hooks, _ := root["hooks"].(map[string]any)
+	for _, rawGroups := range hooks {
+		groups, _ := rawGroups.([]any)
+		for _, g := range groups {
+			gm, _ := g.(map[string]any)
+			hs, _ := gm["hooks"].([]any)
+			for _, h := range hs {
+				if hm, ok := h.(map[string]any); ok {
+					if c, _ := hm["command"].(string); isOurHook(c) {
+						cmds = append(cmds, c)
+					}
+				}
+			}
+		}
+	}
+	return cmds
+}
+
+func firstShellToken(cmd string) string {
+	s := strings.TrimSpace(cmd)
+	if s == "" {
+		return ""
+	}
+	if s[0] == '\'' {
+		var b strings.Builder
+		for i := 1; i < len(s); i++ {
+			if s[i] == '\'' {
+				if strings.HasPrefix(s[i:], `'\''`) {
+					b.WriteByte('\'')
+					i += 3
+					continue
+				}
+				return b.String()
+			}
+			b.WriteByte(s[i])
+		}
+		return b.String()
+	}
+	if s[0] == '"' {
+		var b strings.Builder
+		for i := 1; i < len(s); i++ {
+			if s[i] == '\\' && i+1 < len(s) {
+				i++
+				b.WriteByte(s[i])
+				continue
+			}
+			if s[i] == '"' {
+				return b.String()
+			}
+			b.WriteByte(s[i])
+		}
+		return b.String()
+	}
+	tok, _, _ := strings.Cut(s, " ")
+	return tok
 }
 
 const (
@@ -1230,16 +1614,80 @@ func patchCodexTOML(path, block string) error {
 	return nil
 }
 
+func removeJSONConfig(path, sectionKey, serverName string) error {
+	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return patchJSONFile(path, func(root map[string]any) error {
+		raw, ok := root[sectionKey]
+		if !ok || raw == nil {
+			return nil
+		}
+		sec, ok := raw.(map[string]any)
+		if !ok {
+			return fmt.Errorf("%q is not a JSON object", sectionKey)
+		}
+		delete(sec, serverName)
+		return nil
+	})
+}
+
+func removeCodexTOML(path string) error {
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read %s: %w", path, err)
+	}
+	content := strings.ReplaceAll(string(data), "\r\n", "\n")
+	lines := strings.Split(content, "\n")
+	start := -1
+	end := len(lines)
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if start == -1 {
+			if trimmed == "[mcp_servers.llm-memory]" {
+				start = i
+			}
+			continue
+		}
+		if strings.HasPrefix(trimmed, "[") {
+			end = i
+			break
+		}
+	}
+	if start == -1 {
+		return nil
+	}
+	for end < len(lines) && strings.TrimSpace(lines[end]) == "" {
+		end++
+	}
+	rebuilt := append([]string{}, lines[:start]...)
+	rebuilt = append(rebuilt, lines[end:]...)
+	updated := strings.TrimRight(strings.Join(rebuilt, "\n"), "\n")
+	if updated != "" {
+		updated += "\n"
+	}
+	return os.WriteFile(path, []byte(updated), 0o644)
+}
+
 func (a app) cmdSetup(_ context.Context, args []string) error {
 	fs := a.newFlagSet("setup")
 	flags := config.Register(fs)
 	ollama := fs.Bool("ollama", false, "include local Ollama embeddings defaults ("+defaultOllamaModel+")")
 	write := fs.Bool("write", false, "patch the client configuration file directly")
-	cfgPath := fs.String("config", "", "override target config file path (with --write)")
-	hooks := fs.Bool("hooks", false, "configure the SessionStart hook that injects the briefing (antigravity, claude-code, codex)")
+	remove := fs.Bool("remove", false, "remove llm-memory from the client configuration file")
+	cfgPath := fs.String("config", "", "override target config file path (with --write or --remove)")
+	hooks := fs.Bool("hooks", false, "configure client hooks (antigravity, claude-code, codex)")
+	eventsFlag := fs.String("events", hookEventSessionStart, "comma-separated hook events with --hooks: "+strings.Join(hookEvents, ", "))
 	pos, err := parse(fs, args, 1, 1)
 	if err != nil {
 		return err
+	}
+	if *write && *remove {
+		fmt.Fprintln(a.stderr, "cannot combine --write and --remove")
+		return errUsage
 	}
 	cfg, err := flags.Resolve(a.env)
 	if err != nil {
@@ -1256,7 +1704,43 @@ func (a app) cmdSetup(_ context.Context, args []string) error {
 	bin := executablePath()
 	client := strings.ToLower(pos[0])
 	if *hooks {
-		return a.setupHooks(client, bin, cfg.DB, hookNamespace(fs, a.env), *write, *cfgPath)
+		if *remove {
+			return a.removeHooks(client, *cfgPath)
+		}
+		events, err := parseHookEvents(*eventsFlag)
+		if err != nil {
+			fmt.Fprintln(a.stderr, err)
+			return errUsage
+		}
+		return a.setupHooks(client, bin, cfg.DB, hookNamespace(fs, a.env), events, *write, *cfgPath)
+	}
+	if *remove {
+		target := *cfgPath
+		if target == "" {
+			target, err = clientConfigPath(client, a.env)
+			if err != nil {
+				fmt.Fprintf(a.stderr, "unknown client %q (expected antigravity, claude-desktop, claude-code, codex, opencode or vscode)\n", pos[0])
+				return errUsage
+			}
+		}
+		switch client {
+		case "antigravity", "claude-desktop", "claude-code":
+			err = removeJSONConfig(target, "mcpServers", "llm-memory")
+		case "vscode":
+			err = removeJSONConfig(target, "servers", "llm-memory")
+		case "opencode":
+			err = removeJSONConfig(target, "mcp", "llm-memory")
+		case "codex":
+			err = removeCodexTOML(target)
+		default:
+			fmt.Fprintf(a.stderr, "unknown client %q (expected antigravity, claude-desktop, claude-code, codex, opencode or vscode)\n", pos[0])
+			return errUsage
+		}
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(a.stdout, "Removed llm-memory from %s (%s)\n", target, client)
+		return nil
 	}
 
 	srvArgs := []string{"serve", "--db", cfg.DB}
@@ -1479,3 +1963,124 @@ func (a app) cmdBackup(ctx context.Context, args []string) error {
 	}
 	return nil
 }
+
+func (a app) cmdCompletion(_ context.Context, args []string) error {
+	fs := a.newFlagSet("completion")
+	pos, err := parse(fs, args, 1, 1)
+	if err != nil {
+		return err
+	}
+	shell := strings.ToLower(pos[0])
+	switch shell {
+	case "bash":
+		_, err = fmt.Fprint(a.stdout, bashCompletion)
+		return err
+	case "zsh":
+		_, err = fmt.Fprint(a.stdout, zshCompletion)
+		return err
+	case "fish":
+		_, err = fmt.Fprint(a.stdout, fishCompletion)
+		return err
+	default:
+		fmt.Fprintf(a.stderr, "unsupported shell %q (expected bash, zsh or fish)\n", pos[0])
+		return errUsage
+	}
+}
+
+const bashCompletion = `_llm_memory() {
+  local cur prev cmds
+  COMPREPLY=()
+  cur="${COMP_WORDS[COMP_CWORD]}"
+  prev="${COMP_WORDS[COMP_CWORD-1]}"
+  cmds="serve context hook remember update forget handoff list show search restore purge export import stats reindex namespace gc doctor backup setup ui completion version help"
+  if [[ ${COMP_CWORD} -eq 1 ]]; then
+    COMPREPLY=( $(compgen -W "${cmds}" -- "${cur}") )
+    return 0
+  fi
+  case "${COMP_WORDS[1]}" in
+    namespace)
+      if [[ ${COMP_CWORD} -eq 2 ]]; then
+        COMPREPLY=( $(compgen -W "list rename merge archive" -- "${cur}") )
+      fi
+      ;;
+    setup)
+      COMPREPLY=( $(compgen -W "antigravity claude-desktop claude-code codex opencode vscode --hooks --write --remove --ollama --events --config" -- "${cur}") )
+      ;;
+    hook)
+      COMPREPLY=( $(compgen -W "antigravity claude-code codex --event --events --write --remove --max-chars --focus --config" -- "${cur}") )
+      ;;
+    completion)
+      COMPREPLY=( $(compgen -W "bash zsh fish" -- "${cur}") )
+      ;;
+    *)
+      if [[ "${cur}" == -* ]]; then
+        COMPREPLY=( $(compgen -W "--db --namespace --source --log-level --json --help" -- "${cur}") )
+      fi
+      ;;
+  esac
+}
+complete -F _llm_memory llm-memory
+`
+
+const zshCompletion = `#compdef llm-memory
+
+_llm-memory() {
+  local -a commands
+  commands=(
+    'serve:start the MCP server (stdio or Streamable HTTP)'
+    'context:print the briefing get_context would return'
+    'hook:lifecycle hook entry point'
+    'remember:create a memory'
+    'update:modify an active memory'
+    'forget:archive one or more memories'
+    'handoff:write a handoff for the next assistant'
+    'list:list memories'
+    'show:full content, links and history of a memory'
+    'search:full-text / semantic search'
+    'restore:un-archive a memory'
+    'purge:permanently delete archived memories'
+    'export:JSON export'
+    'import:import a JSON export'
+    'stats:database statistics'
+    'reindex:compute embeddings'
+    'namespace:manage namespaces'
+    'gc:archive expired memories'
+    'doctor:check database integrity, permissions, embeddings and clients'
+    'backup:hot SQLite backup'
+    'setup:configure MCP clients or hooks'
+    'ui:start local web explorer'
+    'completion:print shell completion script'
+    'version:version and schema version'
+    'help:show usage'
+  )
+  if (( CURRENT == 2 )); then
+    _describe 'command' commands
+    return
+  fi
+  case "${words[2]}" in
+    namespace)
+      _values 'subcommand' list rename merge archive
+      ;;
+    setup)
+      _values 'client' antigravity claude-desktop claude-code codex opencode vscode
+      ;;
+    hook)
+      _values 'client' antigravity claude-code codex
+      ;;
+    completion)
+      _values 'shell' bash zsh fish
+      ;;
+  esac
+}
+
+_llm-memory "$@"
+`
+
+const fishCompletion = `set -l cmds serve context hook remember update forget handoff list show search restore purge export import stats reindex namespace gc doctor backup setup ui completion version help
+complete -c llm-memory -f
+complete -c llm-memory -n "not __fish_seen_subcommand_from $cmds" -a "$cmds"
+complete -c llm-memory -n "__fish_seen_subcommand_from namespace" -a "list rename merge archive"
+complete -c llm-memory -n "__fish_seen_subcommand_from setup" -a "antigravity claude-desktop claude-code codex opencode vscode"
+complete -c llm-memory -n "__fish_seen_subcommand_from hook" -a "antigravity claude-code codex"
+complete -c llm-memory -n "__fish_seen_subcommand_from completion" -a "bash zsh fish"
+`

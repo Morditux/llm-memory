@@ -225,16 +225,19 @@ func importMemory(ctx context.Context, tx *sql.Tx, m DumpMemory, by string) (int
 	if updated.IsZero() {
 		updated = created
 	}
-	var archived any
+	var archived, expires any
 	if m.ArchivedAt != nil {
 		archived = FormatTime(*m.ArchivedAt)
 	}
+	if m.ExpiresAt != nil {
+		expires = FormatTime(*m.ExpiresAt)
+	}
 	res, err := tx.ExecContext(ctx,
 		`INSERT INTO memories(namespace, kind, title, content, tags, importance, source,
-		                      created_at, updated_at, updated_by, archived_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		                      created_at, updated_at, updated_by, archived_at, expires_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		ns, string(m.Kind), title, content, joinTags(m.Tags), imp, normalizeActor(m.Source),
-		FormatTime(created), FormatTime(updated), normalizeActor(m.UpdatedBy), archived)
+		FormatTime(created), FormatTime(updated), normalizeActor(m.UpdatedBy), archived, expires)
 	if err != nil {
 		return 0, false, fmt.Errorf("insert: %w", err)
 	}

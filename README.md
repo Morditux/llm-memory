@@ -5,8 +5,10 @@
 # llm-memory
 
 [![CI](https://github.com/Morditux/llm-memory/actions/workflows/ci.yml/badge.svg)](https://github.com/Morditux/llm-memory/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/Morditux/llm-memory)](https://github.com/Morditux/llm-memory/releases)
 [![Go](https://img.shields.io/github/go-mod/go-version/Morditux/llm-memory?logo=go&logoColor=white)](https://go.dev/)
 [![SQLite](https://img.shields.io/badge/SQLite-FTS5-003B57?logo=sqlite&logoColor=white)](https://www.sqlite.org/)
+[![License](https://img.shields.io/github/license/Morditux/llm-memory)](LICENSE)
 
 A local MCP server that stores a **memory shared by several LLMs** in a SQLite file
 (Claude Desktop, Claude Code, VS Code, an internal LLM…). When you switch from one client to
@@ -100,11 +102,11 @@ Priority: flag > environment variable > default.
 
 | Tool | Role |
 | --- | --- |
-| `get_context` | Start-of-session Markdown briefing: latest handoff, essential memories, tasks, preferences, recent decisions and facts |
-| `remember` | Creates a memory (`preference`, `fact`, `decision`, `task_state`, `note`); reports probable duplicates; `supersedes` archives the replaced memories; rejects detected secrets |
+| `get_context` | Start-of-session Markdown briefing: latest handoff, essential memories, tasks, preferences, recent decisions and facts (supports `focus`, including semantic search when enabled) |
+| `remember` | Creates a memory (`preference`, `fact`, `decision`, `task_state`, `note`); reports probable duplicates; `supersedes`, `related_to` and `depends_on` create structured links; rejects detected secrets |
 | `recall` | Full-text search (accents and case ignored, words matched as prefixes), namespace / kinds / tags filters |
-| `get_memory` | Full content, history optional |
-| `update_memory` | Modifies the given fields; the old version stays in history |
+| `get_memory` | Full content, change history (optional) and structured links (`supersedes`, `relates_to`, `depends_on`) |
+| `update_memory` | Modifies the given fields or adds/removes links; the old version stays in history |
 | `forget` | Archives (reversible with `llm-memory restore`) |
 | `handoff` | Handoff for the next LLM (summary, next steps, open questions, optional `supersedes` and `namespace_description`); one active per namespace |
 | `list_namespaces` | Namespaces, number of active memories, last activity |
@@ -123,26 +125,31 @@ Flags may be placed before or after arguments. Writes made from the CLI are
 recorded with the author `cli` (overridable with `--source`).
 
 ```bash
-llm-memory remember --kind decision [--namespace X] [--title T] [--tag t1,t2] [--importance 2] [--supersedes 1,2] [--json] <content|->
+llm-memory remember --kind decision [--namespace X] [--title T] [--tag t1,t2] [--importance 2] [--supersedes 1,2] [--expires-in 7d] [--json] <content|->
+llm-memory update [--kind K] [--title T] [--content C] [--tag t1,t2] [--importance N] [--namespace X] [--expires-in D] [--clear-expires] [--add-link relates_to:5] [--remove-link relates_to:5] [--json] <id> [content|-]
 llm-memory handoff [--namespace X] [--next "step 1,step 2"] [--questions "q1"] [--supersedes 3] [--description "..."] [--json] <summary|->
 llm-memory forget [--reason "..."] [--json] <id>...
 llm-memory list [--namespace X] [--kind decision,fact] [--tag db,api] [--archived] [--limit N] [--json]
-llm-memory show [--json] 42              # full content and history
+llm-memory show [--json] 42              # full content, links and history
 llm-memory search [--tag db] [--json] postgres jsonb   # same engine as recall
-llm-memory context --namespace demo [--json]           # exactly what get_context would return
+llm-memory context --namespace demo [--focus Q] [--json] # exactly what get_context would return
 llm-memory restore 42                    # un-archives
 llm-memory purge --archived-before 2026-01-01 [--yes]   # permanent deletion
 llm-memory export [--namespace X] [--history] [-o dump.json]
 llm-memory import [--dry-run] dump.json  # or - for stdin; exact duplicates are skipped
 llm-memory stats [--json]                # per namespace, kind, source; file size
+llm-memory namespace <list|rename|merge|archive> ... # manage namespaces
+llm-memory gc [--json]                   # archive expired (TTL) memories
 llm-memory backup [--keep N] [--verify] [--json] [<dest>] # hot SQLite backup (VACUUM INTO)
-llm-memory doctor [--json]               # check database integrity, permissions and embeddings
-llm-memory setup [--ollama] [--write] [--config PATH] <client> # print or patch MCP config (antigravity, claude-desktop, claude-code, codex, opencode, vscode)
-llm-memory setup --hooks [--write] [--config PATH] <client>    # SessionStart hook injecting the briefing (antigravity, claude-code, codex)
-llm-memory hook [--focus Q] <client>     # hook entry point: prints the briefing in the client's hook format
-llm-memory hook --write [--config PATH] [--max-chars N] [--focus Q] <client>  # install the hook in the client config (flags are kept in the hook command)
+llm-memory doctor [--json]               # check database integrity, permissions, embeddings and client configs
+llm-memory setup [--ollama] [--write|--remove] [--config PATH] <client> # print, write or remove MCP config (antigravity, claude-desktop, claude-code, codex, opencode, vscode)
+llm-memory setup --hooks [--events SessionStart,PreCompact,Stop] [--write|--remove] [--config PATH] <client> # lifecycle hooks (antigravity, claude-code, codex)
+llm-memory hook [--event E] [--focus Q] <client>     # hook entry point: prints the payload in the client's hook format
+llm-memory hook --write [--events LIST] [--config PATH] [--max-chars N] [--focus Q] <client>  # install hook(s) in the client config
+llm-memory hook --remove [--config PATH] <client>    # remove llm-memory hooks from the client config
 llm-memory reindex [--all]               # embeddings (semantic search only)
-llm-memory ui [--addr 127.0.0.1:8765]    # local web explorer (create/edit, diff history, similar/supersede, GC)
+llm-memory ui [--addr 127.0.0.1:8765]    # local web explorer (create/edit, tags, TTL, links, namespaces, diff history, similar/supersede, GC)
+llm-memory completion <bash|zsh|fish>    # print shell completion script
 llm-memory serve [--listen 127.0.0.1:8766] [--stateless] [--read-only] # stdio (default) or Streamable HTTP (/mcp, /healthz)
 ```
 

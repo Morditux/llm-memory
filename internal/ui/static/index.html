@@ -27,7 +27,7 @@
     }
     header h1 { margin: 0; font-size: 1.1rem; font-weight: 600; color: var(--accent); }
     #stats { font-size: 0.85rem; color: var(--muted); margin-left: auto; }
-    main { display: grid; grid-template-columns: 220px 1fr 460px; flex: 1; min-height: 0; }
+    main { display: grid; grid-template-columns: 240px 1fr 480px; flex: 1; min-height: 0; }
     aside, section { border-right: 1px solid var(--border); overflow-y: auto; padding: 1rem; }
     section:last-child { border-right: none; }
     h2 { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin: 0 0 0.75rem; }
@@ -37,19 +37,26 @@
     }
     .ns-item:hover { background: rgba(56, 189, 248, 0.1); }
     .ns-item.active { background: rgba(56, 189, 248, 0.2); color: var(--accent); font-weight: 600; }
+    .ns-panel {
+      margin-top: 1rem; padding: 0.7rem; border: 1px solid var(--border); border-radius: 8px;
+      background: rgba(30, 41, 59, 0.6); font-size: 0.82rem; display: flex; flex-direction: column; gap: 0.45rem;
+    }
     .badge {
       font-size: 0.75rem; padding: 0.1rem 0.45rem; border-radius: 999px;
       background: var(--bg); color: var(--muted); border: 1px solid var(--border);
     }
+    .badge.tag-btn { cursor: pointer; }
+    .badge.tag-btn:hover { border-color: var(--accent); color: var(--accent); }
     .toolbar { display: flex; gap: 0.5rem; margin-bottom: 1rem; flex-wrap: wrap; }
     input, select, button, textarea {
       background: var(--panel); color: var(--text); border: 1px solid var(--border);
       border-radius: 6px; padding: 0.45rem 0.7rem; font-size: 0.88rem; font-family: inherit;
     }
     textarea { width: 100%; min-height: 110px; resize: vertical; line-height: 1.4; }
-    input[type="search"] { flex: 1; min-width: 180px; }
+    input[type="search"] { flex: 1; min-width: 160px; }
     button { cursor: pointer; }
-    button:hover { border-color: var(--accent); }
+    button:hover:not(:disabled) { border-color: var(--accent); }
+    button:disabled { opacity: 0.45; cursor: default; }
     button.primary { border-color: var(--accent); color: var(--accent); }
     button.danger { border-color: var(--red); color: var(--red); }
     button.ok { border-color: var(--green); color: var(--green); }
@@ -78,7 +85,11 @@
     .banner { padding: 0.5rem 0.75rem; border-radius: 6px; font-size: 0.84rem; margin-bottom: 0.75rem; border: 1px solid var(--border); background: var(--panel); }
     .banner.err { border-color: var(--red); color: var(--red); }
     .banner.ok { border-color: var(--green); color: var(--green); }
-    .sim-card { padding: 0.55rem; border: 1px solid var(--border); border-radius: 6px; margin-bottom: 0.45rem; background: var(--bg); font-size: 0.82rem; }
+    .sim-card, .link-card { padding: 0.55rem; border: 1px solid var(--border); border-radius: 6px; margin-bottom: 0.45rem; background: var(--bg); font-size: 0.82rem; }
+    .link-card { display: flex; justify-content: space-between; align-items: center; gap: 0.5rem; }
+    .link-jump { cursor: pointer; color: var(--accent); text-decoration: none; }
+    .link-jump:hover { text-decoration: underline; }
+    .pager { display: flex; justify-content: space-between; align-items: center; margin-top: 0.75rem; font-size: 0.82rem; color: var(--muted); }
     @media (max-width: 960px) { main { grid-template-columns: 1fr; } aside, section { border-right: none; border-bottom: 1px solid var(--border); } }
   </style>
 </head>
@@ -93,12 +104,14 @@
     <aside>
       <h2>Namespaces</h2>
       <div id="ns-list"></div>
+      <div id="ns-panel"></div>
     </aside>
     <section>
       <div id="status-banner" style="display:none;"></div>
       <div id="create-box" style="display:none;"></div>
       <div class="toolbar">
         <input id="q" type="search" placeholder="Search memories (FTS / semantic)…" />
+        <input id="tag" placeholder="Tags (comma-sep)" style="max-width:150px;" />
         <select id="kind">
           <option value="">All kinds</option>
           <option value="handoff">handoff</option>
@@ -115,14 +128,20 @@
         </select>
       </div>
       <div id="mem-list"></div>
+      <div id="pager" class="pager" style="display:none;">
+        <button class="sm" id="btn-prev">← Prev</button>
+        <span id="page-info"></span>
+        <button class="sm" id="btn-next">Next →</button>
+      </div>
     </section>
     <section id="detail">
       <h2>Details</h2>
-      <p style="color: var(--muted); font-size: 0.9rem;">Select a memory to inspect its content, diff history, and similar memories.</p>
+      <p style="color: var(--muted); font-size: 0.9rem;">Select a memory to inspect its content, links, diff history, and similar memories.</p>
     </section>
   </main>
   <script>
-    const state = { ns: "", selectedId: null, diffMode: true };
+    const PAGE_SIZE = 50;
+    const state = { ns: "", namespaces: [], selectedId: null, diffMode: true, offset: 0 };
     const $ = (id) => document.getElementById(id);
 
     async function api(url, opts) {
@@ -180,37 +199,136 @@
       $("stats").textContent = `${st.active} active · ${st.archived} archived · schema v${st.schema_version}`;
     }
 
+    function renderNamespacePanel() {
+      const panel = $("ns-panel");
+      if (!state.ns) {
+        panel.innerHTML = "";
+        return;
+      }
+      const cur = state.namespaces.find((n) => n.name === state.ns);
+      if (!cur) {
+        panel.innerHTML = "";
+        return;
+      }
+      const isGlobal = cur.name === "global";
+      panel.innerHTML = `
+        <div class="ns-panel">
+          <strong>${esc(cur.name)}</strong>
+          <input id="ns-desc" value="${esc(cur.description || "")}" placeholder="Description" />
+          <button class="sm primary" id="ns-save-desc">Save description</button>
+          ${isGlobal ? "" : `
+            <div style="display:flex; gap:0.35rem;">
+              <input id="ns-rename-to" placeholder="New name" style="min-width:0; flex:1;" />
+              <button class="sm" id="ns-rename">Rename</button>
+            </div>
+            <div style="display:flex; gap:0.35rem;">
+              <input id="ns-merge-to" placeholder="Merge into" style="min-width:0; flex:1;" />
+              <button class="sm" id="ns-merge">Merge</button>
+            </div>
+            <button class="sm danger" id="ns-archive">Archive all in ${esc(cur.name)}</button>
+          `}
+        </div>
+      `;
+      $("ns-save-desc").onclick = async () => {
+        try {
+          await api(`/api/namespaces/${encodeURIComponent(cur.name)}`, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ description: $("ns-desc").value }),
+          });
+          showBanner(`Updated description for "${cur.name}"`, false);
+          await loadNamespaces();
+        } catch (err) { showBanner(err.message, true); }
+      };
+      if (!isGlobal) {
+        $("ns-rename").onclick = async () => {
+          try {
+            const res = await api(`/api/namespaces/${encodeURIComponent(cur.name)}/rename`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ new_name: $("ns-rename-to").value }),
+            });
+            state.ns = res.name;
+            showBanner(`Renamed namespace to "${res.name}"`, false);
+            await refresh(state.selectedId);
+          } catch (err) { showBanner(err.message, true); }
+        };
+        $("ns-merge").onclick = async () => {
+          try {
+            const target = $("ns-merge-to").value.trim();
+            const res = await api(`/api/namespaces/${encodeURIComponent(cur.name)}/merge`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ target }),
+            });
+            state.ns = target;
+            showBanner(`Merged "${cur.name}" into "${target}" (${res.moved} moved)`, false);
+            await refresh(state.selectedId);
+          } catch (err) { showBanner(err.message, true); }
+        };
+        $("ns-archive").onclick = async () => {
+          try {
+            const res = await api(`/api/namespaces/${encodeURIComponent(cur.name)}/archive`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ reason: "archived from web UI" }),
+            });
+            showBanner(`Archived ${res.archived} memory(ies) in "${cur.name}"`, false);
+            await refresh(state.selectedId);
+          } catch (err) { showBanner(err.message, true); }
+        };
+      }
+    }
+
     async function loadNamespaces() {
       const list = await api("/api/namespaces");
+      state.namespaces = list;
       const el = $("ns-list");
       const allBtn = `<div class="ns-item ${state.ns === "" ? "active" : ""}" data-ns=""><span>All namespaces</span></div>`;
       el.innerHTML = allBtn + list.map((n) =>
-        `<div class="ns-item ${state.ns === n.name ? "active" : ""}" data-ns="${esc(n.name)}">
+        `<div class="ns-item ${state.ns === n.name ? "active" : ""}" data-ns="${esc(n.name)}" title="${esc(n.description || "")}">
           <span>${esc(n.name)}</span>
           <span class="badge">${n.active_count}</span>
         </div>`
       ).join("");
       el.querySelectorAll(".ns-item").forEach((node) => {
-        node.onclick = () => { state.ns = node.dataset.ns; loadNamespaces(); loadMemories(); };
+        node.onclick = () => {
+          state.ns = node.dataset.ns;
+          state.offset = 0;
+          loadNamespaces();
+          loadMemories();
+        };
       });
+      renderNamespacePanel();
     }
 
     async function loadMemories() {
       const q = $("q").value.trim();
+      const tag = $("tag").value.trim();
       const kind = $("kind").value;
       const archived = $("archived").value;
       const params = new URLSearchParams();
       if (state.ns) params.set("namespace", state.ns);
+      if (tag) params.set("tag", tag);
       if (kind) params.set("kind", kind);
       if (archived) params.set("archived", archived);
 
       let items = [];
+      const pager = $("pager");
       if (q) {
         params.set("q", q);
         const res = await api("/api/search?" + params.toString());
         items = res.map((r) => r.memory);
+        pager.style.display = "none";
       } else {
+        params.set("limit", String(PAGE_SIZE));
+        params.set("offset", String(state.offset));
         items = await api("/api/memories?" + params.toString());
+        pager.style.display = (state.offset > 0 || items.length === PAGE_SIZE) ? "flex" : "none";
+        const page = Math.floor(state.offset / PAGE_SIZE) + 1;
+        $("page-info").textContent = `Page ${page} (${items.length} shown)`;
+        $("btn-prev").disabled = state.offset === 0;
+        $("btn-next").disabled = items.length < PAGE_SIZE;
       }
       const el = $("mem-list");
       if (!items.length) {
@@ -262,7 +380,10 @@
             </select>
           </div>
           <input id="c-title" placeholder="Title (optional)" />
-          <input id="c-tags" placeholder="Tags comma-separated (optional)" />
+          <div class="form-row">
+            <input id="c-tags" placeholder="Tags comma-separated (optional)" />
+            <input id="c-ttl" placeholder="Expires in (e.g. 24h, 7d)" />
+          </div>
           <textarea id="c-content" placeholder="Memory content…"></textarea>
           <div style="display:flex; justify-content:flex-end; gap:0.5rem;">
             <button class="primary" id="c-save">Create</button>
@@ -282,6 +403,7 @@
               importance: Number($("c-imp").value),
               title: $("c-title").value.trim(),
               tags,
+              expires_in: $("c-ttl").value.trim(),
               content: $("c-content").value,
             }),
           });
@@ -296,8 +418,8 @@
 
     async function loadDetail(id, editMode = false) {
       state.selectedId = id;
-      const { memory: m, history } = await api(`/api/memories/${id}`);
-      const tags = (m.tags || []).map((t) => `<span class="badge">#${esc(t)}</span>`).join(" ");
+      const { memory: m, history, links = [] } = await api(`/api/memories/${id}`);
+      const tags = (m.tags || []).map((t) => `<span class="badge tag-btn" data-tag="${esc(t)}">#${esc(t)}</span>`).join(" ");
       const actionBtn = m.archived_at
         ? `<button class="ok sm" id="btn-restore">Restore</button>`
         : `<button class="sm" id="btn-edit">Edit</button>
@@ -307,6 +429,7 @@
       const bodyHTML = editMode ? `
         <div class="form-grid" style="margin-top:0.5rem;">
           <div class="form-row">
+            <input id="e-ns" value="${esc(m.namespace)}" placeholder="Namespace" />
             <select id="e-kind">
               ${["fact","decision","preference","task_state","note"].map((k) => `<option value="${k}" ${m.kind === k ? "selected" : ""}>${k}</option>`).join("")}
             </select>
@@ -315,7 +438,11 @@
             </select>
           </div>
           <input id="e-title" value="${esc(m.title)}" placeholder="Title" />
-          <input id="e-tags" value="${esc((m.tags || []).join(", "))}" placeholder="Tags comma-separated" />
+          <div class="form-row">
+            <input id="e-tags" value="${esc((m.tags || []).join(", "))}" placeholder="Tags comma-separated" />
+            <input id="e-ttl" placeholder="New TTL (e.g. 24h, 7d)" />
+          </div>
+          ${m.expires_at ? `<label style="font-size:0.8rem; color:var(--muted); display:flex; align-items:center; gap:0.4rem;"><input type="checkbox" id="e-clear-ttl" style="width:auto;" /> Clear expiration (${esc(m.expires_at)})</label>` : ""}
           <textarea id="e-content">${esc(m.content)}</textarea>
           <div style="display:flex; justify-content:flex-end; gap:0.5rem;">
             <button class="sm" id="e-cancel">Cancel</button>
@@ -327,6 +454,19 @@
         <div style="margin-bottom:0.6rem;">${tags}</div>
         <div class="detail-content">${esc(m.content)}</div>
       `;
+
+      const linksHTML = links.map((l) => `
+        <div class="link-card">
+          <div>
+            <span class="badge">${l.direction === "outgoing" ? esc(l.kind) : "← " + esc(l.kind)}</span>
+            <a class="link-jump" data-jump="${l.id}">#${l.id}</a>
+            <span style="color:var(--muted);">[${esc(l.memory_kind)}]</span>
+            ${l.title ? `<span>${esc(l.title)}</span>` : ""}
+            ${l.archived ? `<span class="archived-tag">(archived)</span>` : ""}
+          </div>
+          ${l.direction === "outgoing" ? `<button class="sm danger btn-unlink" data-target="${l.id}" data-kind="${esc(l.kind)}" title="Remove link">×</button>` : ""}
+        </div>
+      `).join("");
 
       const histHTML = history.map((h, idx) => {
         let body = `<div>${esc(h.snapshot)}</div>`;
@@ -352,9 +492,23 @@
           <span>${esc(m.namespace)}</span>
           <span>by ${esc(m.updated_by)}</span>
           <span>imp:${m.importance}</span>
+          ${m.expires_at ? `<span>expires:${esc(m.expires_at.slice(0, 10))}</span>` : ""}
         </div>
         ${bodyHTML}
         <div id="similar-box" style="margin-top:1rem;"></div>
+        <div style="margin-top:1.25rem;">
+          <h2>Links (${links.length})</h2>
+          <div>${linksHTML || `<p style="color:var(--muted); font-size:0.82rem; margin:0 0 0.5rem;">No links.</p>`}</div>
+          <div class="form-row" style="margin-top:0.4rem;">
+            <select id="lnk-kind" style="max-width:130px;">
+              <option value="relates_to">relates_to</option>
+              <option value="depends_on">depends_on</option>
+              <option value="supersedes">supersedes</option>
+            </select>
+            <input id="lnk-target" type="number" min="1" placeholder="Target #id" style="max-width:120px;" />
+            <button class="sm" id="btn-link-add" style="flex:0;">+ Link</button>
+          </div>
+        </div>
         <div style="display:flex; justify-content:space-between; align-items:center; margin-top:1.25rem; margin-bottom:0.5rem;">
           <h2 style="margin:0;">History (${history.length})</h2>
           <button class="sm" id="btn-diff-toggle">${state.diffMode ? "Show Raw" : "Show Diff"}</button>
@@ -362,22 +516,58 @@
         <div>${histHTML}</div>
       `;
 
+      $("detail").querySelectorAll(".tag-btn").forEach((el) => {
+        el.onclick = () => { $("tag").value = el.dataset.tag; state.offset = 0; loadMemories(); };
+      });
+      $("detail").querySelectorAll(".link-jump").forEach((el) => {
+        el.onclick = () => loadDetail(Number(el.dataset.jump));
+      });
+      $("detail").querySelectorAll(".btn-unlink").forEach((btn) => {
+        btn.onclick = async () => {
+          try {
+            await api(`/api/memories/${id}/links/remove`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ target_id: Number(btn.dataset.target), kind: btn.dataset.kind }),
+            });
+            await loadDetail(id);
+          } catch (err) { showBanner(err.message, true); }
+        };
+      });
+      $("btn-link-add").onclick = async () => {
+        try {
+          const targetId = Number($("lnk-target").value);
+          if (!targetId) return;
+          await api(`/api/memories/${id}/links`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ target_id: targetId, kind: $("lnk-kind").value }),
+          });
+          await loadDetail(id);
+        } catch (err) { showBanner(err.message, true); }
+      };
+
       if ($("btn-edit")) $("btn-edit").onclick = () => loadDetail(id, true);
       if ($("e-cancel")) $("e-cancel").onclick = () => loadDetail(id, false);
       if ($("e-save")) {
         $("e-save").onclick = async () => {
           try {
             const tags = $("e-tags").value.split(",").map((t) => t.trim()).filter(Boolean);
+            const payload = {
+              namespace: $("e-ns").value.trim(),
+              kind: $("e-kind").value,
+              importance: Number($("e-imp").value),
+              title: $("e-title").value,
+              tags,
+              content: $("e-content").value,
+            };
+            const ttl = $("e-ttl").value.trim();
+            if (ttl) payload.expires_in = ttl;
+            if ($("e-clear-ttl") && $("e-clear-ttl").checked) payload.clear_expires = true;
             await api(`/api/memories/${id}`, {
               method: "PUT",
               headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                kind: $("e-kind").value,
-                importance: Number($("e-imp").value),
-                title: $("e-title").value,
-                tags,
-                content: $("e-content").value,
-              }),
+              body: JSON.stringify(payload),
             });
             showBanner(`Updated memory #${id}`, false);
             await refresh(id);
@@ -452,11 +642,15 @@
       showBanner(`GC archived ${res.archived} expired memory(ies)`, false);
       await refresh(state.selectedId);
     };
+    $("btn-prev").onclick = () => { state.offset = Math.max(0, state.offset - PAGE_SIZE); loadMemories(); };
+    $("btn-next").onclick = () => { state.offset += PAGE_SIZE; loadMemories(); };
 
     let searchTimer;
-    $("q").oninput = () => { clearTimeout(searchTimer); searchTimer = setTimeout(loadMemories, 200); };
-    $("kind").onchange = loadMemories;
-    $("archived").onchange = loadMemories;
+    const onFilterChange = () => { state.offset = 0; loadMemories(); };
+    $("q").oninput = () => { clearTimeout(searchTimer); searchTimer = setTimeout(onFilterChange, 200); };
+    $("tag").oninput = () => { clearTimeout(searchTimer); searchTimer = setTimeout(onFilterChange, 200); };
+    $("kind").onchange = onFilterChange;
+    $("archived").onchange = onFilterChange;
     refresh();
   </script>
 </body>

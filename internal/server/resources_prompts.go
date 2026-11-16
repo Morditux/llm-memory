@@ -81,7 +81,7 @@ func (s *srv) readContextResource(ctx context.Context, req *mcp.ReadResourceRequ
 	default:
 		return nil, mcp.ResourceNotFoundError(uri)
 	}
-	text, err := briefing.Build(ctx, s.store, briefing.Options{Namespace: ns})
+	text, err := briefing.Build(ctx, s.store, briefing.Options{Namespace: ns, Searcher: s.search})
 	if err != nil {
 		return nil, err
 	}
@@ -102,7 +102,7 @@ func (s *srv) promptBriefing(ctx context.Context, req *mcp.GetPromptRequest) (*m
 		rawNS = req.Params.Arguments["namespace"]
 	}
 	ns := s.namespace(rawNS)
-	text, err := briefing.Build(ctx, s.store, briefing.Options{Namespace: ns})
+	text, err := briefing.Build(ctx, s.store, briefing.Options{Namespace: ns, Searcher: s.search})
 	if err != nil {
 		return nil, err
 	}

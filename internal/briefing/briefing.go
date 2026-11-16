@@ -23,11 +23,17 @@ const (
 	dateLayout           = "2006-01-02 15:04 UTC"
 )
 
+// Searcher runs a recall query (implemented by *store.Store and *semantic.Engine).
+type Searcher interface {
+	Search(ctx context.Context, q store.SearchQuery) ([]store.SearchResult, error)
+}
+
 // Options configures Build.
 type Options struct {
-	Namespace string // default "global"
-	MaxChars  int    // default 6000, minimum 400
-	Focus     string // optional topic/query to prioritize relevant memories
+	Namespace string   // default "global"
+	MaxChars  int      // default 6000, minimum 400
+	Focus     string   // optional topic/query to prioritize relevant memories
+	Searcher  Searcher // optional search backend for Focus; defaults to st
 }
 
 // Build loads the namespace and renders its briefing. If a valid namespace does
@@ -58,7 +64,11 @@ func Build(ctx context.Context, st *store.Store, opt Options) (string, error) {
 			d.last = &last[0]
 		}
 		if d.focus != "" {
-			res, serr := st.Search(ctx, store.SearchQuery{Query: d.focus, Namespace: ns, Limit: maxRecent})
+			searcher := opt.Searcher
+			if searcher == nil {
+				searcher = st
+			}
+			res, serr := searcher.Search(ctx, store.SearchQuery{Query: d.focus, Namespace: ns, Limit: maxRecent})
 			if serr == nil {
 				for _, r := range res {
 					d.relevant = append(d.relevant, r.Memory)

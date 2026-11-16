@@ -91,6 +91,47 @@ type HistoryEntry struct {
 	ChangedAt time.Time `json:"changed_at"`
 }
 
+// LinkKind is the relationship type between two memories.
+type LinkKind string
+
+// Supported memory link kinds.
+const (
+	LinkSupersedes LinkKind = "supersedes"
+	LinkRelatesTo  LinkKind = "relates_to"
+	LinkDependsOn  LinkKind = "depends_on"
+)
+
+// LinkKinds lists every valid link kind.
+var LinkKinds = []LinkKind{LinkSupersedes, LinkRelatesTo, LinkDependsOn}
+
+// Valid reports whether k is a known link kind.
+func (k LinkKind) Valid() bool {
+	for _, v := range LinkKinds {
+		if k == v {
+			return true
+		}
+	}
+	return false
+}
+
+// LinkRef describes an outgoing link to create alongside a memory.
+type LinkRef struct {
+	TargetID int64    `json:"target_id"`
+	Kind     LinkKind `json:"kind"`
+}
+
+// LinkView is one resolved link attached to a memory (outgoing or incoming).
+type LinkView struct {
+	Direction  string    `json:"direction"` // "outgoing" or "incoming"
+	Kind       LinkKind  `json:"kind"`
+	ID         int64     `json:"id"`
+	MemoryKind Kind      `json:"memory_kind"`
+	Namespace  string    `json:"namespace"`
+	Title      string    `json:"title,omitempty"`
+	Archived   bool      `json:"archived,omitempty"`
+	CreatedAt  time.Time `json:"created_at"`
+}
+
 // Namespace describes a namespace and its activity.
 type Namespace struct {
 	Name         string     `json:"name"`

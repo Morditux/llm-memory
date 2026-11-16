@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -20,14 +21,21 @@ import (
 	"github.com/Morditux/llm-memory/internal/store"
 )
 
-// Session-start hooks: the client runs `llm-memory hook <client>` when a
-// session starts and injects the briefing into the model context, so the
-// memory no longer depends on the LLM remembering to call get_context.
+// Client hooks: the client runs `llm-memory hook <client>` on lifecycle events
+// (SessionStart, PreCompact, Stop) so the memory no longer depends solely on
+// the LLM remembering to call get_context or handoff.
 
-// hookClients lists the clients whose SessionStart hook is supported.
+// hookClients lists the clients whose hooks are supported.
 var hookClients = []string{"antigravity", "claude-code", "codex"}
 
+// hookEvents lists the supported hook lifecycle events.
+var hookEvents = []string{"SessionStart", "PreCompact", "Stop"}
+
 const (
+	hookEventSessionStart = "SessionStart"
+	hookEventPreCompact   = "PreCompact"
+	hookEventStop         = "Stop"
+
 	// hookStdinLimit caps the JSON payload read from the client.
 	hookStdinLimit = 1 << 20
 	// hookStdinWait bounds the wait for a client that never closes stdin.
@@ -65,6 +73,45 @@ func unknownHookClient(w io.Writer, c string) error {
 	return errUsage
 }
 
+func normalizeHookEvent(raw string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", "sessionstart", "session-start", "session_start":
+		return hookEventSessionStart, nil
+	case "precompact", "pre-compact", "pre_compact":
+		return hookEventPreCompact, nil
+	case "stop":
+		return hookEventStop, nil
+	default:
+		return "", fmt.Errorf("unsupported hook event %q (expected %s)", raw, strings.Join(hookEvents, ", "))
+	}
+}
+
+func parseHookEvents(raw string) ([]string, error) {
+	if strings.TrimSpace(raw) == "" {
+		return []string{hookEventSessionStart}, nil
+	}
+	var out []string
+	seen := map[string]bool{}
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		ev, err := normalizeHookEvent(part)
+		if err != nil {
+			return nil, err
+		}
+		if !seen[ev] {
+			seen[ev] = true
+			out = append(out, ev)
+		}
+	}
+	if len(out) == 0 {
+		return []string{hookEventSessionStart}, nil
+	}
+	return out, nil
+}
+
 // readHookPayload reads the client's JSON payload. It never blocks for long
 // and never fails: a missing or invalid payload just means "no project dir".
 func readHookPayload(r io.Reader) hookPayload {
@@ -90,16 +137,19 @@ func readHookPayload(r io.Reader) hookPayload {
 	return p
 }
 
-// cmdHook prints the briefing in the format the client's SessionStart hook
-// expects. Errors are reported on stderr but the exit status stays 0, so a
-// memory problem never prevents a session from starting.
+// cmdHook prints the hook output in the format the client expects. Errors are
+// reported on stderr but the exit status stays 0 during live hook execution,
+// so a memory problem never prevents a session from starting.
 func (a app) cmdHook(ctx context.Context, args []string) error {
 	fs := a.newFlagSet("hook")
 	flags := config.Register(fs)
+	eventFlag := fs.String("event", hookEventSessionStart, "hook event: "+strings.Join(hookEvents, ", "))
+	eventsFlag := fs.String("events", hookEventSessionStart, "comma-separated events to install with --write: "+strings.Join(hookEvents, ", "))
 	maxChars := fs.Int("max-chars", briefing.DefaultMaxChars, "character budget of the briefing")
 	focus := fs.String("focus", "", "optional topic or query to prioritize relevant memories")
 	write := fs.Bool("write", false, "patch the client configuration file with this hook instead of printing the briefing")
-	cfgPath := fs.String("config", "", "override target config file path (with --write)")
+	remove := fs.Bool("remove", false, "remove llm-memory hooks from the client configuration file")
+	cfgPath := fs.String("config", "", "override target config file path (with --write or --remove)")
 	pos, err := parse(fs, args, 1, 1)
 	if err != nil {
 		return err
@@ -108,7 +158,23 @@ func (a app) cmdHook(ctx context.Context, args []string) error {
 	if !isHookClient(client) {
 		return unknownHookClient(a.stderr, pos[0])
 	}
+	if *write && *remove {
+		fmt.Fprintln(a.stderr, "cannot combine --write and --remove")
+		return errUsage
+	}
+	if *remove {
+		return a.removeHooks(client, *cfgPath)
+	}
 	if *write {
+		evSpec := *eventsFlag
+		if isSet(fs, "event") && !isSet(fs, "events") {
+			evSpec = *eventFlag
+		}
+		events, err := parseHookEvents(evSpec)
+		if err != nil {
+			fmt.Fprintln(a.stderr, err)
+			return errUsage
+		}
 		cfg, err := flags.Resolve(a.env)
 		if err != nil {
 			return err
@@ -120,10 +186,15 @@ func (a app) cmdHook(ctx context.Context, args []string) error {
 		if isSet(fs, "focus") {
 			extra = append(extra, "--focus", *focus)
 		}
-		return a.setupHooks(client, executablePath(), cfg.DB, hookNamespace(fs, a.env), true, *cfgPath, extra...)
+		return a.setupHooks(client, executablePath(), cfg.DB, hookNamespace(fs, a.env), events, true, *cfgPath, extra...)
 	}
 	if isSet(fs, "config") {
-		fmt.Fprintln(a.stderr, "--config requires --write")
+		fmt.Fprintln(a.stderr, "--config requires --write or --remove")
+		return errUsage
+	}
+	event, err := normalizeHookEvent(*eventFlag)
+	if err != nil {
+		fmt.Fprintln(a.stderr, err)
 		return errUsage
 	}
 
@@ -135,15 +206,15 @@ func (a app) cmdHook(ctx context.Context, args []string) error {
 
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	text, err := hookBriefing(ctx, flags, env, *maxChars, *focus)
+	text, err := hookText(ctx, flags, env, event, *maxChars, *focus)
 	if err != nil {
 		fmt.Fprintln(a.stderr, "llm-memory hook:", err)
 		return nil
 	}
-	return writeJSON(a.stdout, hookOutput(client, hookPreamble+text))
+	return writeJSON(a.stdout, hookOutput(client, event, text))
 }
 
-func hookBriefing(ctx context.Context, flags *config.Flags, env config.Env, maxChars int, focus string) (string, error) {
+func hookText(ctx context.Context, flags *config.Flags, env config.Env, event string, maxChars int, focus string) (string, error) {
 	cfg, err := flags.Resolve(env)
 	if err != nil {
 		return "", err
@@ -153,11 +224,57 @@ func hookBriefing(ctx context.Context, flags *config.Flags, env config.Env, maxC
 		return "", err
 	}
 	defer func() { _ = st.Close() }()
-	return briefing.Build(ctx, st, briefing.Options{Namespace: cfg.Namespace, MaxChars: maxChars, Focus: focus})
+
+	if event == hookEventSessionStart {
+		var searcher briefing.Searcher = st
+		if cfg.Embed.Enabled() {
+			logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+			if eng, err := newEngine(st, cfg, logger); err == nil && eng != nil {
+				searcher = eng
+			}
+		}
+		text, err := briefing.Build(ctx, st, briefing.Options{
+			Namespace: cfg.Namespace,
+			MaxChars:  maxChars,
+			Focus:     focus,
+			Searcher:  searcher,
+		})
+		if err != nil {
+			return "", err
+		}
+		return hookPreamble + text, nil
+	}
+
+	ns, err := store.NormalizeNamespace(cfg.Namespace)
+	if err != nil {
+		ns = store.DefaultNamespace
+	}
+	tasks, _ := st.List(ctx, store.ListFilter{Namespace: ns, Kinds: []store.Kind{store.KindTaskState}, Limit: 5})
+	return hookReminder(event, ns, tasks), nil
 }
 
-// hookOutput builds the stdout JSON for each client.
-func hookOutput(client, text string) any {
+func hookReminder(event, ns string, tasks []store.Memory) string {
+	var b strings.Builder
+	if event == hookEventPreCompact {
+		fmt.Fprintf(&b, "Context compaction imminent for llm-memory namespace %q.\n", ns)
+		b.WriteString("- Persist any new decisions (with reason), preferences, or stable facts using `remember`.\n")
+		b.WriteString("- Update current progress with `handoff` so the post-compaction session can resume cleanly.\n")
+	} else {
+		fmt.Fprintf(&b, "Before ending or switching tools (llm-memory namespace %q):\n", ns)
+		b.WriteString("- If you made decisions, learned stable facts, or received lasting preferences, save them with `remember`.\n")
+		b.WriteString("- If a multi-step task is ongoing or finished, leave a `handoff` (passing completed task_state IDs in `supersedes`).\n")
+	}
+	if len(tasks) > 0 {
+		b.WriteString("- Active task_state memories in this namespace:\n")
+		for _, t := range tasks {
+			fmt.Fprintf(&b, "  - #%d: %s\n", t.ID, summary(t))
+		}
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+// hookOutput builds the stdout JSON for each client and event.
+func hookOutput(client, event, text string) any {
 	if client == "antigravity" {
 		// Shape of the SessionStart example in the Antigravity hooks docs.
 		return map[string]any{
@@ -166,10 +283,15 @@ func hookOutput(client, text string) any {
 			},
 		}
 	}
-	// Claude Code and Codex share the hookSpecificOutput format.
+	if event == hookEventStop {
+		return map[string]any{
+			"systemMessage": text,
+		}
+	}
+	// Claude Code and Codex share the hookSpecificOutput format for SessionStart / PreCompact.
 	return map[string]any{
 		"hookSpecificOutput": map[string]any{
-			"hookEventName":     "SessionStart",
+			"hookEventName":     event,
 			"additionalContext": text,
 		},
 	}
@@ -207,8 +329,12 @@ func shellQuote(s string) string {
 
 // hookCommand is the command line written into the client's hook config.
 // extra holds additional flag/value pairs passed through to `llm-memory hook`.
-func hookCommand(bin, client, db, namespace string, extra ...string) string {
-	parts := []string{shellQuote(bin), "hook", client, "--db", shellQuote(db), "--namespace", shellQuote(namespace)}
+func hookCommand(bin, client, event, db, namespace string, extra ...string) string {
+	parts := []string{shellQuote(bin), "hook", client}
+	if event != "" && event != hookEventSessionStart {
+		parts = append(parts, "--event", event)
+	}
+	parts = append(parts, "--db", shellQuote(db), "--namespace", shellQuote(namespace))
 	for _, e := range extra {
 		parts = append(parts, shellQuote(e))
 	}
@@ -249,13 +375,79 @@ func hookHandler(cmd string) map[string]any {
 	return map[string]any{"type": "command", "command": cmd, "timeout": hookTimeout}
 }
 
-// applySessionStartHook adds (or replaces) our SessionStart handler in a
-// decoded hook config. Claude Code and Codex use
-// {"hooks":{"SessionStart":[{"matcher":…,"hooks":[handler…]}]}};
-// Antigravity uses {"<name>":{"SessionStart":[handler…]}}.
-func applySessionStartHook(root map[string]any, client, cmd string) error {
+// stripOurHooks removes all llm-memory hook handlers from root.
+func stripOurHooks(root map[string]any, client string) error {
 	if client == "antigravity" {
-		root["llm-memory"] = map[string]any{"SessionStart": []any{hookHandler(cmd)}}
+		delete(root, "llm-memory")
+		return nil
+	}
+	rawHooks, ok := root["hooks"]
+	if !ok || rawHooks == nil {
+		return nil
+	}
+	hooks, ok := rawHooks.(map[string]any)
+	if !ok {
+		return errors.New(`"hooks" is not a JSON object`)
+	}
+	for ev, rawGroups := range hooks {
+		if rawGroups == nil {
+			continue
+		}
+		groups, ok := rawGroups.([]any)
+		if !ok {
+			return fmt.Errorf(`"hooks.%s" is not a JSON array`, ev)
+		}
+		var kept []any
+		hadOur := false
+		for _, g := range groups {
+			gm, ok := g.(map[string]any)
+			if !ok {
+				kept = append(kept, g)
+				continue
+			}
+			hs, ok := gm["hooks"].([]any)
+			if !ok {
+				kept = append(kept, g)
+				continue
+			}
+			var rest []any
+			for _, h := range hs {
+				if hm, ok := h.(map[string]any); ok {
+					if c, _ := hm["command"].(string); isOurHook(c) {
+						hadOur = true
+						continue
+					}
+				}
+				rest = append(rest, h)
+			}
+			if len(rest) == 0 && len(hs) > 0 && hadOur {
+				continue // group only held our previous handler
+			}
+			gm["hooks"] = rest
+			kept = append(kept, g)
+		}
+		if len(kept) == 0 && hadOur {
+			delete(hooks, ev)
+		} else if kept != nil {
+			hooks[ev] = kept
+		}
+	}
+	return nil
+}
+
+// applyHooks adds (or replaces) our hook handlers in a decoded hook config.
+// Claude Code and Codex use {"hooks":{"<Event>":[{"matcher":…,"hooks":[handler…]}]}};
+// Antigravity uses {"llm-memory":{"<Event>":[handler…]}}.
+func applyHooks(root map[string]any, client string, events []string, cmdForEvent func(event string) string) error {
+	if err := stripOurHooks(root, client); err != nil {
+		return err
+	}
+	if client == "antigravity" {
+		entry := map[string]any{}
+		for _, ev := range events {
+			entry[ev] = []any{hookHandler(cmdForEvent(ev))}
+		}
+		root["llm-memory"] = entry
 		return nil
 	}
 	hooks := map[string]any{}
@@ -266,39 +458,19 @@ func applySessionStartHook(root map[string]any, client, cmd string) error {
 		}
 		hooks = m
 	}
-	var groups []any
-	if raw, ok := hooks["SessionStart"]; ok && raw != nil {
-		g, ok := raw.([]any)
-		if !ok {
-			return errors.New(`"hooks.SessionStart" is not a JSON array`)
-		}
-		groups = g
-	}
-	kept := make([]any, 0, len(groups)+1)
-	for _, g := range groups {
-		if gm, ok := g.(map[string]any); ok {
-			if hs, ok := gm["hooks"].([]any); ok {
-				var rest []any
-				for _, h := range hs {
-					if hm, ok := h.(map[string]any); ok {
-						if c, _ := hm["command"].(string); isOurHook(c) {
-							continue
-						}
-					}
-					rest = append(rest, h)
-				}
-				if len(rest) == 0 {
-					continue // the group only held our previous handler
-				}
-				gm["hooks"] = rest
+	for _, ev := range events {
+		var groups []any
+		if raw, ok := hooks[ev]; ok && raw != nil {
+			g, ok := raw.([]any)
+			if !ok {
+				return fmt.Errorf(`"hooks.%s" is not a JSON array`, ev)
 			}
+			groups = g
 		}
-		kept = append(kept, g)
+		// No matcher: run on startup, resume, clear and compact alike.
+		groups = append(groups, map[string]any{"hooks": []any{hookHandler(cmdForEvent(ev))}})
+		hooks[ev] = groups
 	}
-	// No matcher: run on startup, resume, clear and compact alike, so the
-	// briefing is back in context after a compaction too.
-	kept = append(kept, map[string]any{"hooks": []any{hookHandler(cmd)}})
-	hooks["SessionStart"] = kept
 	root["hooks"] = hooks
 	return nil
 }
@@ -337,12 +509,17 @@ func patchJSONFile(path string, fn func(map[string]any) error) error {
 	return nil
 }
 
-// setupHooks prints or writes the SessionStart hook configuration.
-func (a app) setupHooks(client, bin, db, namespace string, write bool, cfgPath string, extra ...string) error {
+// setupHooks prints or writes the hook configuration.
+func (a app) setupHooks(client, bin, db, namespace string, events []string, write bool, cfgPath string, extra ...string) error {
 	if !isHookClient(client) {
 		return unknownHookClient(a.stderr, client)
 	}
-	cmd := hookCommand(bin, client, db, namespace, extra...)
+	if len(events) == 0 {
+		events = []string{hookEventSessionStart}
+	}
+	cmdForEvent := func(ev string) string {
+		return hookCommand(bin, client, ev, db, namespace, extra...)
+	}
 	target := cfgPath
 	if target == "" {
 		var err error
@@ -352,15 +529,15 @@ func (a app) setupHooks(client, bin, db, namespace string, write bool, cfgPath s
 	}
 	if write {
 		if err := patchJSONFile(target, func(root map[string]any) error {
-			return applySessionStartHook(root, client, cmd)
+			return applyHooks(root, client, events, cmdForEvent)
 		}); err != nil {
 			return err
 		}
-		fmt.Fprintf(a.stdout, "Updated %s (%s SessionStart hook)\n", target, client)
+		fmt.Fprintf(a.stdout, "Updated %s (%s %s hook)\n", target, client, strings.Join(events, ","))
 	} else {
 		fmt.Fprintf(a.stderr, "# Add to %s (or rerun with --write):\n", target)
 		root := map[string]any{}
-		if err := applySessionStartHook(root, client, cmd); err != nil {
+		if err := applyHooks(root, client, events, cmdForEvent); err != nil {
 			return err
 		}
 		if err := writeJSON(a.stdout, root); err != nil {
@@ -370,5 +547,26 @@ func (a app) setupHooks(client, bin, db, namespace string, write bool, cfgPath s
 	if client == "codex" {
 		fmt.Fprintln(a.stderr, "# Codex: review and trust the new hook with /hooks before it runs.")
 	}
+	return nil
+}
+
+func (a app) removeHooks(client, cfgPath string) error {
+	target := cfgPath
+	if target == "" {
+		var err error
+		if target, err = hookConfigPath(client, a.env); err != nil {
+			return err
+		}
+	}
+	if _, err := os.Stat(target); errors.Is(err, os.ErrNotExist) {
+		fmt.Fprintf(a.stdout, "No hook configuration found at %s\n", target)
+		return nil
+	}
+	if err := patchJSONFile(target, func(root map[string]any) error {
+		return stripOurHooks(root, client)
+	}); err != nil {
+		return err
+	}
+	fmt.Fprintf(a.stdout, "Removed llm-memory hooks from %s (%s)\n", target, client)
 	return nil
 }

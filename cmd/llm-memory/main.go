@@ -42,6 +42,8 @@ Usage:
                                              print the briefing get_context would return
   llm-memory remember --kind K [--title T] [--tag T[,T]] [--importance N] [--supersedes ID[,ID]] [--expires-in D] [--json] <content|->
                                              create a memory from the command line
+  llm-memory update [--kind K] [--title T] [--content C] [--tag T[,T]] [--importance N] [--namespace X] [--expires-in D] [--clear-expires] [--add-link K:ID] [--remove-link K:ID] [--json] <id> [content|-]
+                                             modify an active memory (previous version stays in history)
   llm-memory handoff [--next S[,S]] [--questions Q[,Q]] [--supersedes ID[,ID]] [--description D] [--json] <summary|->
                                              write a handoff for the next assistant
   llm-memory forget [--reason R] [--json] <id>...
@@ -65,15 +67,18 @@ Usage:
   llm-memory doctor [--json]                 check database integrity, permissions and embeddings
   llm-memory backup [--keep N] [--verify] [--json] [<dest>]
                                              hot SQLite backup via VACUUM INTO
-  llm-memory setup [--ollama] [--write] [--config PATH] <client>
-                                             print or write MCP configuration for a client
-  llm-memory setup --hooks [--write] [--config PATH] <antigravity|claude-code|codex>
-                                             print or write the SessionStart hook that injects the briefing
-  llm-memory hook [--namespace X] [--max-chars N] [--focus Q] <antigravity|claude-code|codex>
-                                             SessionStart hook entry point (reads the client payload on stdin)
-  llm-memory hook --write [--config PATH] [--namespace X] [--max-chars N] [--focus Q] <client>
-                                             install this hook in the client's configuration file
+  llm-memory setup [--ollama] [--write] [--remove] [--config PATH] <client>
+                                             print, write or remove MCP configuration for a client
+  llm-memory setup --hooks [--events LIST] [--write] [--remove] [--config PATH] <antigravity|claude-code|codex>
+                                             print, write or remove the client hooks (SessionStart, PreCompact, Stop)
+  llm-memory hook [--event E] [--namespace X] [--max-chars N] [--focus Q] <antigravity|claude-code|codex>
+                                             hook entry point (reads the client payload on stdin)
+  llm-memory hook --write [--events LIST] [--config PATH] [--namespace X] [--max-chars N] [--focus Q] <client>
+                                             install hook(s) in the client's configuration file
+  llm-memory hook --remove [--config PATH] <client>
+                                             remove llm-memory hooks from the client's configuration file
   llm-memory ui [--addr 127.0.0.1:8765]      start local web explorer
+  llm-memory completion <bash|zsh|fish>      print shell completion script
   llm-memory version                         version and schema version
 
 Common flags (all commands):
@@ -132,28 +137,30 @@ func run(ctx context.Context, args []string, a app) error {
 		cmd, args = args[0], args[1:]
 	}
 	commands := map[string]func(context.Context, []string) error{
-		"serve":     a.cmdServe,
-		"context":   a.cmdContext,
-		"hook":      a.cmdHook,
-		"remember":  a.cmdRemember,
-		"forget":    a.cmdForget,
-		"handoff":   a.cmdHandoff,
-		"list":      a.cmdList,
-		"show":      a.cmdShow,
-		"search":    a.cmdSearch,
-		"restore":   a.cmdRestore,
-		"purge":     a.cmdPurge,
-		"export":    a.cmdExport,
-		"import":    a.cmdImport,
-		"stats":     a.cmdStats,
-		"reindex":   a.cmdReindex,
-		"namespace": a.cmdNamespace,
-		"gc":        a.cmdGC,
-		"doctor":    a.cmdDoctor,
-		"backup":    a.cmdBackup,
-		"setup":     a.cmdSetup,
-		"ui":        a.cmdUI,
-		"version":   a.cmdVersion,
+		"serve":      a.cmdServe,
+		"context":    a.cmdContext,
+		"hook":       a.cmdHook,
+		"remember":   a.cmdRemember,
+		"update":     a.cmdUpdate,
+		"forget":     a.cmdForget,
+		"handoff":    a.cmdHandoff,
+		"list":       a.cmdList,
+		"show":       a.cmdShow,
+		"search":     a.cmdSearch,
+		"restore":    a.cmdRestore,
+		"purge":      a.cmdPurge,
+		"export":     a.cmdExport,
+		"import":     a.cmdImport,
+		"stats":      a.cmdStats,
+		"reindex":    a.cmdReindex,
+		"namespace":  a.cmdNamespace,
+		"gc":         a.cmdGC,
+		"doctor":     a.cmdDoctor,
+		"backup":     a.cmdBackup,
+		"setup":      a.cmdSetup,
+		"ui":         a.cmdUI,
+		"completion": a.cmdCompletion,
+		"version":    a.cmdVersion,
 	}
 	if cmd == "help" {
 		fmt.Fprint(a.stdout, usage)
@@ -340,7 +347,16 @@ func (a app) cmdContext(ctx context.Context, args []string) error {
 		return err
 	}
 	defer func() { _ = st.Close() }()
-	text, err := briefing.Build(ctx, st, briefing.Options{Namespace: cfg.Namespace, MaxChars: *maxChars, Focus: *focus})
+	var searcher briefing.Searcher = st
+	if cfg.Embed.Enabled() {
+		logger := slog.New(slog.NewTextHandler(a.stderr, &slog.HandlerOptions{Level: cfg.LogLevel}))
+		if eng, err := newEngine(st, cfg, logger); err != nil {
+			return err
+		} else if eng != nil {
+			searcher = eng
+		}
+	}
+	text, err := briefing.Build(ctx, st, briefing.Options{Namespace: cfg.Namespace, MaxChars: *maxChars, Focus: *focus, Searcher: searcher})
 	if err != nil {
 		return err
 	}
