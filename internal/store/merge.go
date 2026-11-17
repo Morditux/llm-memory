@@ -314,19 +314,17 @@ func mergeHistory(ctx context.Context, tx *sql.Tx, id int64, hs []DumpHistory, a
 	if err != nil {
 		return added, fmt.Errorf("read history of #%d: %w", id, err)
 	}
+	defer func() { _ = rows.Close() }()
 	for rows.Next() {
 		var action, by, at, snap string
 		if err := rows.Scan(&action, &by, &at, &snap); err != nil {
-			_ = rows.Close()
 			return added, fmt.Errorf("read history of #%d: %w", id, err)
 		}
 		have[historyKey(Action(action), by, at, []byte(snap))] = true
 	}
 	if err := rows.Err(); err != nil {
-		_ = rows.Close()
 		return added, fmt.Errorf("read history of #%d: %w", id, err)
 	}
-	_ = rows.Close()
 	for _, h := range hs {
 		key := historyKey(h.Action, normalizeActor(h.ChangedBy), FormatTime(h.ChangedAt), h.Snapshot)
 		if have[key] {
