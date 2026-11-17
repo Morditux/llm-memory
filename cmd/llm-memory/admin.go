@@ -1872,9 +1872,13 @@ func (a app) cmdUI(ctx context.Context, args []string) error {
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", *addr, err)
 	}
+	allowRemote := !isLoopbackListenAddr(ln.Addr().String())
+	if allowRemote {
+		logger.Warn("web UI has no user authentication; bind to loopback (127.0.0.1) or place behind an authenticating reverse proxy", "addr", ln.Addr().String())
+	}
 	fmt.Fprintf(a.stdout, "llm-memory UI listening on http://%s\n", ln.Addr().String())
 	srv := &http.Server{
-		Handler:           ui.NewHandler(st, searcher),
+		Handler:           ui.NewHandlerWithOptions(st, searcher, ui.Options{AllowRemoteHost: allowRemote}),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	go func() {

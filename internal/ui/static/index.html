@@ -3,6 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="csrf-token" content="__CSRF_TOKEN__" />
   <title>llm-memory — Local Explorer</title>
   <style>
     :root {
@@ -142,10 +143,15 @@
   <script>
     const PAGE_SIZE = 50;
     const state = { ns: "", namespaces: [], selectedId: null, diffMode: true, offset: 0 };
+    const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content || "";
     const $ = (id) => document.getElementById(id);
 
-    async function api(url, opts) {
-      const res = await fetch(url, opts);
+    async function api(url, opts = {}) {
+      const headers = new Headers(opts.headers || {});
+      if (opts.method && opts.method !== "GET" && opts.method !== "HEAD") {
+        headers.set("X-CSRF-Token", csrfToken);
+      }
+      const res = await fetch(url, { ...opts, headers });
       if (!res.ok) throw new Error(await res.text());
       return res.json();
     }

@@ -286,6 +286,9 @@ func (a app) cmdServe(ctx context.Context, args []string) error {
 		if err != nil {
 			return fmt.Errorf("listen %s: %w", *listen, err)
 		}
+		if !isLoopbackListenAddr(ln.Addr().String()) {
+			logger.Warn("Streamable HTTP MCP server has no authentication; bind to loopback (127.0.0.1) or place behind an authenticating reverse proxy", "addr", ln.Addr().String())
+		}
 		httpSrv := &http.Server{
 			Handler:           handler,
 			ReadHeaderTimeout: 5 * time.Second,
@@ -384,4 +387,17 @@ func newEngine(st *store.Store, cfg config.Config, logger *slog.Logger) (*semant
 		return nil, err
 	}
 	return semantic.New(st, client, semantic.Options{MinScore: cfg.Embed.MinScore, Logger: logger}), nil
+}
+
+func isLoopbackListenAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	host = strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }

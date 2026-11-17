@@ -261,6 +261,8 @@ llm-memory completion <bash|zsh|fish>    # print shell completion script
 llm-memory serve [--listen 127.0.0.1:8766] [--stateless] [--read-only] # stdio (default) or Streamable HTTP (/mcp, /healthz)
 ```
 
+> **Note:** Both `serve --listen` (Streamable HTTP) and `ui` have no user authentication; keep them bound to loopback (`127.0.0.1`) or place an authenticating reverse proxy in front.
+
 ## Semantic search (optional)
 
 By default, `recall` is a full-text search (FTS5) and **no data leaves the machine**.
