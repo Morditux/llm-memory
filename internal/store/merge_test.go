@@ -216,8 +216,8 @@ func TestMergeConflictNewerWins(t *testing.T) {
 	ship(t, c, d)
 	tick()
 	_, _ = c.Update(ctx, n.ID, Patch{Content: ptr("v2")}, "c")
-	if rep := ship(t, d, c); rep.KeptLocal != 1 || rep.Updated != 0 || rep.Changes[0].Result != "kept_local" {
-		t.Errorf("older incoming: %+v", rep)
+	if rep := ship(t, d, c); rep.KeptLocal != 1 || rep.Updated != 0 || rep.Changes[0].Result != "kept_local" || rep.Changes[0].Title != "v2" {
+		t.Errorf("older incoming (untitled memory is labelled by its content): %+v", rep)
 	}
 	if g, _ := c.Get(ctx, n.ID); g.Content != "v2" {
 		t.Errorf("older version overwrote the newer: %+v", g)

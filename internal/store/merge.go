@@ -154,10 +154,10 @@ func (s *Store) Merge(ctx context.Context, d Dump, opt MergeOptions, dryRun bool
 					return err
 				}
 				rep.Updated++
-				rep.Changes = append(rep.Changes, MergeChange{ID: id, UUID: m.UUID, Title: f.title, Result: "updated"})
+				rep.Changes = append(rep.Changes, MergeChange{ID: id, UUID: m.UUID, Title: changeLabel(f.title, f.content), Result: "updated"})
 			default:
 				rep.KeptLocal++
-				rep.Changes = append(rep.Changes, MergeChange{ID: id, UUID: m.UUID, Title: cf.title, Result: "kept_local"})
+				rep.Changes = append(rep.Changes, MergeChange{ID: id, UUID: m.UUID, Title: changeLabel(cf.title, cf.content), Result: "kept_local"})
 			}
 			if rep.HistoryAdded, err = mergeHistory(ctx, tx, id, m.History, rep.HistoryAdded); err != nil {
 				return err
@@ -339,4 +339,17 @@ func mergeHistory(ctx context.Context, tx *sql.Tx, id int64, hs []DumpHistory, a
 		added++
 	}
 	return added, nil
+}
+
+// changeLabel names a memory in a report: its title, or the start of its
+// content when it has none.
+func changeLabel(title, content string) string {
+	if title != "" {
+		return title
+	}
+	line, _, _ := strings.Cut(strings.TrimSpace(content), "\n")
+	if r := []rune(line); len(r) > 60 {
+		line = string(r[:60]) + "…"
+	}
+	return line
 }
