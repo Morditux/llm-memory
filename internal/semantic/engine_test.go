@@ -409,3 +409,54 @@ func TestFindSimilar(t *testing.T) {
 		t.Errorf("expected warning log on API failure, got: %s", logs.String())
 	}
 }
+
+type hookEmbedder struct {
+	*fakeEmbedder
+	onEmbed func()
+}
+
+func (h *hookEmbedder) Embed(ctx context.Context, texts []string) ([][]float32, error) {
+	if h.onEmbed != nil {
+		h.onEmbed()
+	}
+	return h.fakeEmbedder.Embed(ctx, texts)
+}
+
+func TestIndexSkipsConcurrentlyEditedMemory(t *testing.T) {
+	st := newStore(t)
+	ctx := context.Background()
+	m, err := st.Create(ctx, store.NewMemory{Namespace: "demo", Kind: store.KindFact, Content: "MySQL initial"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	edited := false
+	emb := &hookEmbedder{
+		fakeEmbedder: &fakeEmbedder{model: "fake"},
+		onEmbed: func() {
+			if edited {
+				return
+			}
+			edited = true
+			updated := "PostgreSQL pour JSONB"
+			if _, err := st.Update(ctx, m.ID, store.Patch{Content: &updated}, "other"); err != nil {
+				t.Errorf("concurrent update: %v", err)
+			}
+		},
+	}
+	e := New(st, emb, Options{})
+
+	// Index reads "MySQL initial", then onEmbed mutates m to "PostgreSQL pour JSONB":
+	// the stale vector must not be stored.
+	if _, err := e.Index(ctx, 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	if vecs, _ := st.Vectors(ctx, "fake", store.VectorFilter{}); len(vecs) != 0 {
+		t.Fatalf("expected stale vector skipped during concurrent edit, got %+v", vecs)
+	}
+
+	// Next search catches up with the updated text and finds it by its new meaning.
+	res := search(t, e, store.SearchQuery{Query: "SGBD", Namespace: "demo"})
+	if len(res) != 1 || res[0].ID != m.ID {
+		t.Fatalf("expected updated memory indexed and found by new meaning, got %v", ids(res))
+	}
+}

@@ -15,12 +15,15 @@ type EmbeddingSource struct {
 	Title   string
 	Content string
 	Tags    []string
+	rawTags string
+	hasRaw  bool
 }
 
 // Vector is a stored embedding.
 type Vector struct {
 	ID     int64
 	Values []float32
+	Source *EmbeddingSource // optional: when set, SetEmbeddings skips the row if title/content/tags changed
 }
 
 // EncodeVector packs v as float32 little-endian.
@@ -92,6 +95,8 @@ func (s *Store) MissingEmbeddingsFiltered(ctx context.Context, model string, f M
 		if err := rows.Scan(&e.ID, &e.Title, &e.Content, &tags); err != nil {
 			return nil, fmt.Errorf("missing embeddings: %w", err)
 		}
+		e.rawTags = tags
+		e.hasRaw = true
 		e.Tags = splitTags(tags)
 		out = append(out, e)
 	}
@@ -122,10 +127,19 @@ func (s *Store) SetEmbeddings(ctx context.Context, model string, vecs []Vector) 
 			if len(v.Values) == 0 {
 				return &ValidationError{Field: "vector", Msg: fmt.Sprintf("empty embedding for memory #%d", v.ID)}
 			}
-			if _, err := tx.ExecContext(ctx,
-				`INSERT OR REPLACE INTO memory_embeddings(memory_id, model, dims, vector)
-				 SELECT ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM memories WHERE id = ?)`,
-				v.ID, model, len(v.Values), EncodeVector(v.Values), v.ID); err != nil {
+			q := `INSERT OR REPLACE INTO memory_embeddings(memory_id, model, dims, vector)
+				  SELECT ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM memories m WHERE m.id = ?`
+			args := []any{v.ID, model, len(v.Values), EncodeVector(v.Values), v.ID}
+			if v.Source != nil {
+				rawTags := v.Source.rawTags
+				if !v.Source.hasRaw {
+					rawTags = joinTags(v.Source.Tags)
+				}
+				q += " AND m.title = ? AND m.content = ? AND m.tags = ?"
+				args = append(args, v.Source.Title, v.Source.Content, rawTags)
+			}
+			q += ")"
+			if _, err := tx.ExecContext(ctx, q, args...); err != nil {
 				return fmt.Errorf("store embedding of #%d: %w", v.ID, err)
 			}
 		}

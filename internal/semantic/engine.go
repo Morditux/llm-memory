@@ -99,8 +99,8 @@ func (e *Engine) indexFiltered(ctx context.Context, f store.MissingFilter, progr
 			return done, err
 		}
 		rows := make([]store.Vector, len(batch))
-		for i, m := range batch {
-			rows[i] = store.Vector{ID: m.ID, Values: vecs[i]}
+		for i := range batch {
+			rows[i] = store.Vector{ID: batch[i].ID, Values: vecs[i], Source: &batch[i]}
 		}
 		if err := e.store.SetEmbeddings(ctx, e.emb.Model(), rows); err != nil {
 			return done, err

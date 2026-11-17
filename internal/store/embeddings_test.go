@@ -166,6 +166,63 @@ func TestMissingEmbeddingsFiltered(t *testing.T) {
 	}
 }
 
+func TestSetEmbeddingsSkipsStaleSource(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	m, _ := s.Create(ctx, NewMemory{Kind: KindFact, Title: "Old", Content: "old body", Tags: []string{"a"}})
+
+	missing, err := s.MissingEmbeddings(ctx, "m", 0)
+	if err != nil || len(missing) != 1 {
+		t.Fatalf("MissingEmbeddings = %+v, %v", missing, err)
+	}
+	staleSrc := missing[0]
+
+	// Importance-only update leaves title/content/tags intact -> embedding is stored.
+	imp := 3
+	if _, err := s.Update(ctx, m.ID, Patch{Importance: &imp}, "t"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetEmbeddings(ctx, "m", []Vector{{ID: m.ID, Values: []float32{1, 0}, Source: &staleSrc}}); err != nil {
+		t.Fatal(err)
+	}
+	if vecs, _ := s.Vectors(ctx, "m", VectorFilter{}); len(vecs) != 1 || vecs[0].Values[0] != 1 {
+		t.Fatalf("expected vector stored after importance-only update, got %+v", vecs)
+	}
+
+	// Simulate race: another writer updates content (trigger deletes old vector) and stores a fresh vector;
+	// a late SetEmbeddings carrying the old Source must not overwrite the fresh vector.
+	newBody := "new body"
+	if _, err := s.Update(ctx, m.ID, Patch{Content: &newBody}, "t"); err != nil {
+		t.Fatal(err)
+	}
+	freshMissing, _ := s.MissingEmbeddings(ctx, "m", 0)
+	if len(freshMissing) != 1 {
+		t.Fatalf("expected missing after update, got %+v", freshMissing)
+	}
+	if err := s.SetEmbeddings(ctx, "m", []Vector{{ID: m.ID, Values: []float32{0, 1}, Source: &freshMissing[0]}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetEmbeddings(ctx, "m", []Vector{{ID: m.ID, Values: []float32{1, 0}, Source: &staleSrc}}); err != nil {
+		t.Fatal(err)
+	}
+	vecs, _ := s.Vectors(ctx, "m", VectorFilter{})
+	if len(vecs) != 1 || vecs[0].Values[0] != 0 || vecs[0].Values[1] != 1 {
+		t.Fatalf("stale write overwrote fresh vector: %+v", vecs)
+	}
+
+	// Same check when no fresh vector exists yet (trigger found nothing to delete).
+	newTitle := "New Title"
+	if _, err := s.Update(ctx, m.ID, Patch{Title: &newTitle}, "t"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetEmbeddings(ctx, "m", []Vector{{ID: m.ID, Values: []float32{1, 0}, Source: &freshMissing[0]}}); err != nil {
+		t.Fatal(err)
+	}
+	if vecs, _ := s.Vectors(ctx, "m", VectorFilter{}); len(vecs) != 0 {
+		t.Fatalf("expected stale vector skipped when title changed, got %+v", vecs)
+	}
+}
+
 func TestGetManyAndHelpers(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
