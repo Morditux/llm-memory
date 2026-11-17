@@ -96,6 +96,9 @@ func (s *Store) Export(ctx context.Context, opt ExportOptions) (Dump, error) {
 		return Dump{}, err
 	}
 	for _, m := range ms {
+		// Format v1 has no uuid, and older binaries reject unknown fields on
+		// import: keep the export readable by them until format v2 lands.
+		m.UUID = ""
 		dm := DumpMemory{Memory: m}
 		if opt.WithHistory {
 			hs, err := s.History(ctx, m.ID)
@@ -232,12 +235,18 @@ func importMemory(ctx context.Context, tx *sql.Tx, m DumpMemory, by string) (int
 	if m.ExpiresAt != nil {
 		expires = FormatTime(*m.ExpiresAt)
 	}
+	// Phase 1: an imported memory always gets a fresh identity. Keeping the
+	// uuid of the dump is part of the merge import.
+	uid, err := newUUID()
+	if err != nil {
+		return 0, false, err
+	}
 	res, err := tx.ExecContext(ctx,
 		`INSERT INTO memories(namespace, kind, title, content, tags, importance, source,
-		                      created_at, updated_at, updated_by, archived_at, expires_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		                      created_at, updated_at, updated_by, archived_at, expires_at, uuid)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		ns, string(m.Kind), title, content, joinTags(m.Tags), imp, normalizeActor(m.Source),
-		FormatTime(created), FormatTime(updated), normalizeActor(m.UpdatedBy), archived, expires)
+		FormatTime(created), FormatTime(updated), normalizeActor(m.UpdatedBy), archived, expires, uid)
 	if err != nil {
 		return 0, false, fmt.Errorf("insert: %w", err)
 	}

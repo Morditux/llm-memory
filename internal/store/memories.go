@@ -18,7 +18,7 @@ type queryer interface {
 }
 
 const memoryColumns = `id, namespace, kind, title, content, tags, importance, source,
-	created_at, updated_at, updated_by, archived_at, expires_at`
+	created_at, updated_at, updated_by, archived_at, expires_at, uuid`
 
 const notExpiredSQL = "(expires_at IS NULL OR expires_at > " + sqlNow + ")"
 
@@ -31,11 +31,13 @@ func scanMemory(sc scanner) (Memory, error) {
 		created, updated string
 		archived         sql.NullString
 		expires          sql.NullString
+		uuid             sql.NullString
 	)
 	if err := sc.Scan(&m.ID, &m.Namespace, &kind, &m.Title, &m.Content, &tags, &m.Importance,
-		&m.Source, &created, &updated, &m.UpdatedBy, &archived, &expires); err != nil {
+		&m.Source, &created, &updated, &m.UpdatedBy, &archived, &expires, &uuid); err != nil {
 		return Memory{}, err
 	}
+	m.UUID = uuid.String
 	m.Kind = Kind(kind)
 	m.Tags = splitTags(tags)
 	var err error
@@ -174,10 +176,14 @@ func (s *Store) CreateDetailed(ctx context.Context, in NewMemory) (Memory, []int
 		if in.ExpiresAt != nil {
 			expires = FormatTime(*in.ExpiresAt)
 		}
+		uid, err := newUUID()
+		if err != nil {
+			return err
+		}
 		res, err := tx.ExecContext(ctx,
-			`INSERT INTO memories(namespace, kind, title, content, tags, importance, source, updated_by, expires_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			ns, string(in.Kind), title, content, joinTags(in.Tags), imp, src, src, expires)
+			`INSERT INTO memories(namespace, kind, title, content, tags, importance, source, updated_by, expires_at, uuid)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			ns, string(in.Kind), title, content, joinTags(in.Tags), imp, src, src, expires, uid)
 		if err != nil {
 			return fmt.Errorf("insert memory: %w", err)
 		}

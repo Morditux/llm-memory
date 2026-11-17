@@ -37,10 +37,12 @@ func normalize(d Dump) Dump {
 	}
 	for i := range d.Memories {
 		d.Memories[i].ID = 0
+		d.Memories[i].UUID = "" // import assigns fresh identities (phase 1)
 		for j := range d.Memories[i].History {
 			var snap map[string]any
 			_ = json.Unmarshal(d.Memories[i].History[j].Snapshot, &snap)
 			delete(snap, "id")
+			delete(snap, "uuid")
 			d.Memories[i].History[j].Snapshot, _ = json.Marshal(snap)
 		}
 	}

@@ -48,6 +48,7 @@ const (
 // Memory is one stored memory.
 type Memory struct {
 	ID         int64      `json:"id"`
+	UUID       string     `json:"uuid,omitempty"`
 	Namespace  string     `json:"namespace"`
 	Kind       Kind       `json:"kind"`
 	Title      string     `json:"title"`
