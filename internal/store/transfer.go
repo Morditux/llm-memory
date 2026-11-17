@@ -229,25 +229,8 @@ func (s *Store) Import(ctx context.Context, d Dump, dryRun bool, by string) (Imp
 	by = normalizeActor(by)
 
 	err := s.withTx(ctx, func(tx *sql.Tx) error {
-		for _, n := range d.Namespaces {
-			name, err := NormalizeNamespace(n.Name)
-			if err != nil {
-				return fmt.Errorf("namespace %q: %w", n.Name, err)
-			}
-			res, err := tx.ExecContext(ctx,
-				"INSERT OR IGNORE INTO namespaces(name, description, created_at) VALUES (?, ?, ?)",
-				name, n.Description, FormatTime(n.CreatedAt))
-			if err != nil {
-				return fmt.Errorf("import namespace %q: %w", name, err)
-			}
-			if c, _ := res.RowsAffected(); c > 0 {
-				rep.NamespacesCreated++
-			} else if n.Description != "" {
-				if _, err := tx.ExecContext(ctx,
-					"UPDATE namespaces SET description = ? WHERE name = ? AND description = ''", n.Description, name); err != nil {
-					return fmt.Errorf("import namespace %q: %w", name, err)
-				}
-			}
+		if err := importNamespaces(ctx, tx, d.Namespaces, &rep.NamespacesCreated); err != nil {
+			return err
 		}
 		// dump uuid -> local id, for imported memories and for the existing
 		// duplicates they were skipped for, so links can be restored.
@@ -301,41 +284,36 @@ func (s *Store) Import(ctx context.Context, d Dump, dryRun bool, by string) (Imp
 	return rep, nil
 }
 
-func importMemory(ctx context.Context, tx *sql.Tx, m DumpMemory, by string) (int64, bool, error) {
+// rowFields is a dump memory validated and normalised like a new write.
+type rowFields struct {
+	ns, kind, title, content, tags, source, updatedBy string
+	importance                                        int
+	created, updated                                  time.Time
+	archived, expires                                 *time.Time
+}
+
+func normalizeDumpMemory(m DumpMemory) (rowFields, error) {
 	ns, err := NormalizeNamespace(m.Namespace)
 	if err != nil {
-		return 0, false, err
+		return rowFields{}, err
 	}
 	if err := validateKind(m.Kind); err != nil {
-		return 0, false, err
+		return rowFields{}, err
 	}
 	content, err := normalizeContent(m.Content)
 	if err != nil {
-		return 0, false, err
+		return rowFields{}, err
 	}
 	title, err := normalizeTitle(m.Title)
 	if err != nil {
-		return 0, false, err
+		return rowFields{}, err
 	}
 	imp := m.Importance
 	if imp == 0 {
 		imp = DefaultImportance
 	}
 	if err := validateImportance(imp); err != nil {
-		return 0, false, err
-	}
-	var dupID int64
-	err = tx.QueryRowContext(ctx,
-		"SELECT id FROM memories WHERE namespace = ? AND kind = ? AND content = ? ORDER BY id LIMIT 1",
-		ns, string(m.Kind), content).Scan(&dupID)
-	if err == nil {
-		return dupID, true, nil
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return 0, false, fmt.Errorf("check duplicate: %w", err)
-	}
-	if err := ensureNamespace(ctx, tx, ns); err != nil {
-		return 0, false, err
+		return rowFields{}, err
 	}
 	created, updated := m.CreatedAt, m.UpdatedAt
 	if created.IsZero() {
@@ -344,52 +322,128 @@ func importMemory(ctx context.Context, tx *sql.Tx, m DumpMemory, by string) (int
 	if updated.IsZero() {
 		updated = created
 	}
-	var archived, expires any
-	if m.ArchivedAt != nil {
-		archived = FormatTime(*m.ArchivedAt)
+	return rowFields{
+		ns: ns, kind: string(m.Kind), title: title, content: content, tags: joinTags(m.Tags),
+		source: normalizeActor(m.Source), updatedBy: normalizeActor(m.UpdatedBy), importance: imp,
+		created: created.UTC(), updated: updated.UTC(), archived: m.ArchivedAt, expires: m.ExpiresAt,
+	}, nil
+}
+
+func optTime(t *time.Time) any {
+	if t == nil {
+		return nil
 	}
-	if m.ExpiresAt != nil {
-		expires = FormatTime(*m.ExpiresAt)
-	}
-	// Phase 1: an imported memory always gets a fresh identity. Keeping the
-	// uuid of the dump is part of the merge import.
-	uid, err := newUUID()
-	if err != nil {
-		return 0, false, err
+	return FormatTime(*t)
+}
+
+// insertMemoryRow creates the namespace if needed and inserts the row with the
+// given uuid, keeping the timestamps and authors of f.
+func insertMemoryRow(ctx context.Context, tx *sql.Tx, f rowFields, uid string) (int64, error) {
+	if err := ensureNamespace(ctx, tx, f.ns); err != nil {
+		return 0, err
 	}
 	res, err := tx.ExecContext(ctx,
 		`INSERT INTO memories(namespace, kind, title, content, tags, importance, source,
 		                      created_at, updated_at, updated_by, archived_at, expires_at, uuid)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		ns, string(m.Kind), title, content, joinTags(m.Tags), imp, normalizeActor(m.Source),
-		FormatTime(created), FormatTime(updated), normalizeActor(m.UpdatedBy), archived, expires, uid)
+		f.ns, f.kind, f.title, f.content, f.tags, f.importance, f.source,
+		FormatTime(f.created), FormatTime(f.updated), f.updatedBy, optTime(f.archived), optTime(f.expires), uid)
 	if err != nil {
-		return 0, false, fmt.Errorf("insert: %w", err)
+		return 0, fmt.Errorf("insert: %w", err)
 	}
 	id, err := res.LastInsertId()
 	if err != nil {
-		return 0, false, fmt.Errorf("insert: %w", err)
+		return 0, fmt.Errorf("insert: %w", err)
+	}
+	return id, nil
+}
+
+func validateDumpHistory(h DumpHistory) error {
+	switch h.Action {
+	case ActionCreate, ActionUpdate, ActionArchive, ActionRestore:
+	default:
+		return &ValidationError{Field: "history.action", Msg: fmt.Sprintf("unknown action %q", h.Action)}
+	}
+	if !json.Valid(h.Snapshot) {
+		return &ValidationError{Field: "history.snapshot", Msg: "is not valid JSON"}
+	}
+	return nil
+}
+
+func insertHistoryRow(ctx context.Context, tx *sql.Tx, id int64, h DumpHistory) error {
+	if _, err := tx.ExecContext(ctx,
+		"INSERT INTO memory_history(memory_id, action, snapshot, changed_by, changed_at) VALUES (?, ?, ?, ?, ?)",
+		id, string(h.Action), string(h.Snapshot), normalizeActor(h.ChangedBy), FormatTime(h.ChangedAt)); err != nil {
+		return fmt.Errorf("insert history: %w", err)
+	}
+	return nil
+}
+
+// importMemory inserts m with a fresh uuid unless an identical memory (same
+// namespace, kind and content) exists, in which case it returns that memory's
+// id and skipped = true.
+func importMemory(ctx context.Context, tx *sql.Tx, m DumpMemory, by string) (int64, bool, error) {
+	f, err := normalizeDumpMemory(m)
+	if err != nil {
+		return 0, false, err
+	}
+	var dupID int64
+	err = tx.QueryRowContext(ctx,
+		"SELECT id FROM memories WHERE namespace = ? AND kind = ? AND content = ? ORDER BY id LIMIT 1",
+		f.ns, f.kind, f.content).Scan(&dupID)
+	if err == nil {
+		return dupID, true, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return 0, false, fmt.Errorf("check duplicate: %w", err)
+	}
+	uid, err := newUUID()
+	if err != nil {
+		return 0, false, err
+	}
+	id, err := insertMemoryRow(ctx, tx, f, uid)
+	if err != nil {
+		return 0, false, err
 	}
 	if len(m.History) == 0 {
 		_, err := writeHistory(ctx, tx, id, ActionCreate, by, "imported")
 		return id, false, err
 	}
 	for _, h := range m.History {
-		switch h.Action {
-		case ActionCreate, ActionUpdate, ActionArchive, ActionRestore:
-		default:
-			return 0, false, &ValidationError{Field: "history.action", Msg: fmt.Sprintf("unknown action %q", h.Action)}
+		if err := validateDumpHistory(h); err != nil {
+			return 0, false, err
 		}
-		if !json.Valid(h.Snapshot) {
-			return 0, false, &ValidationError{Field: "history.snapshot", Msg: "is not valid JSON"}
-		}
-		if _, err := tx.ExecContext(ctx,
-			"INSERT INTO memory_history(memory_id, action, snapshot, changed_by, changed_at) VALUES (?, ?, ?, ?, ?)",
-			id, string(h.Action), string(h.Snapshot), normalizeActor(h.ChangedBy), FormatTime(h.ChangedAt)); err != nil {
-			return 0, false, fmt.Errorf("insert history: %w", err)
+		if err := insertHistoryRow(ctx, tx, id, h); err != nil {
+			return 0, false, err
 		}
 	}
 	return id, false, nil
+}
+
+// importNamespaces creates the namespaces of a dump, and fills an empty
+// description of an existing one.
+func importNamespaces(ctx context.Context, tx *sql.Tx, ns []DumpNamespace, created *int) error {
+	for _, n := range ns {
+		name, err := NormalizeNamespace(n.Name)
+		if err != nil {
+			return fmt.Errorf("namespace %q: %w", n.Name, err)
+		}
+		res, err := tx.ExecContext(ctx,
+			"INSERT OR IGNORE INTO namespaces(name, description, created_at) VALUES (?, ?, ?)",
+			name, n.Description, FormatTime(n.CreatedAt))
+		if err != nil {
+			return fmt.Errorf("import namespace %q: %w", name, err)
+		}
+		if c, _ := res.RowsAffected(); c > 0 {
+			*created++
+		} else if n.Description != "" {
+			if _, err := tx.ExecContext(ctx,
+				"UPDATE namespaces SET description = ? WHERE name = ? AND description = ''", n.Description, name); err != nil {
+				return fmt.Errorf("import namespace %q: %w", name, err)
+			}
+		}
+	}
+	return nil
 }
 
 // validateDumpIdentities checks the uuids and links of a dump before anything

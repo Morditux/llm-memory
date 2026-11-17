@@ -1,6 +1,6 @@
 # Multi-machine support (global memory identity + merge)
 
-Status: draft, branch `multi-machine`. Phase 1 (identity) committed; phase 2 (export v2) implemented, uncommitted.
+Status: draft, branch `multi-machine`. Phases 1 (identity) and 2 (export v2) committed; phase 3 (merge import) implemented, uncommitted.
 
 ## Problem
 
@@ -107,7 +107,7 @@ Matching is by `uuid`. For each incoming memory:
 | uuid unknown locally | insert (new local id), keep timestamps and authors |
 | uuid known, incoming `updated_at` newer | overwrite fields, record an `update` history line |
 | uuid known, incoming older | keep local row |
-| equal `updated_at`, different content | deterministic tie-break on `origin` (lexicographic) |
+| equal `updated_at`, different content | deterministic tie-break on the canonical row (see below) |
 | identical | no-op (idempotent) |
 
 Rules that make this converge:
@@ -224,3 +224,35 @@ Findings:
    apply the old `(namespace, kind, content)` rule to collapse them, and which
    uuid wins?
 6. **Transport**: file only for now. Revisit after Bearer auth for `serve`.
+
+## Implementation notes (phase 3)
+
+Deviations from the first draft, decided while implementing `Store.Merge`
+(`internal/store/merge.go`, CLI `import --merge`):
+
+- **Tie-break does not use `origin`.** After several hops a dump's origin is
+  not the author of a row, so it cannot decide anything. The winner is the
+  larger canonical form of the row (`updated_at` first, then namespace, kind,
+  title, content, tags, importance, source, updated_by, archived, expires).
+  This is a pure function of the two versions, so both sides pick the same one.
+- **Loser preservation.** A replaced *local* version is already in the local
+  history; the merge adds one `merged: newer version from <origin>` line. A
+  losing *incoming* version is reported (`kept_local`) and is preserved only
+  when the dump carries `--history`; no synthetic history line is written for
+  it, because history is read in order and a stale snapshot would look current.
+- **History order.** `History()` now sorts by `(changed_at, id)` instead of `id`,
+  so lines added by a merge slot in chronologically. History lines are matched
+  on `(action, by, at, hash of the snapshot minus id and uuid)`.
+- **Links** are copied with their original `created_at`, are looked up by uuid
+  in the dump or, failing that, in the local database, and never bump
+  `updated_at` or write history (otherwise two databases never agree).
+- **Twin rule.** An incoming memory unknown by uuid is paired with a local
+  memory of same namespace, kind and content that the dump does not describe
+  and that is not already paired; both then adopt the smaller uuid, which is
+  what the other side will compute too. `--no-content-match` disables it. It
+  only helps for the first merge: once one twin is edited their contents differ.
+- **`created_at`** settles on the earliest of the two.
+- **Known limits**: two active handoffs in one namespace can result from a merge
+  (the newest is the one briefings use); no tombstones yet, so `purge` is local
+  and can be undone by a merge; a dump without timestamps gets "now" and is
+  therefore not idempotent (only hand-built dumps).

@@ -504,6 +504,8 @@ func (a app) cmdImport(ctx context.Context, args []string) error {
 	fs := a.newFlagSet("import")
 	flags := config.Register(fs)
 	dryRun := fs.Bool("dry-run", false, "check and count without writing")
+	merge := fs.Bool("merge", false, "merge a format 2 export by memory uuid (newest version wins, links and history are added) instead of skipping duplicates")
+	noContentMatch := fs.Bool("no-content-match", false, "with --merge: do not pair memories of identical content that have different uuids")
 	pos, err := parse(fs, args, 1, 1)
 	if err != nil {
 		return err
@@ -528,13 +530,30 @@ func (a app) cmdImport(ctx context.Context, args []string) error {
 		return err
 	}
 	defer func() { _ = st.Close() }()
+	prefix := ""
+	if *dryRun {
+		prefix = "Dry run (nothing written): "
+	}
+	if *merge {
+		mr, err := st.Merge(ctx, d, store.MergeOptions{NoContentMatch: *noContentMatch}, *dryRun, cliSource)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(a.stdout, "%sMerged: %d inserted, %d updated, %d kept local (newer here), %d unchanged, %d namespace(s) created.\n",
+			prefix, mr.Inserted, mr.Updated, mr.KeptLocal, mr.Unchanged, mr.NamespacesCreated)
+		fmt.Fprintf(a.stdout, "%s%d link(s) added, %d history line(s) added", prefix, mr.LinksAdded, mr.HistoryAdded)
+		if mr.TwinsMatched > 0 {
+			fmt.Fprintf(a.stdout, ", %d memory(ies) paired by identical content", mr.TwinsMatched)
+		}
+		fmt.Fprintln(a.stdout, ".")
+		for _, c := range mr.Changes {
+			fmt.Fprintf(a.stdout, "  #%d %s: %s\n", c.ID, c.Result, c.Title)
+		}
+		return nil
+	}
 	rep, err := st.Import(ctx, d, *dryRun, cliSource)
 	if err != nil {
 		return err
-	}
-	prefix := ""
-	if rep.DryRun {
-		prefix = "Dry run (nothing written): "
 	}
 	fmt.Fprintf(a.stdout, "%s%d imported, %d skipped (exact duplicates), %d namespace(s) created.\n",
 		prefix, rep.Imported, rep.Skipped, rep.NamespacesCreated)

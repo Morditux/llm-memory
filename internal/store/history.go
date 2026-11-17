@@ -23,7 +23,7 @@ func (s *Store) History(ctx context.Context, id int64) ([]HistoryEntry, error) {
 	}
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, memory_id, action, snapshot, changed_by, changed_at
-		 FROM memory_history WHERE memory_id = ? ORDER BY id`, id)
+		 FROM memory_history WHERE memory_id = ? ORDER BY changed_at, id`, id)
 	if err != nil {
 		return nil, fmt.Errorf("history of #%d: %w", id, err)
 	}

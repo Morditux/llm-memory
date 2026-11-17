@@ -275,6 +275,28 @@ func TestExportImportCLI(t *testing.T) {
 		t.Errorf("listings differ after import\n--- source ---\n%s\n--- destination ---\n%s", a, b)
 	}
 
+	// Merge: into an empty base, then again (no-op), by uuid.
+	mdb := filepath.Join(dir, "merge.db")
+	if out := cliOK(t, "import", "--merge", "--dry-run", dump, "--db", mdb); !strings.Contains(out, "Dry run (nothing written): Merged: 4 inserted, 0 updated") {
+		t.Errorf("merge dry run: %q", out)
+	}
+	if out := cliOK(t, "import", "--merge", dump, "--db", mdb); !strings.Contains(out, "Merged: 4 inserted, 0 updated, 0 kept local (newer here), 0 unchanged") {
+		t.Errorf("merge: %q", out)
+	}
+	if out := cliOK(t, "import", "--merge", dump, "--db", mdb); !strings.Contains(out, "Merged: 0 inserted, 0 updated, 0 kept local (newer here), 4 unchanged") || !strings.Contains(out, "0 history line(s) added") {
+		t.Errorf("second merge: %q", out)
+	}
+	if a, b := cliOK(t, "list", "--archived", "--db", db), cliOK(t, "list", "--archived", "--db", mdb); a != b {
+		t.Errorf("listings differ after merge\n%s\n%s", a, b)
+	}
+	v1file := filepath.Join(dir, "v1.json")
+	if r := cli(t, "", "export", "--format-version", "1", "-o", v1file, "--db", db); r.err != nil {
+		t.Fatal(r.err)
+	}
+	if r := cli(t, "", "import", "--merge", v1file, "--db", mdb); r.err == nil || !strings.Contains(r.err.Error(), "merge needs a version 2 export") {
+		t.Errorf("merge of a v1 file: %+v", r)
+	}
+
 	// Format version 1, for older releases: no origin, still importable here.
 	var v1 store.Dump
 	if err := json.Unmarshal([]byte(cliOK(t, "export", "--format-version", "1", "--db", db)), &v1); err != nil || v1.FormatVersion != 1 || v1.Origin != "" {

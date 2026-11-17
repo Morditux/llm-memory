@@ -245,6 +245,7 @@ llm-memory restore 42                    # un-archives
 llm-memory purge --archived-before 2026-01-01 [--yes]   # permanent deletion
 llm-memory export [--namespace X] [--history] [--format-version 1|2] [-o dump.json]
 llm-memory import [--dry-run] dump.json  # or - for stdin; exact duplicates are skipped, links are restored (format 2)
+llm-memory import --merge [--dry-run] [--no-content-match] dump.json  # merge a format 2 export from another machine
 llm-memory stats [--json]                # per namespace, kind, source; file size
 llm-memory namespace <list|rename|merge|archive> ... # manage namespaces
 llm-memory gc [--json]                   # archive expired (TTL) memories
@@ -316,6 +317,32 @@ How it works:
 - **File copy**: close the clients, then copy `memory.db` **and** `memory.db-wal` if it exists
   (WAL mode). With clients open, prefer `sqlite3 memory.db ".backup copy.db"`.
 - Never store secrets in the memory: it is stored in clear text on disk.
+
+## Using several machines
+
+Every memory has a global uuid (the `#id` you see stays local to each database). To bring two
+databases together, export one with its history and merge it into the other, then do the reverse:
+
+```
+machine-a$ llm-memory export --history -o a.json
+machine-b$ llm-memory import --merge --dry-run a.json    # preview
+machine-b$ llm-memory import --merge a.json
+machine-b$ llm-memory export --history -o b.json         # then: machine-a$ llm-memory import --merge b.json
+```
+
+- Memories are matched by uuid. When both sides have one, the **most recently updated** version
+  replaces the other as a whole (a tie is settled the same way on both sides). A replaced local
+  version stays in that memory's history; a losing incoming version is only reported, unless the
+  export carries `--history`.
+- Links and history lines are added, never removed. Merging does not touch a memory's
+  `updated_at`, so repeating a merge changes nothing.
+- A memory with no matching uuid but identical namespace, kind and content to a local one (the same
+  fact saved on both machines) is paired with it and both keep the smaller uuid;
+  `--no-content-match` turns this off.
+- Not synchronised: deletions (`purge` removes a row only locally, and a later merge from a machine
+  that still has it brings it back), removal of a `relates_to`/`depends_on` link, and embeddings
+  (rebuilt locally). Copy a database file (or `backup`) only to restore it, not to seed a second
+  machine: both would share one instance id.
 
 ## Checking the installation
 
