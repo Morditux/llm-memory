@@ -47,14 +47,38 @@ func DecodeVector(b []byte) ([]float32, error) {
 const missingEmbeddingsWhere = ` FROM memories m
 	WHERE NOT EXISTS (SELECT 1 FROM memory_embeddings e WHERE e.memory_id = m.id AND e.model = ?)`
 
+// MissingFilter restricts MissingEmbeddingsFiltered. Zero values select all
+// namespaces, active (non-archived, non-expired) memories only, and no limit.
+type MissingFilter struct {
+	Namespace       string
+	IncludeArchived bool
+	Limit           int
+}
+
 // MissingEmbeddings returns up to limit memories (active first, then archived,
 // most recent first) that have no embedding for model. limit <= 0 means all.
 func (s *Store) MissingEmbeddings(ctx context.Context, model string, limit int) ([]EmbeddingSource, error) {
-	q := "SELECT m.id, m.title, m.content, m.tags" + missingEmbeddingsWhere + " ORDER BY (m.archived_at IS NULL) DESC, m.id DESC"
-	args := []any{model}
-	if limit > 0 {
+	return s.MissingEmbeddingsFiltered(ctx, model, MissingFilter{IncludeArchived: true, Limit: limit})
+}
+
+// MissingEmbeddingsFiltered returns memories (active first, then archived,
+// most recent first) matching f that have no embedding for model.
+// f.Limit <= 0 means all.
+func (s *Store) MissingEmbeddingsFiltered(ctx context.Context, model string, f MissingFilter) ([]EmbeddingSource, error) {
+	ns := ""
+	if f.Namespace != "" {
+		var err error
+		if ns, err = NormalizeNamespace(f.Namespace); err != nil {
+			return nil, err
+		}
+	}
+	filter, fargs := filterSQL(ns, nil, nil, f.IncludeArchived, 0)
+	order := " ORDER BY (m.archived_at IS NULL AND (m.expires_at IS NULL OR m.expires_at > " + sqlNow + ")) DESC, m.id DESC"
+	q := "SELECT m.id, m.title, m.content, m.tags" + missingEmbeddingsWhere + filter + order
+	args := append([]any{model}, fargs...)
+	if f.Limit > 0 {
 		q += " LIMIT ?"
-		args = append(args, limit)
+		args = append(args, f.Limit)
 	}
 	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {

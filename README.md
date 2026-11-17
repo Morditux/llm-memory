@@ -288,14 +288,21 @@ then add the same two flags to the `serve` `args` in each client's configuration
 
 How it works:
 
-- Memories without an embedding (new, imported, written by a non-configured client) are
-  indexed in batches of 64 at the start of each `recall`; `llm-memory reindex` indexes everything
-  at once, `reindex --all` recomputes everything (after a model change, for example).
+- Active memories without an embedding (new, imported, written by a non-configured client) in the
+  searched scope are indexed in batches of 64 at the start of each `recall` (archived memories are
+  only indexed when `include_archived` is set); `llm-memory reindex` indexes all memories across all
+  namespaces (including archived ones), and `reindex --all` recomputes everything (after a model
+  change, for example).
 - Changing the title, content or tags of a memory invalidates its embedding, which is recomputed later.
 - If the API is unreachable, `recall` still answers with full-text search (warning on stderr).
-- `remember` and duplicate detection remain full-text: writing never depends on the API.
-- **Privacy**: the text of memories and queries is sent to the configured URL.
-  Prefer a local model if the memory contains sensitive information.
+- `remember` also uses embeddings for duplicate detection when indexed memories exist in the target
+  namespace, ignoring API errors and falling back to full-text duplicate detection: writing never
+  depends on the API.
+- **Privacy**: the text of indexed memories, search queries, and new `remember` entries (when
+  indexed memories exist in the target namespace) is sent to the configured URL. `recall` only
+  backfills active memories within its namespace filter (unless `include_archived` is true), whereas
+  `llm-memory reindex` indexes all namespaces including archived memories. Prefer a local model if
+  the memory contains sensitive information.
 
 ## Backup
 

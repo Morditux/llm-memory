@@ -130,6 +130,42 @@ func TestMissingEmbeddingsPrioritizesActive(t *testing.T) {
 	}
 }
 
+func TestMissingEmbeddingsFiltered(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	past := time.Now().UTC().Add(-time.Hour)
+
+	demoActive, _ := s.Create(ctx, NewMemory{Namespace: "demo", Kind: KindFact, Content: "demo active"})
+	demoArch, _ := s.Create(ctx, NewMemory{Namespace: "demo", Kind: KindFact, Content: "demo archived"})
+	_, _ = s.Archive(ctx, demoArch.ID, "t", "")
+	demoExp, _ := s.Create(ctx, NewMemory{Namespace: "demo", Kind: KindFact, Content: "demo expired", ExpiresAt: &past})
+	apiActive, _ := s.Create(ctx, NewMemory{Namespace: "api", Kind: KindFact, Content: "api active"})
+
+	// Scoped to namespace, active only: skips archived, expired, and other namespaces.
+	got, err := s.MissingEmbeddingsFiltered(ctx, "m", MissingFilter{Namespace: "demo"})
+	if err != nil || len(got) != 1 || got[0].ID != demoActive.ID {
+		t.Fatalf("MissingEmbeddingsFiltered(demo, active) = %+v, %v; want [%d]", got, err, demoActive.ID)
+	}
+
+	// IncludeArchived includes archived and expired within the namespace, still skips other namespaces,
+	// prioritizing active (non-archived, non-expired) memories first.
+	gotAllDemo, err := s.MissingEmbeddingsFiltered(ctx, "m", MissingFilter{Namespace: "demo", IncludeArchived: true})
+	if err != nil || len(gotAllDemo) != 3 || gotAllDemo[0].ID != demoActive.ID || gotAllDemo[1].ID != demoExp.ID || gotAllDemo[2].ID != demoArch.ID {
+		t.Fatalf("MissingEmbeddingsFiltered(demo, all) = %+v, %v; want [%d, %d, %d]", gotAllDemo, err, demoActive.ID, demoExp.ID, demoArch.ID)
+	}
+
+	// All namespaces, active only.
+	gotActive, err := s.MissingEmbeddingsFiltered(ctx, "m", MissingFilter{Limit: 10})
+	if err != nil || len(gotActive) != 2 || gotActive[0].ID != apiActive.ID || gotActive[1].ID != demoActive.ID {
+		t.Fatalf("MissingEmbeddingsFiltered(all ns, active) = %+v, %v", gotActive, err)
+	}
+
+	// Invalid namespace returns validation error.
+	if _, err := s.MissingEmbeddingsFiltered(ctx, "m", MissingFilter{Namespace: "-bad"}); err == nil {
+		t.Error("expected validation error for invalid namespace")
+	}
+}
+
 func TestGetManyAndHelpers(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()

@@ -78,7 +78,11 @@ func embedText(m store.EmbeddingSource) string {
 // (limit <= 0: all of them), most recent first. progress, if not nil, is
 // called after each stored batch.
 func (e *Engine) Index(ctx context.Context, limit int, progress func(done int)) (int, error) {
-	todo, err := e.store.MissingEmbeddings(ctx, e.emb.Model(), limit)
+	return e.indexFiltered(ctx, store.MissingFilter{IncludeArchived: true, Limit: limit}, progress)
+}
+
+func (e *Engine) indexFiltered(ctx context.Context, f store.MissingFilter, progress func(done int)) (int, error) {
+	todo, err := e.store.MissingEmbeddingsFiltered(ctx, e.emb.Model(), f)
 	if err != nil {
 		return 0, err
 	}
@@ -142,7 +146,11 @@ func (e *Engine) Search(ctx context.Context, q store.SearchQuery) ([]store.Searc
 	}
 
 	if e.catchUp > 0 {
-		if n, err := e.Index(ctx, e.catchUp, nil); err != nil {
+		if n, err := e.indexFiltered(ctx, store.MissingFilter{
+			Namespace:       q.Namespace,
+			IncludeArchived: q.IncludeArchived,
+			Limit:           e.catchUp,
+		}, nil); err != nil {
 			e.log.WarnContext(ctx, "semantic: indexing failed, continuing", "err", err)
 		} else if n > 0 {
 			e.log.DebugContext(ctx, "semantic: indexed memories", "count", n)
@@ -277,14 +285,17 @@ func (e *Engine) FindSimilar(ctx context.Context, text, namespace string, minSco
 	if minScore <= 0 {
 		minScore = max(e.minScore, 0.75)
 	}
+	vecs, err := e.store.Vectors(ctx, e.emb.Model(), store.VectorFilter{Namespace: namespace})
+	if err != nil {
+		return nil, err
+	}
+	if len(vecs) == 0 {
+		return nil, nil
+	}
 	qv, err := e.emb.Embed(ctx, []string{text})
 	if err != nil {
 		e.log.WarnContext(ctx, "semantic: duplicate check failed, skipping", "err", err)
 		return nil, nil
-	}
-	vecs, err := e.store.Vectors(ctx, e.emb.Model(), store.VectorFilter{Namespace: namespace})
-	if err != nil {
-		return nil, err
 	}
 	nearest := rankByCosine(qv[0], vecs, minScore, limit)
 	now := time.Now().UTC()

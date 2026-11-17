@@ -327,3 +327,85 @@ func TestEmbedText(t *testing.T) {
 		t.Errorf("embedText = %q", got)
 	}
 }
+
+func TestSearchCatchUpScoped(t *testing.T) {
+	st := newStore(t)
+	ctx := context.Background()
+	demoActive, _ := st.Create(ctx, store.NewMemory{Namespace: "demo", Kind: store.KindFact, Content: "PostgreSQL pour JSONB"})
+	demoArch, _ := st.Create(ctx, store.NewMemory{Namespace: "demo", Kind: store.KindFact, Content: "Ancien secret oublié"})
+	if _, err := st.Archive(ctx, demoArch.ID, "t", ""); err != nil {
+		t.Fatal(err)
+	}
+	apiActive, _ := st.Create(ctx, store.NewMemory{Namespace: "api", Kind: store.KindFact, Content: "Jetons JWT EdDSA"})
+
+	emb := &fakeEmbedder{model: "fake"}
+	e := New(st, emb, Options{})
+
+	// Search scoped to "demo" (active only) must only catch up demoActive.
+	search(t, e, store.SearchQuery{Query: "SGBD", Namespace: "demo"})
+	if v, _ := st.Vectors(ctx, "fake", store.VectorFilter{Namespace: "demo"}); len(v) != 1 || v[0].ID != demoActive.ID {
+		t.Fatalf("demo active vectors = %+v, want [%d]", v, demoActive.ID)
+	}
+	if v, _ := st.Vectors(ctx, "fake", store.VectorFilter{Namespace: "demo", IncludeArchived: true}); len(v) != 1 {
+		t.Fatalf("archived memory was indexed without IncludeArchived: %+v", v)
+	}
+	if v, _ := st.Vectors(ctx, "fake", store.VectorFilter{Namespace: "api"}); len(v) != 0 {
+		t.Fatalf("other namespace memory was indexed during scoped search: %+v", v)
+	}
+
+	// Search with IncludeArchived catches up demoArch too, still leaving api untouched.
+	search(t, e, store.SearchQuery{Query: "SGBD", Namespace: "demo", IncludeArchived: true})
+	if v, _ := st.Vectors(ctx, "fake", store.VectorFilter{Namespace: "demo", IncludeArchived: true}); len(v) != 2 {
+		t.Fatalf("expected archived demo memory to be indexed with IncludeArchived: %+v", v)
+	}
+	if v, _ := st.Vectors(ctx, "fake", store.VectorFilter{Namespace: "api"}); len(v) != 0 {
+		t.Fatalf("api namespace should still not be indexed: %+v", v)
+	}
+	_ = apiActive
+}
+
+func TestFindSimilar(t *testing.T) {
+	f := seed(t)
+	ctx := context.Background()
+	emb := &fakeEmbedder{model: "fake"}
+	e := New(f.st, emb, Options{})
+
+	// When the target namespace has no indexed vectors yet, FindSimilar skips the API call.
+	got, err := e.FindSimilar(ctx, "PostgreSQL pour JSONB", "demo", 0, 3)
+	if err != nil || len(got) != 0 {
+		t.Fatalf("empty vectors FindSimilar = %+v, %v", got, err)
+	}
+	if emb.callCount() != 0 {
+		t.Fatalf("expected 0 embed calls when no vectors exist, got %d", emb.callCount())
+	}
+
+	// Index only the "api" namespace: "demo" still has 0 vectors, so API is still skipped.
+	if _, err := e.indexFiltered(ctx, store.MissingFilter{Namespace: "api"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	callsBefore := emb.callCount()
+	got, err = e.FindSimilar(ctx, "PostgreSQL pour JSONB", "demo", 0, 3)
+	if err != nil || len(got) != 0 || emb.callCount() != callsBefore {
+		t.Fatalf("demo FindSimilar with only api indexed = %+v, %v (calls %d -> %d)", got, err, callsBefore, emb.callCount())
+	}
+
+	// Index everything: FindSimilar in "demo" now matches f.pg via the API.
+	if _, err := e.Index(ctx, 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	got, err = e.FindSimilar(ctx, "SGBD pour JSONB", "demo", 0.5, 3)
+	if err != nil || len(got) == 0 || got[0].ID != f.pg.ID {
+		t.Fatalf("FindSimilar(demo) = %+v, %v; want #%d", got, err, f.pg.ID)
+	}
+
+	// API failure is logged and ignored (returns nil, nil).
+	var logs bytes.Buffer
+	down := New(f.st, &fakeEmbedder{model: "fake", fail: errAPIDown}, Options{Logger: slog.New(slog.NewTextHandler(&logs, nil))})
+	got, err = down.FindSimilar(ctx, "SGBD pour JSONB", "demo", 0.5, 3)
+	if err != nil || len(got) != 0 {
+		t.Fatalf("FindSimilar on API failure = %+v, %v", got, err)
+	}
+	if !strings.Contains(logs.String(), "duplicate check failed") {
+		t.Errorf("expected warning log on API failure, got: %s", logs.String())
+	}
+}
