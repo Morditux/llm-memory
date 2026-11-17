@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -57,29 +58,48 @@ func TestMemoryLinksAndSupersede(t *testing.T) {
 		t.Fatalf("unexpected links on m2: %+v", links2)
 	}
 
-	// AddLink / duplicate AddLink (idempotent) / RemoveLink.
-	if err := s.AddLink(ctx, m3.ID, m1.ID, LinkRelatesTo); err != nil {
+	// AddLink / duplicate AddLink (idempotent, no extra history) / RemoveLink.
+	if err := s.AddLink(ctx, m3.ID, m1.ID, LinkRelatesTo, "alice"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.AddLink(ctx, m3.ID, m1.ID, LinkRelatesTo); err != nil {
+	if err := s.AddLink(ctx, m3.ID, m1.ID, LinkRelatesTo, "alice"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.RemoveLink(ctx, m3.ID, m1.ID, LinkRelatesTo); err != nil {
+	hist3, err := s.History(ctx, m3.ID)
+	if err != nil || len(hist3) != 2 || hist3[1].Action != ActionUpdate || hist3[1].ChangedBy != "alice" {
+		t.Fatalf("history after AddLink (and duplicate) = %+v, %v", hist3, err)
+	}
+	if _, reason, err := hist3[1].Decode(); err != nil || reason != fmt.Sprintf("added link relates_to -> #%d", m1.ID) {
+		t.Fatalf("AddLink history reason = %q, %v", reason, err)
+	}
+	if err := s.RemoveLink(ctx, m3.ID, m1.ID, LinkRelatesTo, "bob"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.RemoveLink(ctx, m3.ID, m1.ID, LinkRelatesTo); err == nil {
+	hist3, err = s.History(ctx, m3.ID)
+	if err != nil || len(hist3) != 3 || hist3[2].Action != ActionUpdate || hist3[2].ChangedBy != "bob" {
+		t.Fatalf("history after RemoveLink = %+v, %v", hist3, err)
+	}
+	if _, reason, err := hist3[2].Decode(); err != nil || reason != fmt.Sprintf("removed link relates_to -> #%d", m1.ID) {
+		t.Fatalf("RemoveLink history reason = %q, %v", reason, err)
+	}
+	if err := s.RemoveLink(ctx, m3.ID, m1.ID, LinkRelatesTo, "bob"); err == nil {
 		t.Fatal("expected error removing absent link")
 	}
 
-	// Validation errors.
+	// Removing a supersedes link is refused.
 	var ve *ValidationError
-	if err := s.AddLink(ctx, m2.ID, m2.ID, LinkRelatesTo); !errors.As(err, &ve) {
+	if err := s.RemoveLink(ctx, m2.ID, m1.ID, LinkSupersedes, "cli"); !errors.As(err, &ve) {
+		t.Errorf("remove supersedes err = %v, want ValidationError", err)
+	}
+
+	// Validation errors.
+	if err := s.AddLink(ctx, m2.ID, m2.ID, LinkRelatesTo, "cli"); !errors.As(err, &ve) {
 		t.Errorf("self link err = %v, want ValidationError", err)
 	}
-	if err := s.AddLink(ctx, m2.ID, m3.ID, LinkKind("bogus")); !errors.As(err, &ve) {
+	if err := s.AddLink(ctx, m2.ID, m3.ID, LinkKind("bogus"), "cli"); !errors.As(err, &ve) {
 		t.Errorf("bad kind err = %v, want ValidationError", err)
 	}
-	if err := s.AddLink(ctx, m2.ID, 9999, LinkRelatesTo); !errors.Is(err, ErrNotFound) {
+	if err := s.AddLink(ctx, m2.ID, 9999, LinkRelatesTo, "cli"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("missing target err = %v, want ErrNotFound", err)
 	}
 

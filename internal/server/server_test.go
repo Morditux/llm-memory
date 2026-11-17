@@ -704,9 +704,12 @@ func TestMemoryLinksTools(t *testing.T) {
 		t.Errorf("expected links in changed, got %v", up.Changed)
 	}
 
-	got3 := callOK[GetMemoryOutput](t, cs, "get_memory", map[string]any{"id": m3.Memory.ID})
+	got3 := callOK[GetMemoryOutput](t, cs, "get_memory", map[string]any{"id": m3.Memory.ID, "with_history": true})
 	if len(got3.Links) != 2 {
 		t.Fatalf("expected 2 links on m3, got %+v", got3.Links)
+	}
+	if len(got3.History) != 2 || got3.History[1].Reason == "" {
+		t.Fatalf("expected add_links history entry on m3, got %+v", got3.History)
 	}
 
 	callOK[UpdateMemoryOutput](t, cs, "update_memory", map[string]any{
@@ -719,4 +722,11 @@ func TestMemoryLinksTools(t *testing.T) {
 	if len(got2.Links) != 2 {
 		t.Fatalf("expected 2 links on m2 (supersedes m1, incoming depends_on m3), got %+v", got2.Links)
 	}
+	// Attempting to remove a supersedes link must be rejected.
+	callErr(t, cs, "update_memory", map[string]any{
+		"id": m2.Memory.ID,
+		"remove_links": []map[string]any{
+			{"target_id": m1.Memory.ID, "kind": "supersedes"},
+		},
+	}, "supersedes")
 }

@@ -821,13 +821,19 @@ func (a app) cmdUpdate(ctx context.Context, args []string) error {
 			return &store.StateError{ID: id, Msg: "is archived; restore it first (llm-memory restore)"}
 		}
 	}
+	actor := cliActor(cfg)
 	for _, l := range adds {
-		if err := st.AddLink(ctx, id, l.TargetID, l.Kind); err != nil {
+		if err := st.AddLink(ctx, id, l.TargetID, l.Kind, actor); err != nil {
 			return err
 		}
 	}
 	for _, l := range rems {
-		if err := st.RemoveLink(ctx, id, l.TargetID, l.Kind); err != nil {
+		if err := st.RemoveLink(ctx, id, l.TargetID, l.Kind, actor); err != nil {
+			return err
+		}
+	}
+	if len(adds) > 0 || len(rems) > 0 {
+		if m, err = st.Get(ctx, id); err != nil {
 			return err
 		}
 	}
@@ -1017,12 +1023,12 @@ func (a app) cmdNamespace(ctx context.Context, args []string) error {
 		if err != nil {
 			return err
 		}
-		st, _, err := a.openStore(ctx, flags)
+		st, cfg, err := a.openStore(ctx, flags)
 		if err != nil {
 			return err
 		}
 		defer func() { _ = st.Close() }()
-		ns, err := st.RenameNamespace(ctx, pos[0], pos[1])
+		ns, err := st.RenameNamespace(ctx, pos[0], pos[1], cliActor(cfg))
 		if err != nil {
 			return err
 		}

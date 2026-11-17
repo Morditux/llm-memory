@@ -313,26 +313,32 @@ func (s *srv) getMemory(ctx context.Context, req *mcp.CallToolRequest, in GetMem
 
 // ---- update_memory ----------------------------------------------------------
 
-// LinkInput identifies a directed link to add or remove on a memory.
+// LinkInput identifies a directed link to add on a memory.
 type LinkInput struct {
 	TargetID int64  `json:"target_id" jsonschema:"Target memory ID."`
 	Kind     string `json:"kind" jsonschema:"Relationship kind: relates_to, depends_on or supersedes."`
 }
 
+// RemoveLinkInput identifies a directed link to remove from a memory.
+type RemoveLinkInput struct {
+	TargetID int64  `json:"target_id" jsonschema:"Target memory ID."`
+	Kind     string `json:"kind" jsonschema:"Relationship kind: relates_to or depends_on (supersedes links cannot be removed)."`
+}
+
 // UpdateMemoryInput is the input of update_memory. Omitted fields are unchanged.
 type UpdateMemoryInput struct {
-	ID           int64       `json:"id" jsonschema:"Memory ID to change."`
-	Content      *string     `json:"content,omitempty" jsonschema:"New full content (replaces the old one; the old version stays in history)."`
-	Title        *string     `json:"title,omitempty" jsonschema:"New one-line title; empty string removes it."`
-	Tags         *[]string   `json:"tags,omitempty" jsonschema:"New complete tag list (replaces the old one)."`
-	Importance   *int        `json:"importance,omitempty" jsonschema:"1 = low, 2 = normal, 3 = always shown by get_context."`
-	Kind         *string     `json:"kind,omitempty" jsonschema:"New kind."`
-	Namespace    *string     `json:"namespace,omitempty" jsonschema:"Move to this namespace (created if new)."`
-	ExpiresIn    string      `json:"expires_in,omitempty" jsonschema:"New TTL duration (e.g. 24h, 7d)."`
-	ExpiresAt    string      `json:"expires_at,omitempty" jsonschema:"New RFC 3339 expiration timestamp."`
-	ClearExpires bool        `json:"clear_expires,omitempty" jsonschema:"Remove any expiration timestamp."`
-	AddLinks     []LinkInput `json:"add_links,omitempty" jsonschema:"Links to add from this memory to other memories."`
-	RemoveLinks  []LinkInput `json:"remove_links,omitempty" jsonschema:"Links to remove from this memory."`
+	ID           int64             `json:"id" jsonschema:"Memory ID to change."`
+	Content      *string           `json:"content,omitempty" jsonschema:"New full content (replaces the old one; the old version stays in history)."`
+	Title        *string           `json:"title,omitempty" jsonschema:"New one-line title; empty string removes it."`
+	Tags         *[]string         `json:"tags,omitempty" jsonschema:"New complete tag list (replaces the old one)."`
+	Importance   *int              `json:"importance,omitempty" jsonschema:"1 = low, 2 = normal, 3 = always shown by get_context."`
+	Kind         *string           `json:"kind,omitempty" jsonschema:"New kind."`
+	Namespace    *string           `json:"namespace,omitempty" jsonschema:"Move to this namespace (created if new)."`
+	ExpiresIn    string            `json:"expires_in,omitempty" jsonschema:"New TTL duration (e.g. 24h, 7d)."`
+	ExpiresAt    string            `json:"expires_at,omitempty" jsonschema:"New RFC 3339 expiration timestamp."`
+	ClearExpires bool              `json:"clear_expires,omitempty" jsonschema:"Remove any expiration timestamp."`
+	AddLinks     []LinkInput       `json:"add_links,omitempty" jsonschema:"Links to add from this memory to other memories."`
+	RemoveLinks  []RemoveLinkInput `json:"remove_links,omitempty" jsonschema:"Links to remove from this memory (relates_to or depends_on)."`
 }
 
 // UpdateMemoryOutput is the output of update_memory.
@@ -385,13 +391,20 @@ func (s *srv) updateMemory(ctx context.Context, req *mcp.CallToolRequest, in Upd
 			return nil, UpdateMemoryOutput{}, s.toolError(ctx, req, "update_memory", &store.StateError{ID: in.ID, Msg: "is archived; restore it first (llm-memory restore) or create a new memory"})
 		}
 	}
+	actor := s.source(req)
 	for _, l := range in.AddLinks {
-		if err := s.store.AddLink(ctx, in.ID, l.TargetID, store.LinkKind(l.Kind)); err != nil {
+		if err := s.store.AddLink(ctx, in.ID, l.TargetID, store.LinkKind(l.Kind), actor); err != nil {
 			return nil, UpdateMemoryOutput{}, s.toolError(ctx, req, "update_memory", err)
 		}
 	}
 	for _, l := range in.RemoveLinks {
-		if err := s.store.RemoveLink(ctx, in.ID, l.TargetID, store.LinkKind(l.Kind)); err != nil {
+		if err := s.store.RemoveLink(ctx, in.ID, l.TargetID, store.LinkKind(l.Kind), actor); err != nil {
+			return nil, UpdateMemoryOutput{}, s.toolError(ctx, req, "update_memory", err)
+		}
+	}
+	if len(in.AddLinks) > 0 || len(in.RemoveLinks) > 0 {
+		m, err = s.store.Get(ctx, in.ID)
+		if err != nil {
 			return nil, UpdateMemoryOutput{}, s.toolError(ctx, req, "update_memory", err)
 		}
 	}

@@ -18,42 +18,69 @@ func validateLinkKind(k LinkKind) error {
 	return nil
 }
 
-func insertLink(ctx context.Context, q queryer, srcID, dstID int64, kind LinkKind) error {
+func insertLink(ctx context.Context, q queryer, srcID, dstID int64, kind LinkKind) (bool, error) {
 	if err := validateLinkKind(kind); err != nil {
-		return err
+		return false, err
 	}
 	if srcID <= 0 || dstID <= 0 {
-		return &ValidationError{Field: "link", Msg: "memory ids must be positive"}
+		return false, &ValidationError{Field: "link", Msg: "memory ids must be positive"}
 	}
 	if srcID == dstID {
-		return &ValidationError{Field: "link", Msg: "cannot link a memory to itself"}
+		return false, &ValidationError{Field: "link", Msg: "cannot link a memory to itself"}
 	}
 	if _, err := getMemory(ctx, q, srcID); err != nil {
-		return err
+		return false, err
 	}
 	if _, err := getMemory(ctx, q, dstID); err != nil {
-		return err
+		return false, err
 	}
-	if _, err := q.ExecContext(ctx,
+	res, err := q.ExecContext(ctx,
 		"INSERT OR IGNORE INTO memory_links(src_id, dst_id, kind) VALUES (?, ?, ?)",
-		srcID, dstID, string(kind)); err != nil {
-		return fmt.Errorf("create link #%d -> #%d (%s): %w", srcID, dstID, kind, err)
+		srcID, dstID, string(kind))
+	if err != nil {
+		return false, fmt.Errorf("create link #%d -> #%d (%s): %w", srcID, dstID, kind, err)
 	}
-	return nil
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("create link #%d -> #%d (%s): %w", srcID, dstID, kind, err)
+	}
+	return n > 0, nil
 }
 
-// AddLink records a directed relationship srcID -> dstID of the given kind.
-func (s *Store) AddLink(ctx context.Context, srcID, dstID int64, kind LinkKind) error {
+func touchAndRecordLinkHistory(ctx context.Context, tx *sql.Tx, srcID int64, by, reason string) error {
+	if _, err := tx.ExecContext(ctx,
+		"UPDATE memories SET updated_at = "+sqlNow+", updated_by = ? WHERE id = ?",
+		by, srcID); err != nil {
+		return fmt.Errorf("update memory #%d for link history: %w", srcID, err)
+	}
+	_, err := writeHistory(ctx, tx, srcID, ActionUpdate, by, reason)
+	return err
+}
+
+// AddLink records a directed relationship srcID -> dstID of the given kind
+// and records an update history entry on srcID if the link was newly created.
+func (s *Store) AddLink(ctx context.Context, srcID, dstID int64, kind LinkKind, by string) error {
+	by = normalizeActor(by)
 	return s.withTx(ctx, func(tx *sql.Tx) error {
-		return insertLink(ctx, tx, srcID, dstID, kind)
+		inserted, err := insertLink(ctx, tx, srcID, dstID, kind)
+		if err != nil || !inserted {
+			return err
+		}
+		return touchAndRecordLinkHistory(ctx, tx, srcID, by, fmt.Sprintf("added link %s -> #%d", kind, dstID))
 	})
 }
 
-// RemoveLink deletes a directed relationship srcID -> dstID of the given kind.
-func (s *Store) RemoveLink(ctx context.Context, srcID, dstID int64, kind LinkKind) error {
+// RemoveLink deletes a directed relationship srcID -> dstID of the given kind
+// and records an update history entry on srcID. Supersedes links record archival
+// provenance and cannot be removed.
+func (s *Store) RemoveLink(ctx context.Context, srcID, dstID int64, kind LinkKind, by string) error {
 	if err := validateLinkKind(kind); err != nil {
 		return err
 	}
+	if kind == LinkSupersedes {
+		return &ValidationError{Field: "link_kind", Msg: "supersedes links record archival provenance and cannot be removed"}
+	}
+	by = normalizeActor(by)
 	return s.withTx(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx,
 			"DELETE FROM memory_links WHERE src_id = ? AND dst_id = ? AND kind = ?",
@@ -68,7 +95,7 @@ func (s *Store) RemoveLink(ctx context.Context, srcID, dstID int64, kind LinkKin
 		if n == 0 {
 			return &ValidationError{Field: "link", Msg: fmt.Sprintf("no %s link from #%d to #%d", kind, srcID, dstID)}
 		}
-		return nil
+		return touchAndRecordLinkHistory(ctx, tx, srcID, by, fmt.Sprintf("removed link %s -> #%d", kind, dstID))
 	})
 }
 
@@ -93,7 +120,8 @@ func (s *Store) Supersede(ctx context.Context, srcID, targetID int64, by string)
 			return err
 		}
 		out = res.Memory
-		return insertLink(ctx, tx, srcID, targetID, LinkSupersedes)
+		_, err = insertLink(ctx, tx, srcID, targetID, LinkSupersedes)
+		return err
 	})
 	return out, err
 }

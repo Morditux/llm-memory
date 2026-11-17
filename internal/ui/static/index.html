@@ -464,7 +464,7 @@
             ${l.title ? `<span>${esc(l.title)}</span>` : ""}
             ${l.archived ? `<span class="archived-tag">(archived)</span>` : ""}
           </div>
-          ${l.direction === "outgoing" ? `<button class="sm danger btn-unlink" data-target="${l.id}" data-kind="${esc(l.kind)}" title="Remove link">×</button>` : ""}
+          ${l.direction === "outgoing" && l.kind !== "supersedes" ? `<button class="sm danger btn-unlink" data-target="${l.id}" data-kind="${esc(l.kind)}" title="Remove link">×</button>` : ""}
         </div>
       `).join("");
 

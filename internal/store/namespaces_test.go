@@ -93,7 +93,7 @@ func TestNamespaceRenameMergeArchive(t *testing.T) {
 	s := newTestStore(t)
 
 	// Cannot rename or merge global.
-	if _, err := s.RenameNamespace(ctx, "global", "other"); err == nil {
+	if _, err := s.RenameNamespace(ctx, "global", "other", "cli"); err == nil {
 		t.Error("expected error renaming global")
 	}
 	if _, err := s.MergeNamespace(ctx, "global", "other", "cli"); err == nil {
@@ -114,33 +114,52 @@ func TestNamespaceRenameMergeArchive(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Rename alpha -> gamma.
-	got, err := s.RenameNamespace(ctx, "alpha", "gamma")
+	// Rename alpha -> gamma records an update history row.
+	got, err := s.RenameNamespace(ctx, "alpha", "gamma", "alice")
 	if err != nil || got != "gamma" {
 		t.Fatalf("RenameNamespace = %q, %v", got, err)
 	}
 	m1After, err := s.Get(ctx, m1.ID)
-	if err != nil || m1After.Namespace != "gamma" {
-		t.Fatalf("m1 namespace = %q, %v", m1After.Namespace, err)
+	if err != nil || m1After.Namespace != "gamma" || m1After.UpdatedBy != "alice" {
+		t.Fatalf("m1 = %+v, %v", m1After, err)
+	}
+	hist1, err := s.History(ctx, m1.ID)
+	if err != nil || len(hist1) != 2 || hist1[1].Action != ActionUpdate || hist1[1].ChangedBy != "alice" {
+		t.Fatalf("m1 history after rename = %+v, %v", hist1, err)
+	}
+	snap1, reason1, err := hist1[1].Decode()
+	if err != nil || snap1.Namespace != "gamma" || reason1 != `namespace renamed "alpha" -> "gamma"` {
+		t.Fatalf("m1 rename snapshot = %+v, %q, %v", snap1, reason1, err)
 	}
 	// Cannot rename onto existing beta.
-	if _, err := s.RenameNamespace(ctx, "gamma", "beta"); err == nil {
+	if _, err := s.RenameNamespace(ctx, "gamma", "beta", "cli"); err == nil {
 		t.Error("expected error renaming onto existing namespace")
 	}
 
-	// Merge gamma into beta: h1 and beta's handoff -> only one active handoff remains.
-	moved, err := s.MergeNamespace(ctx, "gamma", "beta", "cli")
+	// Merge gamma into beta records update history on moved rows and archive on displaced handoff.
+	moved, err := s.MergeNamespace(ctx, "gamma", "beta", "bob")
 	if err != nil || moved != 2 {
 		t.Fatalf("MergeNamespace = %d, %v", moved, err)
 	}
 	if _, err := s.RequireNamespace(ctx, "gamma"); err == nil {
 		t.Error("gamma should have been deleted after merge")
 	}
+	hist1, err = s.History(ctx, m1.ID)
+	if err != nil || len(hist1) != 3 || hist1[2].Action != ActionUpdate || hist1[2].ChangedBy != "bob" {
+		t.Fatalf("m1 history after merge = %+v, %v", hist1, err)
+	}
+	snap2, reason2, err := hist1[2].Decode()
+	if err != nil || snap2.Namespace != "beta" || reason2 != `namespace merged "gamma" -> "beta"` {
+		t.Fatalf("m1 merge snapshot = %+v, %q, %v", snap2, reason2, err)
+	}
 	handoffs, err := s.List(ctx, ListFilter{Namespace: "beta", Kinds: []Kind{KindHandoff}})
 	if err != nil || len(handoffs) != 1 {
 		t.Fatalf("active handoffs in beta = %d, %v", len(handoffs), err)
 	}
-	_ = h1
+	h1Hist, err := s.History(ctx, h1.ID)
+	if err != nil || len(h1Hist) < 3 {
+		t.Fatalf("h1 history = %+v, %v", h1Hist, err)
+	}
 
 	// Archive all active memories in beta.
 	archivedCount, err := s.ArchiveNamespace(ctx, "beta", "cli", "")

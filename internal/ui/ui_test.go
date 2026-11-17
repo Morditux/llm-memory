@@ -143,6 +143,12 @@ func TestUIEndpoints(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("POST remove link = %d: %s", rec.Code, rec.Body.String())
 	}
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/memories/%d/links/remove", created.ID),
+		strings.NewReader(fmt.Sprintf(`{"target_id":%d,"kind":"supersedes"}`, m.ID))))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("POST remove supersedes link = %d, want 400: %s", rec.Code, rec.Body.String())
+	}
 
 	rec = httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/memories?namespace=demo&tag=sqlite&limit=1&offset=0", nil))

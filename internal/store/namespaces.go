@@ -127,9 +127,19 @@ func (s *Store) ListNamespaces(ctx context.Context) ([]Namespace, error) {
 	return out, nil
 }
 
-// RenameNamespace renames oldName to newName (updating all memories via ON UPDATE CASCADE).
+func recordNamespaceHistory(ctx context.Context, tx *sql.Tx, ids []int64, by, reason string) error {
+	for _, id := range ids {
+		if _, err := writeHistory(ctx, tx, id, ActionUpdate, by, reason); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// RenameNamespace renames oldName to newName (updating all memories via ON UPDATE CASCADE)
+// and records an update history snapshot for every moved memory.
 // The "global" namespace cannot be renamed, and newName must not already exist.
-func (s *Store) RenameNamespace(ctx context.Context, oldName, newName string) (string, error) {
+func (s *Store) RenameNamespace(ctx context.Context, oldName, newName, by string) (string, error) {
 	oldNS, err := NormalizeNamespace(oldName)
 	if err != nil {
 		return "", err
@@ -144,6 +154,7 @@ func (s *Store) RenameNamespace(ctx context.Context, oldName, newName string) (s
 	if oldNS == newNS {
 		return "", &ValidationError{Field: "namespace", Msg: "source and target namespaces are identical"}
 	}
+	by = normalizeActor(by)
 	err = s.withTx(ctx, func(tx *sql.Tx) error {
 		if err := requireNamespace(ctx, tx, oldNS); err != nil {
 			return err
@@ -156,16 +167,31 @@ func (s *Store) RenameNamespace(ctx context.Context, oldName, newName string) (s
 		if !errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("check namespace %q: %w", newNS, err)
 		}
+		ids, err := collectIDs(ctx, tx, "SELECT id FROM memories WHERE namespace = ? ORDER BY id", oldNS)
+		if err != nil {
+			return fmt.Errorf("list memories in %q: %w", oldNS, err)
+		}
 		if _, err := tx.ExecContext(ctx, "UPDATE namespaces SET name = ? WHERE name = ?", newNS, oldNS); err != nil {
 			return fmt.Errorf("rename namespace %q to %q: %w", oldNS, newNS, err)
+		}
+		if len(ids) > 0 {
+			if _, err := tx.ExecContext(ctx,
+				"UPDATE memories SET updated_at = "+sqlNow+", updated_by = ? WHERE namespace = ?",
+				by, newNS); err != nil {
+				return fmt.Errorf("update memories after rename %q to %q: %w", oldNS, newNS, err)
+			}
+			if err := recordNamespaceHistory(ctx, tx, ids, by, fmt.Sprintf("namespace renamed %q -> %q", oldNS, newNS)); err != nil {
+				return err
+			}
 		}
 		return nil
 	})
 	return newNS, err
 }
 
-// MergeNamespace moves all memories from src into dst, enforces at most one
-// active handoff in dst (keeping the most recent), and removes src.
+// MergeNamespace moves all memories from src into dst, records an update
+// history snapshot for each moved memory, enforces at most one active handoff
+// in dst (keeping the most recent), and removes src.
 // The "global" namespace cannot be merged away.
 func (s *Store) MergeNamespace(ctx context.Context, src, dst, by string) (int64, error) {
 	srcNS, err := NormalizeNamespace(src)
@@ -191,11 +217,20 @@ func (s *Store) MergeNamespace(ctx context.Context, src, dst, by string) (int64,
 		if err := ensureNamespace(ctx, tx, dstNS); err != nil {
 			return err
 		}
-		res, err := tx.ExecContext(ctx, "UPDATE memories SET namespace = ? WHERE namespace = ?", dstNS, srcNS)
+		ids, err := collectIDs(ctx, tx, "SELECT id FROM memories WHERE namespace = ? ORDER BY id", srcNS)
+		if err != nil {
+			return fmt.Errorf("list memories in %q: %w", srcNS, err)
+		}
+		res, err := tx.ExecContext(ctx,
+			"UPDATE memories SET namespace = ?, updated_at = "+sqlNow+", updated_by = ? WHERE namespace = ?",
+			dstNS, by, srcNS)
 		if err != nil {
 			return fmt.Errorf("move memories from %q to %q: %w", srcNS, dstNS, err)
 		}
 		moved, _ = res.RowsAffected()
+		if err := recordNamespaceHistory(ctx, tx, ids, by, fmt.Sprintf("namespace merged %q -> %q", srcNS, dstNS)); err != nil {
+			return err
+		}
 
 		var keepID int64
 		err = tx.QueryRowContext(ctx,

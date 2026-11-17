@@ -80,7 +80,7 @@ func NewHandler(st *store.Store, search Searcher) http.Handler {
 		if !decodeJSON(w, r, &body) {
 			return
 		}
-		ns, err := st.RenameNamespace(r.Context(), name, body.NewName)
+		ns, err := st.RenameNamespace(r.Context(), name, body.NewName, "ui")
 		if err != nil {
 			writeErr(w, err)
 			return
@@ -351,7 +351,7 @@ func NewHandler(st *store.Store, search Searcher) http.Handler {
 		if !decodeJSON(w, r, &body) {
 			return
 		}
-		if err := st.AddLink(r.Context(), id, body.TargetID, body.Kind); err != nil {
+		if err := st.AddLink(r.Context(), id, body.TargetID, body.Kind, "ui"); err != nil {
 			writeErr(w, err)
 			return
 		}
@@ -374,7 +374,7 @@ func NewHandler(st *store.Store, search Searcher) http.Handler {
 		if !decodeJSON(w, r, &body) {
 			return
 		}
-		if err := st.RemoveLink(r.Context(), id, body.TargetID, body.Kind); err != nil {
+		if err := st.RemoveLink(r.Context(), id, body.TargetID, body.Kind, "ui"); err != nil {
 			writeErr(w, err)
 			return
 		}
