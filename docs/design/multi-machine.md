@@ -1,6 +1,6 @@
 # Multi-machine support (global memory identity + merge)
 
-Status: draft, branch `multi-machine`. Phase 1 (identity) implemented, uncommitted.
+Status: draft, branch `multi-machine`. Phase 1 (identity) committed; phase 2 (export v2) implemented, uncommitted.
 
 ## Problem
 

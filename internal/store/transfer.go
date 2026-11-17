@@ -9,16 +9,39 @@ import (
 	"time"
 )
 
-// FormatVersion is the version of the JSON export format.
-const FormatVersion = 1
+// Export format versions.
+//
+//   - 1: memories, namespaces and optional history. No identity: ids are local
+//     to the exporting database, and older binaries reject unknown fields.
+//   - 2: adds the memory uuid, the links between memories (by uuid), and the
+//     origin (instance id) of the exporting database.
+const (
+	FormatVersionV1 = 1
+	// FormatVersion is the latest version, written by default.
+	FormatVersion = 2
+)
 
 // Dump is the JSON export of a database (or of one namespace).
 type Dump struct {
 	FormatVersion int             `json:"format_version"`
 	SchemaVersion int             `json:"schema_version"`
 	ExportedAt    time.Time       `json:"exported_at"`
+	Origin        string          `json:"origin,omitempty"` // instance id of the exporting database (v2)
 	Namespaces    []DumpNamespace `json:"namespaces"`
 	Memories      []DumpMemory    `json:"memories"`
+	Links         []DumpLink      `json:"links,omitempty"` // v2
+
+	// DroppedLinks counts links left out because one end is not in the
+	// export (namespace-scoped export). Not part of the file.
+	DroppedLinks int `json:"-"`
+}
+
+// DumpLink is an exported link between two memories, identified by uuid.
+type DumpLink struct {
+	Src       string    `json:"src_uuid"`
+	Dst       string    `json:"dst_uuid"`
+	Kind      LinkKind  `json:"kind"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // DumpNamespace is an exported namespace.
@@ -45,13 +68,21 @@ type DumpHistory struct {
 
 // ExportOptions restricts Export.
 type ExportOptions struct {
-	Namespace   string // empty = everything; must exist otherwise
-	WithHistory bool
+	Namespace     string // empty = everything; must exist otherwise
+	WithHistory   bool
+	FormatVersion int // 0 = latest (FormatVersion); FormatVersionV1 for older binaries
 }
 
 // Export returns every memory (archived included) and namespace, ordered by id.
 func (s *Store) Export(ctx context.Context, opt ExportOptions) (Dump, error) {
-	d := Dump{FormatVersion: FormatVersion, ExportedAt: time.Now().UTC(), Namespaces: []DumpNamespace{}, Memories: []DumpMemory{}}
+	version := opt.FormatVersion
+	if version == 0 {
+		version = FormatVersion
+	}
+	if version != FormatVersionV1 && version != FormatVersion {
+		return Dump{}, &ValidationError{Field: "format_version", Msg: fmt.Sprintf("cannot export version %d; use 1 or %d", version, FormatVersion)}
+	}
+	d := Dump{FormatVersion: version, ExportedAt: time.Now().UTC(), Namespaces: []DumpNamespace{}, Memories: []DumpMemory{}}
 	var err error
 	if d.SchemaVersion, err = s.SchemaVersion(ctx); err != nil {
 		return Dump{}, err
@@ -96,9 +127,10 @@ func (s *Store) Export(ctx context.Context, opt ExportOptions) (Dump, error) {
 		return Dump{}, err
 	}
 	for _, m := range ms {
-		// Format v1 has no uuid, and older binaries reject unknown fields on
-		// import: keep the export readable by them until format v2 lands.
-		m.UUID = ""
+		if version == FormatVersionV1 {
+			// v1 has no uuid and older binaries reject unknown fields.
+			m.UUID = ""
+		}
 		dm := DumpMemory{Memory: m}
 		if opt.WithHistory {
 			hs, err := s.History(ctx, m.ID)
@@ -113,7 +145,57 @@ func (s *Store) Export(ctx context.Context, opt ExportOptions) (Dump, error) {
 		}
 		d.Memories = append(d.Memories, dm)
 	}
+	if version >= 2 {
+		if d.Origin, err = s.InstanceID(ctx); err != nil {
+			return Dump{}, err
+		}
+		if d.Links, d.DroppedLinks, err = s.exportLinks(ctx, d.Memories); err != nil {
+			return Dump{}, err
+		}
+	}
 	return d, nil
+}
+
+// exportLinks returns the links whose two ends are both among ms, ordered by
+// (src, dst, kind) so exports are stable, and the number of links dropped
+// because one end is outside ms.
+func (s *Store) exportLinks(ctx context.Context, ms []DumpMemory) ([]DumpLink, int, error) {
+	in := make(map[string]bool, len(ms))
+	for _, m := range ms {
+		in[m.UUID] = true
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT s.uuid, d.uuid, l.kind, l.created_at
+		FROM memory_links l
+		JOIN memories s ON s.id = l.src_id
+		JOIN memories d ON d.id = l.dst_id
+		ORDER BY s.uuid, d.uuid, l.kind`)
+	if err != nil {
+		return nil, 0, fmt.Errorf("export links: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []DumpLink
+	dropped := 0
+	for rows.Next() {
+		var l DumpLink
+		var kind, created string
+		if err := rows.Scan(&l.Src, &l.Dst, &kind, &created); err != nil {
+			return nil, 0, fmt.Errorf("export links: %w", err)
+		}
+		l.Kind = LinkKind(kind)
+		if l.CreatedAt, err = parseTime(created); err != nil {
+			return nil, 0, err
+		}
+		if !in[l.Src] || !in[l.Dst] {
+			dropped++
+			continue
+		}
+		out = append(out, l)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, fmt.Errorf("export links: %w", err)
+	}
+	return out, dropped, nil
 }
 
 // errDryRun rolls back the import transaction in dry-run mode.
@@ -124,8 +206,10 @@ type ImportReport struct {
 	DryRun            bool    `json:"dry_run"`
 	NamespacesCreated int     `json:"namespaces_created"`
 	Imported          int     `json:"imported"`
-	Skipped           int     `json:"skipped"`      // exact duplicates (namespace + kind + content)
-	ImportedIDs       []int64 `json:"imported_ids"` // new ids, in dump order
+	LinksImported     int     `json:"links_imported"`
+	LinksSkipped      int     `json:"links_skipped"` // already present, or an end is missing from the dump
+	Skipped           int     `json:"skipped"`       // exact duplicates (namespace + kind + content)
+	ImportedIDs       []int64 `json:"imported_ids"`  // new ids, in dump order
 }
 
 // Import loads a dump in one transaction. Memories keep their timestamps,
@@ -136,8 +220,11 @@ type ImportReport struct {
 // counted, then rolled back.
 func (s *Store) Import(ctx context.Context, d Dump, dryRun bool, by string) (ImportReport, error) {
 	rep := ImportReport{DryRun: dryRun, ImportedIDs: []int64{}}
-	if d.FormatVersion != FormatVersion {
-		return rep, &ValidationError{Field: "format_version", Msg: fmt.Sprintf("is %d, this binary reads version %d", d.FormatVersion, FormatVersion)}
+	if d.FormatVersion != FormatVersionV1 && d.FormatVersion != FormatVersion {
+		return rep, &ValidationError{Field: "format_version", Msg: fmt.Sprintf("is %d, this binary reads versions 1 to %d", d.FormatVersion, FormatVersion)}
+	}
+	if err := validateDumpIdentities(d); err != nil {
+		return rep, err
 	}
 	by = normalizeActor(by)
 
@@ -162,17 +249,46 @@ func (s *Store) Import(ctx context.Context, d Dump, dryRun bool, by string) (Imp
 				}
 			}
 		}
+		// dump uuid -> local id, for imported memories and for the existing
+		// duplicates they were skipped for, so links can be restored.
+		local := make(map[string]int64, len(d.Memories))
+		isNew := make(map[int64]bool, len(d.Memories))
 		for i, m := range d.Memories {
 			id, skipped, err := importMemory(ctx, tx, m, by)
 			if err != nil {
 				return fmt.Errorf("memory %d (id %d in the dump): %w", i+1, m.ID, err)
 			}
+			if m.UUID != "" {
+				local[m.UUID] = id
+			}
 			if skipped {
 				rep.Skipped++
 				continue
 			}
+			isNew[id] = true
 			rep.Imported++
 			rep.ImportedIDs = append(rep.ImportedIDs, id)
+		}
+		for i, l := range d.Links {
+			src, dst := local[l.Src], local[l.Dst]
+			if src == 0 || dst == 0 || src == dst {
+				rep.LinksSkipped++
+				continue
+			}
+			added, err := insertLink(ctx, tx, src, dst, l.Kind)
+			if err != nil {
+				return fmt.Errorf("link %d (%s -> %s): %w", i+1, l.Src, l.Dst, err)
+			}
+			if !added {
+				rep.LinksSkipped++
+				continue
+			}
+			rep.LinksImported++
+			if !isNew[src] { // an existing memory changed: say so in its history
+				if err := touchAndRecordLinkHistory(ctx, tx, src, by, fmt.Sprintf("imported link %s -> #%d", l.Kind, dst)); err != nil {
+					return err
+				}
+			}
 		}
 		if dryRun {
 			return errDryRun
@@ -208,15 +324,15 @@ func importMemory(ctx context.Context, tx *sql.Tx, m DumpMemory, by string) (int
 	if err := validateImportance(imp); err != nil {
 		return 0, false, err
 	}
-	var dup int
+	var dupID int64
 	err = tx.QueryRowContext(ctx,
-		"SELECT count(*) FROM memories WHERE namespace = ? AND kind = ? AND content = ?",
-		ns, string(m.Kind), content).Scan(&dup)
-	if err != nil {
-		return 0, false, fmt.Errorf("check duplicate: %w", err)
+		"SELECT id FROM memories WHERE namespace = ? AND kind = ? AND content = ? ORDER BY id LIMIT 1",
+		ns, string(m.Kind), content).Scan(&dupID)
+	if err == nil {
+		return dupID, true, nil
 	}
-	if dup > 0 {
-		return 0, true, nil
+	if !errors.Is(err, sql.ErrNoRows) {
+		return 0, false, fmt.Errorf("check duplicate: %w", err)
 	}
 	if err := ensureNamespace(ctx, tx, ns); err != nil {
 		return 0, false, err
@@ -274,4 +390,32 @@ func importMemory(ctx context.Context, tx *sql.Tx, m DumpMemory, by string) (int
 		}
 	}
 	return id, false, nil
+}
+
+// validateDumpIdentities checks the uuids and links of a dump before anything
+// is written. Memories may lack a uuid (version 1, or a hand-built dump); when
+// present it must be well formed and unique.
+func validateDumpIdentities(d Dump) error {
+	seen := make(map[string]bool, len(d.Memories))
+	for i, m := range d.Memories {
+		if m.UUID == "" {
+			continue
+		}
+		if !validUUID(m.UUID) {
+			return &ValidationError{Field: "memories.uuid", Msg: fmt.Sprintf("memory %d: %q is not a valid uuid", i+1, m.UUID)}
+		}
+		if seen[m.UUID] {
+			return &ValidationError{Field: "memories.uuid", Msg: fmt.Sprintf("memory %d: uuid %s appears twice", i+1, m.UUID)}
+		}
+		seen[m.UUID] = true
+	}
+	for i, l := range d.Links {
+		if err := validateLinkKind(l.Kind); err != nil {
+			return fmt.Errorf("link %d: %w", i+1, err)
+		}
+		if !validUUID(l.Src) || !validUUID(l.Dst) {
+			return &ValidationError{Field: "links", Msg: fmt.Sprintf("link %d: src_uuid and dst_uuid must be valid uuids", i+1)}
+		}
+	}
+	return nil
 }

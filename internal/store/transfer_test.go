@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"sort"
+	"strings"
 	"testing"
 	"time"
 )
@@ -32,6 +34,8 @@ func populated(t *testing.T) *Store {
 // normalize clears what legitimately differs between two databases.
 func normalize(d Dump) Dump {
 	d.ExportedAt = time.Time{}
+	d.Origin = ""
+	d.Links = nil // compared separately, by content (uuids are not kept by Import)
 	for i := range d.Namespaces {
 		d.Namespaces[i].CreatedAt = time.Time{} // "global" is created by each database
 	}
@@ -86,6 +90,9 @@ func TestExportImportRoundTrip(t *testing.T) {
 		d2, err := dst.Export(ctx, ExportOptions{WithHistory: withHistory})
 		if err != nil {
 			t.Fatal(err)
+		}
+		if got, want := linkKeys(d2), linkKeys(d); strings.Join(got, "\n") != strings.Join(want, "\n") || len(want) != 1 {
+			t.Errorf("links after round trip = %q, want %q (one supersedes link)", got, want)
 		}
 		if !withHistory {
 			// The importer records its own "create" line; compare memories only.
@@ -275,5 +282,192 @@ func TestExportImportPreservesExpiresAt(t *testing.T) {
 	}
 	if got.ExpiresAt == nil || !got.ExpiresAt.Equal(*m.ExpiresAt) {
 		t.Fatalf("ExpiresAt = %v, want %v", got.ExpiresAt, m.ExpiresAt)
+	}
+}
+
+// linkKeys describes the links of a dump by the content of their ends, which
+// survives an import that assigns fresh uuids.
+func linkKeys(d Dump) []string {
+	content := map[string]string{}
+	for _, m := range d.Memories {
+		content[m.UUID] = m.Namespace + "/" + m.Content
+	}
+	out := []string{}
+	for _, l := range d.Links {
+		out = append(out, content[l.Src]+" -"+string(l.Kind)+"-> "+content[l.Dst])
+	}
+	sort.Strings(out)
+	return out
+}
+
+func TestExportV2IdentityAndLinks(t *testing.T) {
+	ctx := context.Background()
+	src := populated(t)
+	d, err := src.Export(ctx, ExportOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inst, _ := src.InstanceID(ctx)
+	if d.FormatVersion != 2 || d.Origin != inst || len(d.Links) != 1 || d.DroppedLinks != 0 {
+		t.Fatalf("dump: version %d origin %q links %+v dropped %d", d.FormatVersion, d.Origin, d.Links, d.DroppedLinks)
+	}
+	for _, m := range d.Memories {
+		if !validUUID(m.UUID) {
+			t.Errorf("memory %d: uuid %q", m.ID, m.UUID)
+		}
+	}
+	if l := d.Links[0]; l.Kind != LinkSupersedes || l.Src == l.Dst || l.CreatedAt.IsZero() {
+		t.Errorf("link: %+v", l)
+	}
+	// Stable output: exporting twice gives the same links in the same order.
+	d2, _ := src.Export(ctx, ExportOptions{})
+	if asJSON(t, d.Links) != asJSON(t, d2.Links) {
+		t.Error("link order is not stable")
+	}
+}
+
+func TestExportV1HasNoV2Fields(t *testing.T) {
+	ctx := context.Background()
+	d, err := populated(t).Export(ctx, ExportOptions{FormatVersion: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.FormatVersion != 1 || d.Origin != "" || len(d.Links) != 0 {
+		t.Errorf("v1 dump: %+v", d)
+	}
+	b := asJSON(t, d)
+	for _, key := range []string{`"origin"`, `"links"`} {
+		if strings.Contains(b, key) {
+			t.Errorf("v1 JSON contains %s", key)
+		}
+	}
+	for _, m := range d.Memories {
+		if m.UUID != "" {
+			t.Errorf("v1 memory has uuid %q", m.UUID)
+		}
+	}
+	// Still importable.
+	if rep, err := newTestStore(t).Import(ctx, d, false, "cli"); err != nil || rep.Imported != 5 || rep.LinksImported != 0 {
+		t.Errorf("import v1: %+v, %v", rep, err)
+	}
+	var ve *ValidationError
+	if _, err := populated(t).Export(ctx, ExportOptions{FormatVersion: 3}); !errors.As(err, &ve) {
+		t.Errorf("export v3: %v", err)
+	}
+}
+
+func TestExportNamespaceDropsCrossLinks(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	_, _ = s.EnsureNamespace(ctx, "demo", "")
+	a, _ := s.Create(ctx, NewMemory{Namespace: "demo", Kind: KindFact, Content: "a", Source: "t"})
+	b, _ := s.Create(ctx, NewMemory{Kind: KindFact, Content: "b", Source: "t"})
+	c, _ := s.Create(ctx, NewMemory{Namespace: "demo", Kind: KindFact, Content: "c", Source: "t"})
+	if err := s.AddLink(ctx, a.ID, b.ID, LinkRelatesTo, "t"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AddLink(ctx, a.ID, c.ID, LinkRelatesTo, "t"); err != nil {
+		t.Fatal(err)
+	}
+	d, err := s.Export(ctx, ExportOptions{Namespace: "demo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(d.Links) != 1 || d.DroppedLinks != 1 {
+		t.Errorf("links %d dropped %d, want 1 and 1", len(d.Links), d.DroppedLinks)
+	}
+}
+
+func TestImportRestoresLinksAndIsIdempotent(t *testing.T) {
+	ctx := context.Background()
+	d, _ := populated(t).Export(ctx, ExportOptions{})
+	var back Dump
+	if err := json.Unmarshal([]byte(asJSON(t, d)), &back); err != nil {
+		t.Fatal(err)
+	}
+	dst := newTestStore(t)
+	rep, err := dst.Import(ctx, back, false, "cli")
+	if err != nil || rep.LinksImported != 1 || rep.LinksSkipped != 0 {
+		t.Fatalf("first import: %+v, %v", rep, err)
+	}
+	// The link is on the right memories.
+	var n int
+	if err := dst.db.QueryRowContext(ctx, `
+		SELECT count(*) FROM memory_links l
+		JOIN memories s ON s.id = l.src_id JOIN memories d ON d.id = l.dst_id
+		WHERE l.kind = 'supersedes' AND s.content = 'PostgreSQL pour JSONB' AND d.content = 'MySQL'`).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("restored link count = %d, %v", n, err)
+	}
+	// Second import: everything is a duplicate, the link already exists, and
+	// the existing source memory is not touched.
+	before, _ := dst.History(ctx, rep.ImportedIDs[1])
+	rep, err = dst.Import(ctx, back, false, "cli")
+	if err != nil || rep.Imported != 0 || rep.LinksImported != 0 || rep.LinksSkipped != 1 {
+		t.Fatalf("second import: %+v, %v", rep, err)
+	}
+	if after, _ := dst.History(ctx, before[0].MemoryID); len(after) != len(before) {
+		t.Errorf("history grew on a no-op import: %d -> %d", len(before), len(after))
+	}
+}
+
+func TestImportLinkOnExistingMemoryRecordsHistory(t *testing.T) {
+	ctx := context.Background()
+	dst := newTestStore(t)
+	a, _ := dst.Create(ctx, NewMemory{Kind: KindFact, Content: "a", Source: "t"})
+	b, _ := dst.Create(ctx, NewMemory{Kind: KindFact, Content: "b", Source: "t"})
+	const ua, ub = "11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222"
+	d := Dump{FormatVersion: 2,
+		Memories: []DumpMemory{
+			{Memory: Memory{UUID: ua, Namespace: "global", Kind: KindFact, Content: "a"}},
+			{Memory: Memory{UUID: ub, Namespace: "global", Kind: KindFact, Content: "b"}},
+		},
+		Links: []DumpLink{{Src: ua, Dst: ub, Kind: LinkRelatesTo}},
+	}
+	rep, err := dst.Import(ctx, d, false, "cli")
+	if err != nil || rep.Skipped != 2 || rep.LinksImported != 1 {
+		t.Fatalf("import: %+v, %v", rep, err)
+	}
+	h, _ := dst.History(ctx, a.ID)
+	if len(h) != 2 || h[1].Action != ActionUpdate {
+		t.Errorf("history of the linked existing memory: %+v", h)
+	}
+	if h, _ := dst.History(ctx, b.ID); len(h) != 1 {
+		t.Errorf("target memory history changed: %+v", h)
+	}
+}
+
+func TestImportRejectsBadIdentities(t *testing.T) {
+	ctx := context.Background()
+	const u1, u2 = "11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222"
+	mem := func(u, c string) DumpMemory {
+		return DumpMemory{Memory: Memory{UUID: u, Namespace: "x", Kind: KindFact, Content: c}}
+	}
+	cases := map[string]Dump{
+		"bad uuid":       {FormatVersion: 2, Memories: []DumpMemory{mem("nope", "a")}},
+		"duplicate uuid": {FormatVersion: 2, Memories: []DumpMemory{mem(u1, "a"), mem(u1, "b")}},
+		"bad link kind":  {FormatVersion: 2, Memories: []DumpMemory{mem(u1, "a"), mem(u2, "b")}, Links: []DumpLink{{Src: u1, Dst: u2, Kind: "bogus"}}},
+		"bad link uuid":  {FormatVersion: 2, Memories: []DumpMemory{mem(u1, "a")}, Links: []DumpLink{{Src: u1, Dst: "zzz", Kind: LinkRelatesTo}}},
+	}
+	for name, d := range cases {
+		s := newTestStore(t)
+		if _, err := s.Import(ctx, d, false, "cli"); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+		if all, _ := s.List(ctx, ListFilter{Archived: IncludeArchived}); len(all) != 0 {
+			t.Errorf("%s: left %d memories", name, len(all))
+		}
+	}
+	// A link whose end is not in the dump is skipped, not fatal; so is a self link
+	// produced when two dump memories collapse onto one existing duplicate.
+	s := newTestStore(t)
+	d := Dump{FormatVersion: 2, Memories: []DumpMemory{mem(u1, "a")},
+		Links: []DumpLink{{Src: u1, Dst: u2, Kind: LinkRelatesTo}}}
+	if rep, err := s.Import(ctx, d, false, "cli"); err != nil || rep.LinksSkipped != 1 || rep.LinksImported != 0 {
+		t.Errorf("dangling link: %+v, %v", rep, err)
+	}
+	d = Dump{FormatVersion: 2, Memories: []DumpMemory{mem(u1, "a"), mem(u2, "a")},
+		Links: []DumpLink{{Src: u1, Dst: u2, Kind: LinkRelatesTo}}}
+	if rep, err := s.Import(ctx, d, false, "cli"); err != nil || rep.LinksSkipped != 1 {
+		t.Errorf("collapsed self link: %+v, %v", rep, err)
 	}
 }

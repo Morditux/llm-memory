@@ -160,20 +160,3 @@ func TestMigrateFromV4BackfillsUUIDs(t *testing.T) {
 		t.Errorf("InstanceID after migration = %q, %v", id, err)
 	}
 }
-
-func TestExportV1OmitsUUID(t *testing.T) {
-	ctx := context.Background()
-	s := newTestStore(t)
-	if _, err := s.Create(ctx, NewMemory{Kind: KindFact, Content: "x", Source: "test"}); err != nil {
-		t.Fatal(err)
-	}
-	d, err := s.Export(ctx, ExportOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, m := range d.Memories {
-		if m.UUID != "" {
-			t.Errorf("format v1 export leaks uuid %q", m.UUID)
-		}
-	}
-}

@@ -248,7 +248,7 @@ func TestExportImportCLI(t *testing.T) {
 	}
 	stdoutDump := cliOK(t, "export", "--history", "--db", db)
 	var d store.Dump
-	if err := json.Unmarshal([]byte(stdoutDump), &d); err != nil || d.FormatVersion != 1 || len(d.Memories) != 4 {
+	if err := json.Unmarshal([]byte(stdoutDump), &d); err != nil || d.FormatVersion != 2 || d.Origin == "" || len(d.Memories) != 4 {
 		t.Fatalf("stdout export: %v %+v", err, d)
 	}
 	if ns := cliOK(t, "export", "--namespace", "demo", "--db", db); strings.Contains(ns, "Réponses courtes") {
@@ -273,6 +273,15 @@ func TestExportImportCLI(t *testing.T) {
 	// Same listing on both sides.
 	if a, b := cliOK(t, "list", "--archived", "--db", db), cliOK(t, "list", "--archived", "--db", dst); a != b {
 		t.Errorf("listings differ after import\n--- source ---\n%s\n--- destination ---\n%s", a, b)
+	}
+
+	// Format version 1, for older releases: no origin, still importable here.
+	var v1 store.Dump
+	if err := json.Unmarshal([]byte(cliOK(t, "export", "--format-version", "1", "--db", db)), &v1); err != nil || v1.FormatVersion != 1 || v1.Origin != "" {
+		t.Errorf("v1 export: %v %+v", err, v1)
+	}
+	if r := cli(t, "", "export", "--format-version", "7", "--db", db); r.err == nil || !strings.Contains(r.err.Error(), "cannot export version 7") {
+		t.Errorf("export v7: %+v", r)
 	}
 
 	bad := filepath.Join(dir, "bad.json")

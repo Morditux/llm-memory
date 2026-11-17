@@ -457,6 +457,7 @@ func (a app) cmdExport(ctx context.Context, args []string) error {
 	flags := config.Register(fs)
 	withHistory := fs.Bool("history", false, "include the history of each memory")
 	outPath := fs.String("o", "", "write to this file instead of stdout")
+	version := fs.Int("format-version", store.FormatVersion, "export format version; use 1 for a file that older llm-memory releases can import")
 	if _, err := parse(fs, args, 0, 0); err != nil {
 		return err
 	}
@@ -465,9 +466,12 @@ func (a app) cmdExport(ctx context.Context, args []string) error {
 		return err
 	}
 	defer func() { _ = st.Close() }()
-	d, err := st.Export(ctx, store.ExportOptions{Namespace: namespaceFilter(fs, cfg), WithHistory: *withHistory})
+	d, err := st.Export(ctx, store.ExportOptions{Namespace: namespaceFilter(fs, cfg), WithHistory: *withHistory, FormatVersion: *version})
 	if err != nil {
 		return err
+	}
+	if d.DroppedLinks > 0 {
+		fmt.Fprintf(a.stderr, "Note: %d link(s) to memories outside this export were left out.\n", d.DroppedLinks)
 	}
 	encode := func(w io.Writer) error {
 		enc := json.NewEncoder(w)
@@ -534,6 +538,9 @@ func (a app) cmdImport(ctx context.Context, args []string) error {
 	}
 	fmt.Fprintf(a.stdout, "%s%d imported, %d skipped (exact duplicates), %d namespace(s) created.\n",
 		prefix, rep.Imported, rep.Skipped, rep.NamespacesCreated)
+	if len(d.Links) > 0 {
+		fmt.Fprintf(a.stdout, "%s%d link(s) imported, %d skipped.\n", prefix, rep.LinksImported, rep.LinksSkipped)
+	}
 	return nil
 }
 

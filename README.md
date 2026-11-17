@@ -243,8 +243,8 @@ llm-memory search [--tag db] [--json] postgres jsonb   # same engine as recall
 llm-memory context --namespace demo [--focus Q] [--json] # exactly what get_context would return
 llm-memory restore 42                    # un-archives
 llm-memory purge --archived-before 2026-01-01 [--yes]   # permanent deletion
-llm-memory export [--namespace X] [--history] [-o dump.json]
-llm-memory import [--dry-run] dump.json  # or - for stdin; exact duplicates are skipped
+llm-memory export [--namespace X] [--history] [--format-version 1|2] [-o dump.json]
+llm-memory import [--dry-run] dump.json  # or - for stdin; exact duplicates are skipped, links are restored (format 2)
 llm-memory stats [--json]                # per namespace, kind, source; file size
 llm-memory namespace <list|rename|merge|archive> ... # manage namespaces
 llm-memory gc [--json]                   # archive expired (TTL) memories
@@ -310,7 +310,9 @@ How it works:
 
 - **JSON export** (recommended, readable and portable): `llm-memory export --history -o backup.json`.
   The file is created with mode 0600. Restore: `llm-memory import backup.json` into an empty or
-  existing database (memories already present identically are skipped).
+  existing database (memories already present identically are skipped). Exports are format 2 by
+  default (memory uuids, links, origin); older releases cannot read them, so use
+  `--format-version 1` to produce a file they can import.
 - **File copy**: close the clients, then copy `memory.db` **and** `memory.db-wal` if it exists
   (WAL mode). With clients open, prefer `sqlite3 memory.db ".backup copy.db"`.
 - Never store secrets in the memory: it is stored in clear text on disk.
