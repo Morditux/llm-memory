@@ -166,16 +166,24 @@ Checked against `internal/store`:
 | `Update` (fields, expiry) | yes | `memories.go:307` |
 | `Archive` / `Supersede` target / `ArchiveExpired` | yes | `memories.go:381` |
 | `Restore` | yes | `memories.go:422` |
-| `AddLink` / `RemoveLink` | yes (source memory) | `links.go:52` |
-| `RenameNamespace` / `MergeNamespace` | yes, every affected memory | `namespaces.go:179,225` |
+| `AddLink` / `RemoveLink` | **no** (history only) | `links.go` (`recordLinkHistory`) |
+| `RenameNamespace` / `MergeNamespace` | **no** (history only) | `namespaces.go` (`recordNamespaceHistory`) |
 | `Supersede` link insert | **no** for the source memory | `links.go` (`insertLink` called directly) |
 | `PurgeArchived` | n/a, **hard delete** | `maintenance.go:44` |
 
 Findings:
 
-- Every in-place state change is covered. Timestamps have millisecond
-  precision (`%f`) and are RFC 3339 UTC strings, so lexicographic comparison is
-  chronological. Ties are rare but possible, hence the `origin` tie-break.
+- Content/lifecycle state changes (`Update`, `Archive`, `Restore`) bump
+  `updated_at`. Timestamps have millisecond precision (`%f`) and are RFC 3339
+  UTC strings, so lexicographic comparison is chronological.
+- `AddLink`, `RemoveLink`, `RenameNamespace`, and `MergeNamespace` record
+  `memory_history` entries without bumping `updated_at` / `updated_by` (so
+  moves and link edits do not re-rank briefings, hijack attribution, or make a
+  merged source handoff outrank a newer destination handoff). Links already
+  merge as a set union, so `AddLink`/`RemoveLink` not bumping `updated_at` is
+  harmless. For `RenameNamespace`/`MergeNamespace`, if a memory has not been
+  edited otherwise, `import --merge` sees equal `updated_at` and falls back to
+  the canonical tie-break on `namespace`.
 - `Supersede` adds a `supersedes` link on the source memory without touching
   it. Harmless for merge because links are merged as a set union rather than by
   row timestamp, but it must not be relied on as a change signal for

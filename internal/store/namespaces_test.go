@@ -101,27 +101,29 @@ func TestNamespaceRenameMergeArchive(t *testing.T) {
 	}
 
 	// Create two namespaces with memories and handoffs.
-	m1, err := s.Create(ctx, NewMemory{Namespace: "alpha", Kind: KindFact, Content: "fact alpha"})
+	m1, err := s.Create(ctx, NewMemory{Namespace: "alpha", Kind: KindFact, Content: "fact alpha", Source: "carol"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	h1, err := s.Create(ctx, NewMemory{Namespace: "alpha", Kind: KindHandoff, Content: "handoff alpha"})
+	h1, err := s.Create(ctx, NewMemory{Namespace: "alpha", Kind: KindHandoff, Content: "handoff alpha", Source: "carol"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = s.Create(ctx, NewMemory{Namespace: "beta", Kind: KindHandoff, Content: "handoff beta"})
+	tick()
+	h2, err := s.Create(ctx, NewMemory{Namespace: "beta", Kind: KindHandoff, Content: "handoff beta", Source: "dave"})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// Rename alpha -> gamma records an update history row.
+	// Rename alpha -> gamma records an update history row without altering updated_at/updated_by.
+	tick()
 	got, err := s.RenameNamespace(ctx, "alpha", "gamma", "alice")
 	if err != nil || got != "gamma" {
 		t.Fatalf("RenameNamespace = %q, %v", got, err)
 	}
 	m1After, err := s.Get(ctx, m1.ID)
-	if err != nil || m1After.Namespace != "gamma" || m1After.UpdatedBy != "alice" {
-		t.Fatalf("m1 = %+v, %v", m1After, err)
+	if err != nil || m1After.Namespace != "gamma" || !m1After.UpdatedAt.Equal(m1.UpdatedAt) || m1After.UpdatedBy != "carol" {
+		t.Fatalf("m1 = %+v (want namespace=gamma, updated_at=%v, updated_by=carol), %v", m1After, m1.UpdatedAt, err)
 	}
 	hist1, err := s.History(ctx, m1.ID)
 	if err != nil || len(hist1) != 2 || hist1[1].Action != ActionUpdate || hist1[1].ChangedBy != "alice" {
@@ -136,13 +138,19 @@ func TestNamespaceRenameMergeArchive(t *testing.T) {
 		t.Error("expected error renaming onto existing namespace")
 	}
 
-	// Merge gamma into beta records update history on moved rows and archive on displaced handoff.
+	// Merge gamma into beta records update history on moved rows, keeps the newer
+	// destination handoff h2 active, and archives the older source handoff h1.
+	tick()
 	moved, err := s.MergeNamespace(ctx, "gamma", "beta", "bob")
 	if err != nil || moved != 2 {
 		t.Fatalf("MergeNamespace = %d, %v", moved, err)
 	}
 	if _, err := s.RequireNamespace(ctx, "gamma"); err == nil {
 		t.Error("gamma should have been deleted after merge")
+	}
+	m1AfterMerge, err := s.Get(ctx, m1.ID)
+	if err != nil || !m1AfterMerge.UpdatedAt.Equal(m1.UpdatedAt) || m1AfterMerge.UpdatedBy != "carol" {
+		t.Fatalf("m1 after merge = %+v (want updated_at=%v, updated_by=carol), %v", m1AfterMerge, m1.UpdatedAt, err)
 	}
 	hist1, err = s.History(ctx, m1.ID)
 	if err != nil || len(hist1) != 3 || hist1[2].Action != ActionUpdate || hist1[2].ChangedBy != "bob" {
@@ -153,11 +161,15 @@ func TestNamespaceRenameMergeArchive(t *testing.T) {
 		t.Fatalf("m1 merge snapshot = %+v, %q, %v", snap2, reason2, err)
 	}
 	handoffs, err := s.List(ctx, ListFilter{Namespace: "beta", Kinds: []Kind{KindHandoff}})
-	if err != nil || len(handoffs) != 1 {
-		t.Fatalf("active handoffs in beta = %d, %v", len(handoffs), err)
+	if err != nil || len(handoffs) != 1 || handoffs[0].ID != h2.ID || handoffs[0].UpdatedBy != "dave" {
+		t.Fatalf("active handoffs in beta = %+v (want #%d by dave), %v", handoffs, h2.ID, err)
+	}
+	h1After, err := s.Get(ctx, h1.ID)
+	if err != nil || !h1After.Archived() {
+		t.Fatalf("older handoff h1 should be archived after merge: %+v, %v", h1After, err)
 	}
 	h1Hist, err := s.History(ctx, h1.ID)
-	if err != nil || len(h1Hist) < 3 {
+	if err != nil || len(h1Hist) != 4 {
 		t.Fatalf("h1 history = %+v, %v", h1Hist, err)
 	}
 
@@ -169,5 +181,72 @@ func TestNamespaceRenameMergeArchive(t *testing.T) {
 	active, err := s.List(ctx, ListFilter{Namespace: "beta"})
 	if err != nil || len(active) != 0 {
 		t.Fatalf("active in beta after archive = %d, %v", len(active), err)
+	}
+}
+
+func TestNamespaceMovesPreserveRecencyAndNewerSourceHandoff(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+
+	// f1 (created first) is updated after f2 so f1 is more recent despite lower id.
+	f1, err := s.Create(ctx, NewMemory{Namespace: "src", Kind: KindFact, Content: "fact 1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tick()
+	f2, err := s.Create(ctx, NewMemory{Namespace: "src", Kind: KindFact, Content: "fact 2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tick()
+	updatedContent := "fact 1 edited"
+	if _, err := s.Update(ctx, f1.ID, Patch{Content: &updatedContent}, "editor"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Rename must preserve recency order (f1 before f2) instead of collapsing updated_at.
+	tick()
+	if _, err := s.RenameNamespace(ctx, "src", "renamed", "cli"); err != nil {
+		t.Fatal(err)
+	}
+	facts, err := s.List(ctx, ListFilter{Namespace: "renamed", Kinds: []Kind{KindFact}})
+	if err != nil || len(facts) != 2 || facts[0].ID != f1.ID || facts[1].ID != f2.ID {
+		t.Fatalf("facts order after rename = %+v (want #%d then #%d), %v", facts, f1.ID, f2.ID, err)
+	}
+
+	// Destination fact and older handoff, followed by a newer source handoff.
+	tick()
+	dstFact, err := s.Create(ctx, NewMemory{Namespace: "dst", Kind: KindFact, Content: "dst fact"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tick()
+	dstHandoff, err := s.Create(ctx, NewMemory{Namespace: "dst", Kind: KindHandoff, Content: "dst handoff", Source: "dst-agent"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tick()
+	srcHandoff, err := s.Create(ctx, NewMemory{Namespace: "renamed", Kind: KindHandoff, Content: "src handoff", Source: "src-agent"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tick()
+	if _, err := s.MergeNamespace(ctx, "renamed", "dst", "cli"); err != nil {
+		t.Fatal(err)
+	}
+	// Newer source handoff stays active with its original author; older destination handoff is archived.
+	handoffs, err := s.List(ctx, ListFilter{Namespace: "dst", Kinds: []Kind{KindHandoff}})
+	if err != nil || len(handoffs) != 1 || handoffs[0].ID != srcHandoff.ID || handoffs[0].UpdatedBy != "src-agent" {
+		t.Fatalf("active handoff after merge = %+v (want #%d by src-agent), %v", handoffs, srcHandoff.ID, err)
+	}
+	dstHandoffAfter, err := s.Get(ctx, dstHandoff.ID)
+	if err != nil || !dstHandoffAfter.Archived() {
+		t.Fatalf("older destination handoff should be archived: %+v, %v", dstHandoffAfter, err)
+	}
+	// Destination fact remains ranked ahead of older moved facts.
+	allFacts, err := s.List(ctx, ListFilter{Namespace: "dst", Kinds: []Kind{KindFact}})
+	if err != nil || len(allFacts) != 3 || allFacts[0].ID != dstFact.ID || allFacts[1].ID != f1.ID || allFacts[2].ID != f2.ID {
+		t.Fatalf("facts order after merge = %+v (want #%d, #%d, #%d), %v", allFacts, dstFact.ID, f1.ID, f2.ID, err)
 	}
 }

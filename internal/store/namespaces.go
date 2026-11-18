@@ -175,11 +175,6 @@ func (s *Store) RenameNamespace(ctx context.Context, oldName, newName, by string
 			return fmt.Errorf("rename namespace %q to %q: %w", oldNS, newNS, err)
 		}
 		if len(ids) > 0 {
-			if _, err := tx.ExecContext(ctx,
-				"UPDATE memories SET updated_at = "+sqlNow+", updated_by = ? WHERE namespace = ?",
-				by, newNS); err != nil {
-				return fmt.Errorf("update memories after rename %q to %q: %w", oldNS, newNS, err)
-			}
 			if err := recordNamespaceHistory(ctx, tx, ids, by, fmt.Sprintf("namespace renamed %q -> %q", oldNS, newNS)); err != nil {
 				return err
 			}
@@ -222,8 +217,8 @@ func (s *Store) MergeNamespace(ctx context.Context, src, dst, by string) (int64,
 			return fmt.Errorf("list memories in %q: %w", srcNS, err)
 		}
 		res, err := tx.ExecContext(ctx,
-			"UPDATE memories SET namespace = ?, updated_at = "+sqlNow+", updated_by = ? WHERE namespace = ?",
-			dstNS, by, srcNS)
+			"UPDATE memories SET namespace = ? WHERE namespace = ?",
+			dstNS, srcNS)
 		if err != nil {
 			return fmt.Errorf("move memories from %q to %q: %w", srcNS, dstNS, err)
 		}

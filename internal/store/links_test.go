@@ -59,11 +59,18 @@ func TestMemoryLinksAndSupersede(t *testing.T) {
 	}
 
 	// AddLink / duplicate AddLink (idempotent, no extra history) / RemoveLink.
+	// Neither operation alters updated_at or updated_by on the source memory.
+	tick()
 	if err := s.AddLink(ctx, m3.ID, m1.ID, LinkRelatesTo, "alice"); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.AddLink(ctx, m3.ID, m1.ID, LinkRelatesTo, "alice"); err != nil {
 		t.Fatal(err)
+	}
+	m3AfterAdd, err := s.Get(ctx, m3.ID)
+	if err != nil || !m3AfterAdd.UpdatedAt.Equal(m3.UpdatedAt) || m3AfterAdd.UpdatedBy != m3.UpdatedBy {
+		t.Fatalf("AddLink altered updated_at/updated_by: got (%v, %q), want (%v, %q), err=%v",
+			m3AfterAdd.UpdatedAt, m3AfterAdd.UpdatedBy, m3.UpdatedAt, m3.UpdatedBy, err)
 	}
 	hist3, err := s.History(ctx, m3.ID)
 	if err != nil || len(hist3) != 2 || hist3[1].Action != ActionUpdate || hist3[1].ChangedBy != "alice" {
@@ -72,8 +79,14 @@ func TestMemoryLinksAndSupersede(t *testing.T) {
 	if _, reason, err := hist3[1].Decode(); err != nil || reason != fmt.Sprintf("added link relates_to -> #%d", m1.ID) {
 		t.Fatalf("AddLink history reason = %q, %v", reason, err)
 	}
+	tick()
 	if err := s.RemoveLink(ctx, m3.ID, m1.ID, LinkRelatesTo, "bob"); err != nil {
 		t.Fatal(err)
+	}
+	m3AfterRemove, err := s.Get(ctx, m3.ID)
+	if err != nil || !m3AfterRemove.UpdatedAt.Equal(m3.UpdatedAt) || m3AfterRemove.UpdatedBy != m3.UpdatedBy {
+		t.Fatalf("RemoveLink altered updated_at/updated_by: got (%v, %q), want (%v, %q), err=%v",
+			m3AfterRemove.UpdatedAt, m3AfterRemove.UpdatedBy, m3.UpdatedAt, m3.UpdatedBy, err)
 	}
 	hist3, err = s.History(ctx, m3.ID)
 	if err != nil || len(hist3) != 3 || hist3[2].Action != ActionUpdate || hist3[2].ChangedBy != "bob" {

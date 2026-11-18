@@ -47,12 +47,7 @@ func insertLink(ctx context.Context, q queryer, srcID, dstID int64, kind LinkKin
 	return n > 0, nil
 }
 
-func touchAndRecordLinkHistory(ctx context.Context, tx *sql.Tx, srcID int64, by, reason string) error {
-	if _, err := tx.ExecContext(ctx,
-		"UPDATE memories SET updated_at = "+sqlNow+", updated_by = ? WHERE id = ?",
-		by, srcID); err != nil {
-		return fmt.Errorf("update memory #%d for link history: %w", srcID, err)
-	}
+func recordLinkHistory(ctx context.Context, tx *sql.Tx, srcID int64, by, reason string) error {
 	_, err := writeHistory(ctx, tx, srcID, ActionUpdate, by, reason)
 	return err
 }
@@ -66,7 +61,7 @@ func (s *Store) AddLink(ctx context.Context, srcID, dstID int64, kind LinkKind, 
 		if err != nil || !inserted {
 			return err
 		}
-		return touchAndRecordLinkHistory(ctx, tx, srcID, by, fmt.Sprintf("added link %s -> #%d", kind, dstID))
+		return recordLinkHistory(ctx, tx, srcID, by, fmt.Sprintf("added link %s -> #%d", kind, dstID))
 	})
 }
 
@@ -95,7 +90,7 @@ func (s *Store) RemoveLink(ctx context.Context, srcID, dstID int64, kind LinkKin
 		if n == 0 {
 			return &ValidationError{Field: "link", Msg: fmt.Sprintf("no %s link from #%d to #%d", kind, srcID, dstID)}
 		}
-		return touchAndRecordLinkHistory(ctx, tx, srcID, by, fmt.Sprintf("removed link %s -> #%d", kind, dstID))
+		return recordLinkHistory(ctx, tx, srcID, by, fmt.Sprintf("removed link %s -> #%d", kind, dstID))
 	})
 }
 

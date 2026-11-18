@@ -268,7 +268,7 @@ func (s *Store) Import(ctx context.Context, d Dump, dryRun bool, by string) (Imp
 			}
 			rep.LinksImported++
 			if !isNew[src] { // an existing memory changed: say so in its history
-				if err := touchAndRecordLinkHistory(ctx, tx, src, by, fmt.Sprintf("imported link %s -> #%d", l.Kind, dst)); err != nil {
+				if err := recordLinkHistory(ctx, tx, src, by, fmt.Sprintf("imported link %s -> #%d", l.Kind, dst)); err != nil {
 					return err
 				}
 			}
