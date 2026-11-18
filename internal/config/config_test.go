@@ -164,8 +164,11 @@ func TestResolveEmbed(t *testing.T) {
 	}
 	// Errors.
 	for _, args := range [][]string{
-		{"--embed-url", "http://x"}, // model missing
-		{"--embed-model", "m"},      // URL missing
+		{"--embed-url", "http://x"},                                  // model missing
+		{"--embed-model", "m"},                                       // URL missing
+		{"--embed-provider", "http", "--embed-url", "http://x"},      // http requires model
+		{"--embed-provider", "model2vec", "--embed-url", "http://x"}, // cannot combine
+		{"--embed-provider", "bogus"},                                // unknown provider
 		{"--embed-url", "http://x", "--embed-model", "m", "--embed-min-score", "2"},
 		{"--embed-url", "http://x", "--embed-model", "m", "--embed-min-score", "abc"},
 		{"--embed-url", "http://x", "--embed-model", "m", "--embed-timeout", "soon"},
@@ -174,6 +177,28 @@ func TestResolveEmbed(t *testing.T) {
 		if _, err := resolve(t, args, nil); err == nil {
 			t.Errorf("%v: expected error", args)
 		}
+	}
+
+	// Model2Vec defaults.
+	cfg, err = resolve(t, []string{"--embed-provider", "model2vec"}, nil)
+	if err != nil {
+		t.Fatalf("model2vec defaults: %v", err)
+	}
+	if !cfg.Embed.Enabled() || cfg.Embed.Provider != EmbedProviderModel2Vec || cfg.Embed.Model != DefaultModel2VecModel || cfg.Embed.CacheDir != "/home/test/.llm-memory/models" {
+		t.Errorf("model2vec defaults = %+v", cfg.Embed)
+	}
+
+	// Model2Vec env + custom cache dir + model.
+	cfg, err = resolve(t, nil, map[string]string{
+		EnvEmbedProvider: "MODEL2VEC",
+		EnvEmbedModel:    "minishlab/potion-multilingual-128M",
+		EnvEmbedCacheDir: "~/custom-models",
+	})
+	if err != nil {
+		t.Fatalf("model2vec env: %v", err)
+	}
+	if cfg.Embed.Provider != EmbedProviderModel2Vec || cfg.Embed.Model != "minishlab/potion-multilingual-128M" || cfg.Embed.CacheDir != "/home/test/custom-models" {
+		t.Errorf("model2vec env = %+v", cfg.Embed)
 	}
 }
 

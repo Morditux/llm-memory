@@ -262,7 +262,7 @@ llm-memory namespace <list|rename|merge|archive> ... # manage namespaces
 llm-memory gc [--json]                   # archive expired (TTL) memories
 llm-memory backup [--keep N] [--verify] [--json] [<dest>] # hot SQLite backup (VACUUM INTO)
 llm-memory doctor [--json]               # check database integrity, permissions, embeddings and client configs
-llm-memory setup [--ollama] [--write|--remove] [--config PATH] <client> # print, write or remove MCP config (antigravity, claude-desktop, claude-code, codex, opencode, vscode)
+llm-memory setup [--model2vec|--ollama] [--write|--remove] [--config PATH] <client> # print, write or remove MCP config (antigravity, claude-desktop, claude-code, codex, opencode, vscode)
 llm-memory setup --hooks [--events SessionStart,PreCompact,Stop] [--write|--remove] [--config PATH] <client> # lifecycle hooks (antigravity, claude-code, codex)
 llm-memory hook [--event E] [--focus Q] <client>     # hook entry point: prints the payload in the client's hook format
 llm-memory hook --write [--events LIST] [--config PATH] [--max-chars N] [--focus Q] <client>  # install hook(s) in the client config
@@ -278,24 +278,39 @@ llm-memory serve [--listen 127.0.0.1:8766] [--stateless] [--read-only] # stdio (
 ## Semantic search (optional)
 
 By default, `recall` is a full-text search (FTS5) and **no data leaves the machine**.
-With an embeddings API configured, `recall` and `llm-memory search` also find memories
+With semantic search enabled, `recall` and `llm-memory search` also find memories
 by meaning ("SGBD" finds "PostgreSQL rather than MySQL"): the full-text and vector rankings
 are fused (Reciprocal Rank Fusion).
 
-The API must follow the OpenAI `POST /v1/embeddings` format (OpenAI, Ollama, LM Studio, vLLM, most
-internal gateways). Local example with Ollama:
+Two backends are supported:
+
+1. **Built-in Model2Vec (pure Go, no external server)**: runs static embeddings locally in-process
+   and downloads the model once to `~/.llm-memory/models` (or takes a local directory path).
+
+```bash
+llm-memory reindex --embed-provider model2vec
+# or a multilingual model:
+llm-memory reindex --embed-provider model2vec --embed-model minishlab/potion-multilingual-128M
+# configure a client:
+llm-memory setup --model2vec --write claude-code
+```
+
+2. **OpenAI-compatible `POST /v1/embeddings` API** (OpenAI, Ollama, LM Studio, vLLM, most
+   internal gateways). Local example with Ollama:
 
 ```bash
 ollama pull nomic-embed-text
 llm-memory reindex --embed-url http://localhost:11434/v1/embeddings --embed-model nomic-embed-text
 ```
 
-then add the same two flags to the `serve` `args` in each client's configuration.
+then add the same flags to the `serve` `args` in each client's configuration.
 
 | Flag | Variable | Default |
 | --- | --- | --- |
+| `--embed-provider` | `LLM_MEMORY_EMBED_PROVIDER` | `http` when `--embed-url` is set, or `model2vec` |
 | `--embed-url` | `LLM_MEMORY_EMBED_URL` | empty = disabled |
-| `--embed-model` | `LLM_MEMORY_EMBED_MODEL` | — (required with the URL) |
+| `--embed-model` | `LLM_MEMORY_EMBED_MODEL` | `minishlab/potion-base-8M` (with `model2vec`), required with `--embed-url` |
+| `--embed-cache-dir` | `LLM_MEMORY_EMBED_CACHE_DIR` | `~/.llm-memory/models` (`model2vec` only) |
 | — | `LLM_MEMORY_EMBED_API_KEY` | none (sent as `Authorization: Bearer`); never a flag |
 | `--embed-min-score` | `LLM_MEMORY_EMBED_MIN_SCORE` | `0.3` (minimum cosine similarity; model-dependent, `-1` to disable) |
 | `--embed-timeout` | `LLM_MEMORY_EMBED_TIMEOUT` | `30s` |
@@ -383,7 +398,7 @@ machine-b$ llm-memory export --history -o b.json         # then: machine-a$ llm-
 Updating golden files: `go test ./internal/briefing ./cmd/llm-memory -update`.
 
 Architecture: `internal/store` (SQL, no MCP), `internal/briefing` (text of `get_context`),
-`internal/semantic` (embeddings client and hybrid search, optional),
+`internal/semantic` (hybrid search & HTTP client, optional), `internal/model2vec` (pure-Go static embeddings, optional),
 `internal/server` (thin MCP handlers, no SQL), `cmd/llm-memory` (binary and CLI).
 
 ## License

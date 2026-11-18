@@ -4,11 +4,13 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1190,5 +1192,87 @@ func TestCompletionCommand(t *testing.T) {
 	}
 	if r := cli(t, "", "completion", "powershell"); !errors.Is(r.err, errUsage) {
 		t.Errorf("expected errUsage for unsupported shell, got %v", r.err)
+	}
+}
+
+func TestCLIModel2VecSemanticAndSetup(t *testing.T) {
+	dir := t.TempDir()
+	db := filepath.Join(dir, "mem.db")
+	modelDir := filepath.Join(dir, "local-m2v")
+	if err := os.MkdirAll(modelDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Build a minimal local Model2Vec model where "sgbd" and "postgres" have identical vectors.
+	if err := os.WriteFile(filepath.Join(modelDir, "config.json"), []byte(`{"model_type":"model2vec","normalize":true}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(modelDir, "tokenizer.json"), []byte(`{
+		"normalizer":{"type":"BertNormalizer","lowercase":true},
+		"pre_tokenizer":{"type":"BertPreTokenizer"},
+		"model":{"type":"WordPiece","unk_token":"[UNK]","vocab":{"[UNK]":0,"sgbd":1,"postgres":2,"redis":3}}
+	}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	header := `{"embeddings":{"dtype":"F32","shape":[4,2],"data_offsets":[0,32]}}`
+	var lenBuf [8]byte
+	binary.LittleEndian.PutUint64(lenBuf[:], uint64(len(header)))
+	payload := make([]byte, 32)
+	putF32 := func(idx int, v float32) {
+		binary.LittleEndian.PutUint32(payload[4*idx:], math.Float32bits(v))
+	}
+	putF32(2, 1) // sgbd -> [1, 0]
+	putF32(4, 1) // postgres -> [1, 0]
+	putF32(7, 1) // redis -> [0, 1]
+	sf := append(append(lenBuf[:], []byte(header)...), payload...)
+	if err := os.WriteFile(filepath.Join(modelDir, "model.safetensors"), sf, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// setup --model2vec
+	ocOut := cliOK(t, "setup", "--db", db, "--model2vec", "opencode")
+	if !strings.Contains(ocOut, `"--embed-provider"`) || !strings.Contains(ocOut, config.DefaultModel2VecModel) {
+		t.Errorf("setup --model2vec output missing flags:\n%s", ocOut)
+	}
+	if r := cli(t, "", "setup", "--db", db, "--model2vec", "--ollama", "opencode"); !errors.Is(r.err, errUsage) {
+		t.Errorf("expected errUsage combining --model2vec and --ollama, got %+v", r)
+	}
+
+	// Create two memories, reindex with local Model2Vec, and search by synonym.
+	cliOK(t, "remember", "--db", db, "--kind", "decision", "--title", "DB", "postgres")
+	cliOK(t, "remember", "--db", db, "--kind", "fact", "--title", "Cache", "redis")
+
+	reOut := cliOK(t, "reindex", "--db", db, "--embed-provider", "model2vec", "--embed-model", modelDir)
+	if !strings.Contains(reOut, "Indexed 2 memories") {
+		t.Errorf("reindex = %q", reOut)
+	}
+
+	searchOut := cliOK(t, "search", "--db", db, "--embed-provider", "model2vec", "--embed-model", modelDir, "--json", "sgbd")
+	var hits []store.SearchResult
+	if err := json.Unmarshal([]byte(searchOut), &hits); err != nil {
+		t.Fatalf("search json: %v\n%s", err, searchOut)
+	}
+	if len(hits) != 1 || hits[0].Content != "postgres" {
+		t.Errorf("semantic search for sgbd = %+v, want [postgres]", hits)
+	}
+
+	// doctor --json with cached local model2vec
+	docJSON := cliOK(t, "doctor", "--db", db, "--embed-provider", "model2vec", "--embed-model", modelDir, "--json")
+	var rep doctorReport
+	if err := json.Unmarshal([]byte(docJSON), &rep); err != nil {
+		t.Fatal(err)
+	}
+	if !rep.OK || rep.EmbeddingsProvider != "model2vec" || !strings.HasPrefix(rep.Embeddings, "ok (model2vec") {
+		t.Errorf("unexpected doctor model2vec report: %+v", rep)
+	}
+
+	// doctor --json with uncached HF model reports warning without hitting the network.
+	docUncached := cliOK(t, "doctor", "--db", db, "--embed-provider", "model2vec", "--embed-model", "minishlab/not-downloaded", "--embed-cache-dir", filepath.Join(dir, "empty-cache"), "--json")
+	var repUncached doctorReport
+	if err := json.Unmarshal([]byte(docUncached), &repUncached); err != nil {
+		t.Fatal(err)
+	}
+	if !repUncached.OK || !strings.HasPrefix(repUncached.Embeddings, "not cached") || len(repUncached.Warnings) == 0 {
+		t.Errorf("unexpected doctor uncached model2vec report: %+v", repUncached)
 	}
 }

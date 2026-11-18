@@ -67,7 +67,7 @@ Usage:
   llm-memory doctor [--json]                 check database integrity, permissions and embeddings
   llm-memory backup [--keep N] [--verify] [--json] [<dest>]
                                              hot SQLite backup via VACUUM INTO
-  llm-memory setup [--ollama] [--write] [--remove] [--config PATH] <client>
+  llm-memory setup [--model2vec|--ollama] [--write] [--remove] [--config PATH] <client>
                                              print, write or remove MCP configuration for a client
   llm-memory setup --hooks [--events LIST] [--write] [--remove] [--config PATH] <antigravity|claude-code|codex>
                                              print, write or remove the client hooks (SessionStart, PreCompact, Stop)
@@ -87,10 +87,14 @@ Common flags (all commands):
   --source NAME      client name recorded as author (env LLM_MEMORY_SOURCE)
   --log-level LEVEL  debug|info|warn|error (env LLM_MEMORY_LOG_LEVEL, default info)
 
-Optional semantic search (disabled unless both are set; used by serve, search, reindex):
+Optional semantic search (disabled unless configured; used by serve, search, reindex):
+  --embed-provider NAME    embeddings backend: http (default with --embed-url) or model2vec
+                           (env LLM_MEMORY_EMBED_PROVIDER)
   --embed-url URL          OpenAI-compatible endpoint, e.g. http://localhost:11434/v1/embeddings
                            (env LLM_MEMORY_EMBED_URL; API key: env LLM_MEMORY_EMBED_API_KEY only)
-  --embed-model NAME       embeddings model (env LLM_MEMORY_EMBED_MODEL)
+  --embed-model NAME       embeddings model or Model2Vec repo/path (env LLM_MEMORY_EMBED_MODEL)
+  --embed-cache-dir PATH   cache directory for Model2Vec models (env LLM_MEMORY_EMBED_CACHE_DIR,
+                           default ~/.llm-memory/models)
   --embed-min-score X      minimum cosine similarity, default 0.3 (env LLM_MEMORY_EMBED_MIN_SCORE)
   --embed-timeout D        request timeout, default 30s (env LLM_MEMORY_EMBED_TIMEOUT)
 
@@ -264,7 +268,11 @@ func (a app) cmdServe(ctx context.Context, args []string) error {
 	}
 	if engine != nil {
 		opts.Searcher = engine
-		logger.Info("semantic search enabled", "url", cfg.Embed.URL, "settings", engine.Describe())
+		provider := cfg.Embed.Provider
+		if provider == "" {
+			provider = config.EmbedProviderHTTP
+		}
+		logger.Info("semantic search enabled", "provider", provider, "url", cfg.Embed.URL, "settings", engine.Describe())
 	}
 	if strings.TrimSpace(*listen) != "" {
 		handler, err := server.NewHTTPHandler(st, opts, &mcp.StreamableHTTPOptions{

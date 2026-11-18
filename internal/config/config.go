@@ -23,19 +23,25 @@ const (
 
 	// Semantic search (optional, phase 6). The API key is read from the
 	// environment only, never from a flag (flags are visible in ps).
+	EnvEmbedProvider = "LLM_MEMORY_EMBED_PROVIDER"
 	EnvEmbedURL      = "LLM_MEMORY_EMBED_URL"
 	EnvEmbedModel    = "LLM_MEMORY_EMBED_MODEL"
 	EnvEmbedAPIKey   = "LLM_MEMORY_EMBED_API_KEY"
+	EnvEmbedCacheDir = "LLM_MEMORY_EMBED_CACHE_DIR"
 	EnvEmbedMinScore = "LLM_MEMORY_EMBED_MIN_SCORE"
 	EnvEmbedTimeout  = "LLM_MEMORY_EMBED_TIMEOUT"
 )
 
 // Defaults.
 const (
-	DefaultNamespace = "global"
-	AutoNamespace    = "auto"
-	DefaultLogLevel  = "info"
-	defaultDBRel     = ".llm-memory/memory.db"
+	DefaultNamespace       = "global"
+	AutoNamespace          = "auto"
+	DefaultLogLevel        = "info"
+	defaultDBRel           = ".llm-memory/memory.db"
+	EmbedProviderHTTP      = "http"
+	EmbedProviderModel2Vec = "model2vec"
+	DefaultModel2VecModel  = "minishlab/potion-base-8M"
+	defaultModelCacheRel   = ".llm-memory/models"
 )
 
 // Config holds the resolved parameters.
@@ -49,33 +55,37 @@ type Config struct {
 	Source string
 	// LogLevel is the slog level for stderr logs.
 	LogLevel slog.Level
-	// Embed configures optional semantic search; disabled when URL is empty.
+	// Embed configures optional semantic search; disabled when neither URL nor Model2Vec provider is set.
 	Embed Embed
 }
 
-// Embed configures the embeddings API used by semantic search.
+// Embed configures the embeddings backend used by semantic search.
 type Embed struct {
+	Provider string // "", "http", or "model2vec"
 	URL      string
 	Model    string
 	APIKey   string
+	CacheDir string        // local cache directory for model2vec models
 	MinScore float64       // 0 = engine default
 	Timeout  time.Duration // 0 = client default
 }
 
 // Enabled reports whether semantic search is configured.
-func (e Embed) Enabled() bool { return e.URL != "" }
+func (e Embed) Enabled() bool { return e.URL != "" || e.Provider == EmbedProviderModel2Vec }
 
 // Flags holds the raw flag values registered on a FlagSet.
 type Flags struct {
-	fs         *flag.FlagSet
-	db         string
-	namespace  string
-	source     string
-	logLevel   string
-	embedURL   string
-	embedModel string
-	embedMin   string
-	embedTO    string
+	fs            *flag.FlagSet
+	db            string
+	namespace     string
+	source        string
+	logLevel      string
+	embedProvider string
+	embedURL      string
+	embedModel    string
+	embedCacheDir string
+	embedMin      string
+	embedTO       string
 }
 
 // Register declares the common flags (--db, --namespace, --source, --log-level) on fs.
@@ -85,8 +95,10 @@ func Register(fs *flag.FlagSet) *Flags {
 	fs.StringVar(&f.namespace, "namespace", "", "default namespace (env "+EnvNamespace+", default "+DefaultNamespace+")")
 	fs.StringVar(&f.source, "source", "", "client name recorded as author (env "+EnvSource+", default: MCP clientInfo.name)")
 	fs.StringVar(&f.logLevel, "log-level", "", "log level: debug, info, warn, error (env "+EnvLogLevel+", default "+DefaultLogLevel+")")
+	fs.StringVar(&f.embedProvider, "embed-provider", "", "embeddings backend: http or model2vec (env "+EnvEmbedProvider+")")
 	fs.StringVar(&f.embedURL, "embed-url", "", "OpenAI-compatible embeddings endpoint enabling semantic search (env "+EnvEmbedURL+", default: disabled)")
-	fs.StringVar(&f.embedModel, "embed-model", "", "embeddings model (env "+EnvEmbedModel+"; API key: env "+EnvEmbedAPIKey+")")
+	fs.StringVar(&f.embedModel, "embed-model", "", "embeddings model or Model2Vec repo/path (env "+EnvEmbedModel+"; API key: env "+EnvEmbedAPIKey+")")
+	fs.StringVar(&f.embedCacheDir, "embed-cache-dir", "", "cache directory for Model2Vec models (env "+EnvEmbedCacheDir+", default ~/"+defaultModelCacheRel+")")
 	fs.StringVar(&f.embedMin, "embed-min-score", "", "minimum cosine similarity of a semantic match (env "+EnvEmbedMinScore+", default 0.3)")
 	fs.StringVar(&f.embedTO, "embed-timeout", "", "timeout of an embeddings request (env "+EnvEmbedTimeout+", default 30s)")
 	return f
@@ -156,14 +168,52 @@ func (f *Flags) Resolve(env Env) (Config, error) {
 }
 
 func (f *Flags) resolveEmbed(pick func(name, flagVal, envName, def string) string, env Env) (Embed, error) {
+	provider := strings.ToLower(strings.TrimSpace(pick("embed-provider", f.embedProvider, EnvEmbedProvider, "")))
 	e := Embed{
-		URL:    strings.TrimSpace(pick("embed-url", f.embedURL, EnvEmbedURL, "")),
-		Model:  strings.TrimSpace(pick("embed-model", f.embedModel, EnvEmbedModel, "")),
-		APIKey: strings.TrimSpace(env.Getenv(EnvEmbedAPIKey)),
+		Provider: provider,
+		URL:      strings.TrimSpace(pick("embed-url", f.embedURL, EnvEmbedURL, "")),
+		Model:    strings.TrimSpace(pick("embed-model", f.embedModel, EnvEmbedModel, "")),
+		APIKey:   strings.TrimSpace(env.Getenv(EnvEmbedAPIKey)),
 	}
-	if (e.URL == "") != (e.Model == "") {
-		return Embed{}, errors.New("semantic search needs both --embed-url and --embed-model (or " + EnvEmbedURL + " and " + EnvEmbedModel + ")")
+	cacheDir := strings.TrimSpace(pick("embed-cache-dir", f.embedCacheDir, EnvEmbedCacheDir, ""))
+
+	switch provider {
+	case "", EmbedProviderHTTP:
+		if provider == EmbedProviderHTTP && (e.URL == "" || e.Model == "") {
+			return Embed{}, errors.New("semantic search with provider \"http\" needs both --embed-url and --embed-model (or " + EnvEmbedURL + " and " + EnvEmbedModel + ")")
+		}
+		if (e.URL == "") != (e.Model == "") {
+			return Embed{}, errors.New("semantic search needs both --embed-url and --embed-model (or " + EnvEmbedURL + " and " + EnvEmbedModel + ")")
+		}
+		if cacheDir != "" {
+			var err error
+			if e.CacheDir, err = expandHome(cacheDir, env.UserHomeDir); err != nil {
+				return Embed{}, err
+			}
+		}
+	case EmbedProviderModel2Vec:
+		if e.URL != "" {
+			return Embed{}, errors.New("--embed-url cannot be combined with --embed-provider model2vec")
+		}
+		if e.Model == "" {
+			e.Model = DefaultModel2VecModel
+		} else {
+			var err error
+			if e.Model, err = expandHome(e.Model, env.UserHomeDir); err != nil {
+				return Embed{}, err
+			}
+		}
+		if cacheDir == "" {
+			cacheDir = "~/" + defaultModelCacheRel
+		}
+		var err error
+		if e.CacheDir, err = expandHome(cacheDir, env.UserHomeDir); err != nil {
+			return Embed{}, err
+		}
+	default:
+		return Embed{}, fmt.Errorf("invalid embeddings provider %q (expected http or model2vec)", provider)
 	}
+
 	if v := pick("embed-min-score", f.embedMin, EnvEmbedMinScore, ""); v != "" {
 		x, err := strconv.ParseFloat(v, 64)
 		if err != nil || x < -1 || x > 1 {

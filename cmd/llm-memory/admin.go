@@ -23,6 +23,7 @@ import (
 
 	"github.com/Morditux/llm-memory/internal/bootstrap"
 	"github.com/Morditux/llm-memory/internal/config"
+	"github.com/Morditux/llm-memory/internal/model2vec"
 	"github.com/Morditux/llm-memory/internal/semantic"
 	"github.com/Morditux/llm-memory/internal/server"
 	"github.com/Morditux/llm-memory/internal/store"
@@ -629,7 +630,7 @@ func (a app) cmdReindex(ctx context.Context, args []string) error {
 	}
 	defer func() { _ = st.Close() }()
 	if !cfg.Embed.Enabled() {
-		return errors.New("semantic search is not configured: set --embed-url and --embed-model (or LLM_MEMORY_EMBED_URL and LLM_MEMORY_EMBED_MODEL)")
+		return errors.New("semantic search is not configured: set --embed-provider model2vec or --embed-url and --embed-model")
 	}
 	logger := slog.New(slog.NewTextHandler(a.stderr, &slog.HandlerOptions{Level: cfg.LogLevel}))
 	engine, err := bootstrap.NewEngine(st, cfg, logger)
@@ -1137,25 +1138,26 @@ type clientCheck struct {
 }
 
 type doctorReport struct {
-	OK                bool          `json:"ok"`
-	Binary            string        `json:"binary"`
-	Database          string        `json:"database"`
-	FileBytes         int64         `json:"file_bytes"`
-	Permissions       string        `json:"permissions"`
-	PermissionsWarn   string        `json:"permissions_warning,omitempty"`
-	SchemaVersion     int           `json:"schema_version"`
-	LatestSchema      int           `json:"latest_schema"`
-	Integrity         string        `json:"integrity"`
-	Active            int           `json:"active"`
-	Archived          int           `json:"archived"`
-	ExpiredPendingGC  int           `json:"expired_pending_gc"`
-	Namespace         string        `json:"namespace"`
-	Embeddings        string        `json:"embeddings"`
-	EmbeddingsURL     string        `json:"embeddings_url,omitempty"`
-	EmbeddingsModel   string        `json:"embeddings_model,omitempty"`
-	MissingEmbeddings int           `json:"missing_embeddings,omitempty"`
-	Clients           []clientCheck `json:"clients,omitempty"`
-	Warnings          []string      `json:"warnings,omitempty"`
+	OK                 bool          `json:"ok"`
+	Binary             string        `json:"binary"`
+	Database           string        `json:"database"`
+	FileBytes          int64         `json:"file_bytes"`
+	Permissions        string        `json:"permissions"`
+	PermissionsWarn    string        `json:"permissions_warning,omitempty"`
+	SchemaVersion      int           `json:"schema_version"`
+	LatestSchema       int           `json:"latest_schema"`
+	Integrity          string        `json:"integrity"`
+	Active             int           `json:"active"`
+	Archived           int           `json:"archived"`
+	ExpiredPendingGC   int           `json:"expired_pending_gc"`
+	Namespace          string        `json:"namespace"`
+	Embeddings         string        `json:"embeddings"`
+	EmbeddingsProvider string        `json:"embeddings_provider,omitempty"`
+	EmbeddingsURL      string        `json:"embeddings_url,omitempty"`
+	EmbeddingsModel    string        `json:"embeddings_model,omitempty"`
+	MissingEmbeddings  int           `json:"missing_embeddings,omitempty"`
+	Clients            []clientCheck `json:"clients,omitempty"`
+	Warnings           []string      `json:"warnings,omitempty"`
 }
 
 func checkPrivatePerms(dbPath string) (summary, warning string) {
@@ -1255,6 +1257,10 @@ func (a app) cmdDoctor(ctx context.Context, args []string) error {
 	}
 
 	if cfg.Embed.Enabled() {
+		rep.EmbeddingsProvider = cfg.Embed.Provider
+		if rep.EmbeddingsProvider == "" {
+			rep.EmbeddingsProvider = config.EmbedProviderHTTP
+		}
 		rep.EmbeddingsURL = cfg.Embed.URL
 		rep.EmbeddingsModel = cfg.Embed.Model
 		missing, mErr := st.CountMissingEmbeddings(ctx, cfg.Embed.Model)
@@ -1264,23 +1270,54 @@ func (a app) cmdDoctor(ctx context.Context, args []string) error {
 				rep.Warnings = append(rep.Warnings, fmt.Sprintf("%d memories missing embeddings (run `llm-memory reindex`)", missing))
 			}
 		}
-		client, err := semantic.NewClient(semantic.ClientConfig{
-			URL: cfg.Embed.URL, Model: cfg.Embed.Model, APIKey: cfg.Embed.APIKey, Timeout: cfg.Embed.Timeout,
-		})
-		if err != nil {
-			rep.OK = false
-			rep.Embeddings = fmt.Sprintf("error (%v)", err)
-			if checkErr == nil {
-				checkErr = err
-			}
-		} else if _, err := client.Embed(ctx, []string{"healthcheck"}); err != nil {
-			rep.OK = false
-			rep.Embeddings = fmt.Sprintf("unreachable (%s, %v)", cfg.Embed.URL, err)
-			if checkErr == nil {
-				checkErr = err
+		if cfg.Embed.Provider == config.EmbedProviderModel2Vec {
+			emb, err := model2vec.NewEmbedder(model2vec.Options{
+				Model:    cfg.Embed.Model,
+				CacheDir: cfg.Embed.CacheDir,
+			})
+			if err != nil {
+				rep.OK = false
+				rep.Embeddings = fmt.Sprintf("error (%v)", err)
+				if checkErr == nil {
+					checkErr = err
+				}
+			} else if dir, ready, err := emb.CheckLocal(); err != nil {
+				rep.OK = false
+				rep.Embeddings = fmt.Sprintf("error (%v)", err)
+				if checkErr == nil {
+					checkErr = err
+				}
+			} else if !ready {
+				rep.Embeddings = fmt.Sprintf("not cached (model2vec %s, dir %s)", cfg.Embed.Model, dir)
+				rep.Warnings = append(rep.Warnings, fmt.Sprintf("model2vec model %q is not cached yet (run `llm-memory reindex`)", cfg.Embed.Model))
+			} else if _, err := emb.Embed(ctx, []string{"healthcheck"}); err != nil {
+				rep.OK = false
+				rep.Embeddings = fmt.Sprintf("error (model2vec %s, %v)", cfg.Embed.Model, err)
+				if checkErr == nil {
+					checkErr = err
+				}
+			} else {
+				rep.Embeddings = fmt.Sprintf("ok (model2vec, model %s)", cfg.Embed.Model)
 			}
 		} else {
-			rep.Embeddings = fmt.Sprintf("ok (%s, model %s)", cfg.Embed.URL, cfg.Embed.Model)
+			client, err := semantic.NewClient(semantic.ClientConfig{
+				URL: cfg.Embed.URL, Model: cfg.Embed.Model, APIKey: cfg.Embed.APIKey, Timeout: cfg.Embed.Timeout,
+			})
+			if err != nil {
+				rep.OK = false
+				rep.Embeddings = fmt.Sprintf("error (%v)", err)
+				if checkErr == nil {
+					checkErr = err
+				}
+			} else if _, err := client.Embed(ctx, []string{"healthcheck"}); err != nil {
+				rep.OK = false
+				rep.Embeddings = fmt.Sprintf("unreachable (%s, %v)", cfg.Embed.URL, err)
+				if checkErr == nil {
+					checkErr = err
+				}
+			} else {
+				rep.Embeddings = fmt.Sprintf("ok (%s, model %s)", cfg.Embed.URL, cfg.Embed.Model)
+			}
 		}
 	}
 
@@ -1709,6 +1746,7 @@ func (a app) cmdSetup(_ context.Context, args []string) error {
 	fs := a.newFlagSet("setup")
 	flags := config.Register(fs)
 	ollama := fs.Bool("ollama", false, "include local Ollama embeddings defaults ("+defaultOllamaModel+")")
+	m2v := fs.Bool("model2vec", false, "include local Model2Vec embeddings defaults ("+config.DefaultModel2VecModel+", no external server)")
 	write := fs.Bool("write", false, "patch the client configuration file directly")
 	remove := fs.Bool("remove", false, "remove llm-memory from the client configuration file")
 	cfgPath := fs.String("config", "", "override target config file path (with --write or --remove)")
@@ -1722,6 +1760,10 @@ func (a app) cmdSetup(_ context.Context, args []string) error {
 		fmt.Fprintln(a.stderr, "cannot combine --write and --remove")
 		return errUsage
 	}
+	if *ollama && *m2v {
+		fmt.Fprintln(a.stderr, "cannot combine --ollama and --model2vec")
+		return errUsage
+	}
 	cfg, err := flags.Resolve(a.env)
 	if err != nil {
 		return err
@@ -1732,6 +1774,16 @@ func (a app) cmdSetup(_ context.Context, args []string) error {
 		}
 		if cfg.Embed.Model == "" {
 			cfg.Embed.Model = defaultOllamaModel
+		}
+	}
+	if *m2v {
+		if cfg.Embed.URL != "" {
+			fmt.Fprintln(a.stderr, "cannot combine --model2vec with --embed-url")
+			return errUsage
+		}
+		cfg.Embed.Provider = config.EmbedProviderModel2Vec
+		if cfg.Embed.Model == "" {
+			cfg.Embed.Model = config.DefaultModel2VecModel
 		}
 	}
 	bin := executablePath()
@@ -1781,7 +1833,11 @@ func (a app) cmdSetup(_ context.Context, args []string) error {
 		srvArgs = append(srvArgs, "--namespace", cfg.Namespace)
 	}
 	if cfg.Embed.Enabled() {
-		srvArgs = append(srvArgs, "--embed-url", cfg.Embed.URL, "--embed-model", cfg.Embed.Model)
+		if cfg.Embed.Provider == config.EmbedProviderModel2Vec {
+			srvArgs = append(srvArgs, "--embed-provider", config.EmbedProviderModel2Vec, "--embed-model", cfg.Embed.Model)
+		} else {
+			srvArgs = append(srvArgs, "--embed-url", cfg.Embed.URL, "--embed-model", cfg.Embed.Model)
+		}
 	}
 
 	if *write {
@@ -2041,7 +2097,7 @@ const bashCompletion = `_llm_memory() {
       fi
       ;;
     setup)
-      COMPREPLY=( $(compgen -W "antigravity claude-desktop claude-code codex opencode vscode --hooks --write --remove --ollama --events --config" -- "${cur}") )
+      COMPREPLY=( $(compgen -W "antigravity claude-desktop claude-code codex opencode vscode --hooks --write --remove --model2vec --ollama --events --config" -- "${cur}") )
       ;;
     hook)
       COMPREPLY=( $(compgen -W "antigravity claude-code codex --event --events --write --remove --max-chars --focus --config" -- "${cur}") )
