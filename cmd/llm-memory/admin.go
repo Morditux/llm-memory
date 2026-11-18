@@ -21,6 +21,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/Morditux/llm-memory/internal/bootstrap"
 	"github.com/Morditux/llm-memory/internal/config"
 	"github.com/Morditux/llm-memory/internal/semantic"
 	"github.com/Morditux/llm-memory/internal/server"
@@ -325,7 +326,7 @@ func (a app) cmdSearch(ctx context.Context, args []string) error {
 	defer func() { _ = st.Close() }()
 	var engine server.Searcher = st
 	logger := slog.New(slog.NewTextHandler(a.stderr, &slog.HandlerOptions{Level: cfg.LogLevel}))
-	if e, err := newEngine(st, cfg, logger); err != nil {
+	if e, err := bootstrap.NewEngine(st, cfg, logger); err != nil {
 		return err
 	} else if e != nil {
 		engine = e
@@ -631,7 +632,7 @@ func (a app) cmdReindex(ctx context.Context, args []string) error {
 		return errors.New("semantic search is not configured: set --embed-url and --embed-model (or LLM_MEMORY_EMBED_URL and LLM_MEMORY_EMBED_MODEL)")
 	}
 	logger := slog.New(slog.NewTextHandler(a.stderr, &slog.HandlerOptions{Level: cfg.LogLevel}))
-	engine, err := newEngine(st, cfg, logger)
+	engine, err := bootstrap.NewEngine(st, cfg, logger)
 	if err != nil {
 		return err
 	}
@@ -1885,7 +1886,7 @@ func (a app) cmdUI(ctx context.Context, args []string) error {
 	defer func() { _ = st.Close() }()
 
 	logger := slog.New(slog.NewTextHandler(a.stderr, &slog.HandlerOptions{Level: cfg.LogLevel}))
-	eng, err := newEngine(st, cfg, logger)
+	eng, err := bootstrap.NewEngine(st, cfg, logger)
 	if err != nil {
 		return err
 	}

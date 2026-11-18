@@ -2,23 +2,20 @@
 package ui
 
 import (
-	"context"
 	"crypto/rand"
 	"crypto/subtle"
 	"embed"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"mime"
 	"net"
 	"net/http"
 	"net/url"
-	"slices"
 	"strconv"
 	"strings"
-	"time"
 
+	"github.com/Morditux/llm-memory/internal/explorer"
 	"github.com/Morditux/llm-memory/internal/store"
 )
 
@@ -34,13 +31,7 @@ type Options struct {
 }
 
 // Searcher abstracts store.Search and semantic.Engine.Search.
-type Searcher interface {
-	Search(ctx context.Context, q store.SearchQuery) ([]store.SearchResult, error)
-}
-
-type similarSearcher interface {
-	FindSimilar(ctx context.Context, text, namespace string, minScore float64, limit int) ([]store.Similar, error)
-}
+type Searcher = explorer.Searcher
 
 // NewHandler returns the HTTP handler for the local web UI and JSON API.
 func NewHandler(st *store.Store, search Searcher) http.Handler {
@@ -49,9 +40,7 @@ func NewHandler(st *store.Store, search Searcher) http.Handler {
 
 // NewHandlerWithOptions returns the HTTP handler for the web UI and JSON API.
 func NewHandlerWithOptions(st *store.Store, search Searcher, opts Options) http.Handler {
-	if search == nil {
-		search = st
-	}
+	ex := explorer.New(st, search, explorer.DefaultActor)
 	var tok [32]byte
 	_, _ = rand.Read(tok[:])
 	csrfToken := hex.EncodeToString(tok[:])
@@ -70,7 +59,7 @@ func NewHandlerWithOptions(st *store.Store, search Searcher, opts Options) http.
 		_, _ = w.Write(indexHTML)
 	})
 	mux.HandleFunc("GET /api/stats", func(w http.ResponseWriter, r *http.Request) {
-		stats, err := st.Stats(r.Context())
+		stats, err := ex.Stats(r.Context())
 		if err != nil {
 			writeErr(w, err)
 			return
@@ -78,7 +67,7 @@ func NewHandlerWithOptions(st *store.Store, search Searcher, opts Options) http.
 		writeJSON(w, stats)
 	})
 	mux.HandleFunc("GET /api/namespaces", func(w http.ResponseWriter, r *http.Request) {
-		nss, err := st.ListNamespaces(r.Context())
+		nss, err := ex.Namespaces(r.Context())
 		if err != nil {
 			writeErr(w, err)
 			return
@@ -93,16 +82,12 @@ func NewHandlerWithOptions(st *store.Store, search Searcher, opts Options) http.
 		if !decodeJSON(w, r, &body) {
 			return
 		}
-		norm, err := st.RequireNamespace(r.Context(), name)
+		norm, desc, err := ex.SetNamespaceDescription(r.Context(), name, body.Description)
 		if err != nil {
 			writeErr(w, err)
 			return
 		}
-		if _, err := st.EnsureNamespace(r.Context(), norm, strings.TrimSpace(body.Description)); err != nil {
-			writeErr(w, err)
-			return
-		}
-		writeJSON(w, map[string]string{"name": norm, "description": strings.TrimSpace(body.Description)})
+		writeJSON(w, map[string]string{"name": norm, "description": desc})
 	})
 	mux.HandleFunc("POST /api/namespaces/{name}/rename", func(w http.ResponseWriter, r *http.Request) {
 		name := r.PathValue("name")
@@ -112,7 +97,7 @@ func NewHandlerWithOptions(st *store.Store, search Searcher, opts Options) http.
 		if !decodeJSON(w, r, &body) {
 			return
 		}
-		ns, err := st.RenameNamespace(r.Context(), name, body.NewName, "ui")
+		ns, err := ex.RenameNamespace(r.Context(), name, body.NewName)
 		if err != nil {
 			writeErr(w, err)
 			return
@@ -127,7 +112,7 @@ func NewHandlerWithOptions(st *store.Store, search Searcher, opts Options) http.
 		if !decodeJSON(w, r, &body) {
 			return
 		}
-		moved, err := st.MergeNamespace(r.Context(), name, body.Target, "ui")
+		moved, err := ex.MergeNamespace(r.Context(), name, body.Target)
 		if err != nil {
 			writeErr(w, err)
 			return
@@ -142,7 +127,7 @@ func NewHandlerWithOptions(st *store.Store, search Searcher, opts Options) http.
 		if r.ContentLength != 0 && !decodeJSON(w, r, &body) {
 			return
 		}
-		n, err := st.ArchiveNamespace(r.Context(), name, "ui", body.Reason)
+		n, err := ex.ArchiveNamespace(r.Context(), name, body.Reason)
 		if err != nil {
 			writeErr(w, err)
 			return
@@ -161,7 +146,7 @@ func NewHandlerWithOptions(st *store.Store, search Searcher, opts Options) http.
 		if k := strings.TrimSpace(q.Get("kind")); k != "" {
 			f.Kinds = []store.Kind{store.Kind(k)}
 		}
-		ms, err := st.List(r.Context(), f)
+		ms, err := ex.List(r.Context(), f)
 		if err != nil {
 			writeErr(w, err)
 			return
@@ -180,7 +165,7 @@ func NewHandlerWithOptions(st *store.Store, search Searcher, opts Options) http.
 		if k := strings.TrimSpace(q.Get("kind")); k != "" {
 			sq.Kinds = []store.Kind{store.Kind(k)}
 		}
-		res, err := search.Search(r.Context(), sq)
+		res, err := ex.Search(r.Context(), sq)
 		if err != nil {
 			writeErr(w, err)
 			return
@@ -192,29 +177,19 @@ func NewHandlerWithOptions(st *store.Store, search Searcher, opts Options) http.
 		if !ok {
 			return
 		}
-		m, err := st.Get(r.Context(), id)
+		d, err := ex.Detail(r.Context(), id)
 		if err != nil {
 			writeErr(w, err)
 			return
 		}
-		hist, err := st.History(r.Context(), id)
-		if err != nil {
-			writeErr(w, err)
-			return
-		}
-		links, err := st.Links(r.Context(), id)
-		if err != nil {
-			writeErr(w, err)
-			return
-		}
-		writeJSON(w, map[string]any{"memory": m, "history": hist, "links": links})
+		writeJSON(w, d)
 	})
 	mux.HandleFunc("POST /api/memories/{id}/archive", func(w http.ResponseWriter, r *http.Request) {
 		id, ok := parseID(w, r)
 		if !ok {
 			return
 		}
-		m, err := st.Archive(r.Context(), id, "ui", "archived from web UI")
+		m, err := ex.Archive(r.Context(), id)
 		if err != nil {
 			writeErr(w, err)
 			return
@@ -226,7 +201,7 @@ func NewHandlerWithOptions(st *store.Store, search Searcher, opts Options) http.
 		if !ok {
 			return
 		}
-		m, err := st.Restore(r.Context(), id, "ui")
+		m, err := ex.Restore(r.Context(), id)
 		if err != nil {
 			writeErr(w, err)
 			return
@@ -234,44 +209,11 @@ func NewHandlerWithOptions(st *store.Store, search Searcher, opts Options) http.
 		writeJSON(w, m)
 	})
 	mux.HandleFunc("POST /api/memories", func(w http.ResponseWriter, r *http.Request) {
-		var body struct {
-			Namespace  string     `json:"namespace"`
-			Kind       store.Kind `json:"kind"`
-			Title      string     `json:"title"`
-			Content    string     `json:"content"`
-			Tags       []string   `json:"tags"`
-			Importance int        `json:"importance"`
-			ExpiresIn  string     `json:"expires_in"`
-			ExpiresAt  string     `json:"expires_at"`
-			RelatedTo  []int64    `json:"related_to"`
-			DependsOn  []int64    `json:"depends_on"`
-		}
+		var body explorer.CreateRequest
 		if !decodeJSON(w, r, &body) {
 			return
 		}
-		exp, err := parseExpiration(body.ExpiresIn, body.ExpiresAt)
-		if err != nil {
-			writeErr(w, err)
-			return
-		}
-		var links []store.LinkRef
-		for _, id := range body.RelatedTo {
-			links = append(links, store.LinkRef{TargetID: id, Kind: store.LinkRelatesTo})
-		}
-		for _, id := range body.DependsOn {
-			links = append(links, store.LinkRef{TargetID: id, Kind: store.LinkDependsOn})
-		}
-		m, err := st.Create(r.Context(), store.NewMemory{
-			Namespace:  body.Namespace,
-			Kind:       body.Kind,
-			Title:      body.Title,
-			Content:    body.Content,
-			Tags:       body.Tags,
-			Importance: body.Importance,
-			Source:     "ui",
-			Links:      links,
-			ExpiresAt:  exp,
-		})
+		m, err := ex.Create(r.Context(), body)
 		if err != nil {
 			writeErr(w, err)
 			return
@@ -285,35 +227,11 @@ func NewHandlerWithOptions(st *store.Store, search Searcher, opts Options) http.
 		if !ok {
 			return
 		}
-		var body struct {
-			Namespace    *string     `json:"namespace"`
-			Kind         *store.Kind `json:"kind"`
-			Title        *string     `json:"title"`
-			Content      *string     `json:"content"`
-			Tags         *[]string   `json:"tags"`
-			Importance   *int        `json:"importance"`
-			ExpiresIn    string      `json:"expires_in"`
-			ExpiresAt    string      `json:"expires_at"`
-			ClearExpires bool        `json:"clear_expires"`
-		}
+		var body explorer.UpdateRequest
 		if !decodeJSON(w, r, &body) {
 			return
 		}
-		exp, err := parseExpiration(body.ExpiresIn, body.ExpiresAt)
-		if err != nil {
-			writeErr(w, err)
-			return
-		}
-		m, err := st.Update(r.Context(), id, store.Patch{
-			Namespace:      body.Namespace,
-			Kind:           body.Kind,
-			Title:          body.Title,
-			Content:        body.Content,
-			Tags:           body.Tags,
-			Importance:     body.Importance,
-			ExpiresAt:      exp,
-			ClearExpiresAt: body.ClearExpires,
-		}, "ui")
+		m, err := ex.Update(r.Context(), id, body)
 		if err != nil {
 			writeErr(w, err)
 			return
@@ -325,27 +243,10 @@ func NewHandlerWithOptions(st *store.Store, search Searcher, opts Options) http.
 		if !ok {
 			return
 		}
-		m, err := st.Get(r.Context(), id)
+		sims, err := ex.Similar(r.Context(), id)
 		if err != nil {
 			writeErr(w, err)
 			return
-		}
-		q := strings.TrimSpace(m.Title + " " + m.Content)
-		sims, err := st.FindSimilar(r.Context(), q, m.Namespace, 5, id)
-		if err != nil {
-			writeErr(w, err)
-			return
-		}
-		if sf, ok := search.(similarSearcher); ok {
-			if sems, serr := sf.FindSimilar(r.Context(), q, m.Namespace, 0, 5); serr == nil {
-				filtered := sems[:0]
-				for _, s := range sems {
-					if s.ID != id {
-						filtered = append(filtered, s)
-					}
-				}
-				sims = mergeSimilar(sims, filtered, 5)
-			}
 		}
 		writeJSON(w, sims)
 	})
@@ -364,7 +265,7 @@ func NewHandlerWithOptions(st *store.Store, search Searcher, opts Options) http.
 			http.Error(w, "invalid target_id", http.StatusBadRequest)
 			return
 		}
-		m, err := st.Supersede(r.Context(), id, body.TargetID, "ui")
+		m, err := ex.Supersede(r.Context(), id, body.TargetID)
 		if err != nil {
 			writeErr(w, err)
 			return
@@ -383,11 +284,7 @@ func NewHandlerWithOptions(st *store.Store, search Searcher, opts Options) http.
 		if !decodeJSON(w, r, &body) {
 			return
 		}
-		if err := st.AddLink(r.Context(), id, body.TargetID, body.Kind, "ui"); err != nil {
-			writeErr(w, err)
-			return
-		}
-		links, err := st.Links(r.Context(), id)
+		links, err := ex.AddLink(r.Context(), id, body.TargetID, body.Kind)
 		if err != nil {
 			writeErr(w, err)
 			return
@@ -406,11 +303,7 @@ func NewHandlerWithOptions(st *store.Store, search Searcher, opts Options) http.
 		if !decodeJSON(w, r, &body) {
 			return
 		}
-		if err := st.RemoveLink(r.Context(), id, body.TargetID, body.Kind, "ui"); err != nil {
-			writeErr(w, err)
-			return
-		}
-		links, err := st.Links(r.Context(), id)
+		links, err := ex.RemoveLink(r.Context(), id, body.TargetID, body.Kind)
 		if err != nil {
 			writeErr(w, err)
 			return
@@ -418,7 +311,7 @@ func NewHandlerWithOptions(st *store.Store, search Searcher, opts Options) http.
 		writeJSON(w, links)
 	})
 	mux.HandleFunc("POST /api/gc", func(w http.ResponseWriter, r *http.Request) {
-		n, err := st.ArchiveExpired(r.Context(), time.Now().UTC(), "ui")
+		n, err := ex.GC(r.Context())
 		if err != nil {
 			writeErr(w, err)
 			return
@@ -538,77 +431,6 @@ func parseTagParam(s string) []string {
 		return nil
 	}
 	return store.NormalizeTags(strings.Split(s, ","))
-}
-
-func parseExpiration(expiresIn, expiresAt string) (*time.Time, error) {
-	in := strings.TrimSpace(expiresIn)
-	at := strings.TrimSpace(expiresAt)
-	if in != "" && at != "" {
-		return nil, &store.ValidationError{Field: "expires", Msg: "provide either expires_in or expires_at, not both"}
-	}
-	if in != "" {
-		if strings.HasSuffix(in, "d") {
-			days, err := strconv.Atoi(strings.TrimSuffix(in, "d"))
-			if err != nil || days <= 0 {
-				return nil, &store.ValidationError{Field: "expires_in", Msg: fmt.Sprintf("invalid duration %q", expiresIn)}
-			}
-			t := time.Now().UTC().Add(time.Duration(days) * 24 * time.Hour)
-			return &t, nil
-		}
-		d, err := time.ParseDuration(in)
-		if err != nil || d <= 0 {
-			return nil, &store.ValidationError{Field: "expires_in", Msg: fmt.Sprintf("invalid duration %q", expiresIn)}
-		}
-		t := time.Now().UTC().Add(d)
-		return &t, nil
-	}
-	if at != "" {
-		t, err := time.Parse(time.RFC3339, at)
-		if err != nil {
-			return nil, &store.ValidationError{Field: "expires_at", Msg: fmt.Sprintf("invalid RFC 3339 timestamp %q", expiresAt)}
-		}
-		utc := t.UTC()
-		return &utc, nil
-	}
-	return nil, nil
-}
-
-func mergeSimilar(fts, sem []store.Similar, limit int) []store.Similar {
-	if len(sem) == 0 {
-		return fts
-	}
-	byID := make(map[int64]store.Similar, len(fts)+len(sem))
-	for _, s := range fts {
-		byID[s.ID] = s
-	}
-	for _, s := range sem {
-		if cur, ok := byID[s.ID]; !ok || s.Similarity > cur.Similarity {
-			byID[s.ID] = s
-		}
-	}
-	out := make([]store.Similar, 0, len(byID))
-	for _, s := range byID {
-		out = append(out, s)
-	}
-	slices.SortFunc(out, func(a, b store.Similar) int {
-		if a.Similarity > b.Similarity {
-			return -1
-		}
-		if a.Similarity < b.Similarity {
-			return 1
-		}
-		if a.ID > b.ID {
-			return -1
-		}
-		if a.ID < b.ID {
-			return 1
-		}
-		return 0
-	})
-	if len(out) > limit {
-		out = out[:limit]
-	}
-	return out
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

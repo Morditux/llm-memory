@@ -20,9 +20,9 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/Morditux/llm-memory/internal/bootstrap"
 	"github.com/Morditux/llm-memory/internal/briefing"
 	"github.com/Morditux/llm-memory/internal/config"
-	"github.com/Morditux/llm-memory/internal/semantic"
 	"github.com/Morditux/llm-memory/internal/server"
 	"github.com/Morditux/llm-memory/internal/store"
 )
@@ -228,15 +228,7 @@ func isSet(fs *flag.FlagSet, name string) bool {
 
 // openStore resolves the common flags and opens the database.
 func (a app) openStore(ctx context.Context, flags *config.Flags) (*store.Store, config.Config, error) {
-	cfg, err := flags.Resolve(a.env)
-	if err != nil {
-		return nil, cfg, err
-	}
-	st, err := store.Open(ctx, cfg.DB)
-	if err != nil {
-		return nil, cfg, err
-	}
-	return st, cfg, nil
+	return bootstrap.OpenStore(ctx, flags, a.env)
 }
 
 type nopWriteCloser struct{ io.Writer }
@@ -259,7 +251,7 @@ func (a app) cmdServe(ctx context.Context, args []string) error {
 	defer func() { _ = st.Close() }()
 	logger := slog.New(slog.NewTextHandler(a.stderr, &slog.HandlerOptions{Level: cfg.LogLevel}))
 
-	engine, err := newEngine(st, cfg, logger)
+	engine, err := bootstrap.NewEngine(st, cfg, logger)
 	if err != nil {
 		return err
 	}
@@ -353,7 +345,7 @@ func (a app) cmdContext(ctx context.Context, args []string) error {
 	var searcher briefing.Searcher = st
 	if cfg.Embed.Enabled() {
 		logger := slog.New(slog.NewTextHandler(a.stderr, &slog.HandlerOptions{Level: cfg.LogLevel}))
-		if eng, err := newEngine(st, cfg, logger); err != nil {
+		if eng, err := bootstrap.NewEngine(st, cfg, logger); err != nil {
 			return err
 		} else if eng != nil {
 			searcher = eng
@@ -372,21 +364,6 @@ func (a app) cmdContext(ctx context.Context, args []string) error {
 	}
 	fmt.Fprint(a.stdout, text)
 	return nil
-}
-
-// newEngine returns the semantic search engine, or nil when it is not
-// configured (v1 behaviour: full-text search only, no network access).
-func newEngine(st *store.Store, cfg config.Config, logger *slog.Logger) (*semantic.Engine, error) {
-	if !cfg.Embed.Enabled() {
-		return nil, nil
-	}
-	client, err := semantic.NewClient(semantic.ClientConfig{
-		URL: cfg.Embed.URL, Model: cfg.Embed.Model, APIKey: cfg.Embed.APIKey, Timeout: cfg.Embed.Timeout,
-	})
-	if err != nil {
-		return nil, err
-	}
-	return semantic.New(st, client, semantic.Options{MinScore: cfg.Embed.MinScore, Logger: logger}), nil
 }
 
 func isLoopbackListenAddr(addr string) bool {
