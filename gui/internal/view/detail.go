@@ -1,0 +1,188 @@
+package view
+
+import (
+	"fmt"
+	"image/color"
+	"time"
+
+	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/theme"
+	"fyne.io/fyne/v2/widget"
+
+	"github.com/Morditux/llm-memory/gui/internal/core"
+	"github.com/Morditux/llm-memory/internal/explorer"
+	"github.com/Morditux/llm-memory/internal/store"
+)
+
+const detailHelp = "Select a memory to inspect its content, links, diff history, and similar memories."
+
+var (
+	diffAddBG = color.NRGBA{R: 0x34, G: 0xd3, B: 0x99, A: 0x22}
+	diffDelBG = color.NRGBA{R: 0xf8, G: 0x71, B: 0x71, A: 0x22}
+)
+
+// buildDetail builds the right column and shows the empty state.
+func (w *MainWindow) buildDetail() fyne.CanvasObject {
+	w.detail = container.NewVBox()
+	w.detailScroll = container.NewVScroll(container.NewPadded(w.detail))
+	w.setEmptyDetail()
+	return w.detailScroll
+}
+
+func (w *MainWindow) setEmptyDetail() {
+	w.resetDetailRefs()
+	help := widget.NewLabel(detailHelp)
+	help.Wrapping = fyne.TextWrapWord
+	help.Importance = widget.LowImportance
+	w.title = heading("Details")
+	w.detail.Objects = []fyne.CanvasObject{w.title, help}
+	w.detail.Refresh()
+}
+
+func (w *MainWindow) resetDetailRefs() {
+	w.tagButtons, w.linkButtons, w.diffGrids, w.rawLabels = nil, nil, nil, nil
+	w.diffToggle = nil
+}
+
+func heading(text string) *widget.Label {
+	return widget.NewLabelWithStyle(text, fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+}
+
+// setDetail shows the selected memory with its links and history.
+func (w *MainWindow) setDetail(v core.DetailView) {
+	w.clearError()
+	m := v.Memory
+	w.resetDetailRefs()
+	w.title = heading(fmt.Sprintf("Memory #%d", m.ID))
+	objs := []fyne.CanvasObject{w.title, widget.NewRichText(memoryMeta(m, false)...)}
+
+	if m.Title != "" {
+		objs = append(objs, heading(m.Title))
+	}
+	if len(m.Tags) > 0 {
+		tags := container.NewHBox()
+		for _, t := range m.Tags {
+			b := widget.NewButton("#"+t, func() { w.onTag(t) })
+			b.Importance = widget.LowImportance
+			w.tagButtons = append(w.tagButtons, b)
+			tags.Add(b)
+		}
+		objs = append(objs, tags)
+	}
+	content := widget.NewLabel(m.Content)
+	content.Wrapping = fyne.TextWrapWord
+	content.Selectable = true
+	objs = append(objs, content)
+
+	objs = append(objs, heading(fmt.Sprintf("Links (%d)", len(v.Links))))
+	if len(v.Links) == 0 {
+		none := widget.NewLabel("No links.")
+		none.Importance = widget.LowImportance
+		objs = append(objs, none)
+	}
+	for _, l := range v.Links {
+		objs = append(objs, w.linkRow(l))
+	}
+
+	w.diffToggle = widget.NewButton(toggleLabel(v.DiffMode), func() {
+		go w.ctrl.SetDiffMode(!v.DiffMode)
+	})
+	objs = append(objs, container.NewBorder(nil, nil,
+		heading(fmt.Sprintf("History (%d)", len(v.History))), w.diffToggle))
+	for _, h := range v.History {
+		objs = append(objs, w.historyRow(h, v.DiffMode))
+	}
+
+	w.detail.Objects = objs
+	w.detail.Refresh()
+	if w.shownID != m.ID {
+		w.detailScroll.ScrollToTop()
+	}
+	w.shownID = m.ID
+	w.syncSelection()
+}
+
+func toggleLabel(diff bool) string {
+	if diff {
+		return "Show Raw"
+	}
+	return "Show Diff"
+}
+
+// onTag applies a tag as the only tags filter.
+func (w *MainWindow) onTag(tag string) {
+	w.ctrl.SelectTag(tag)
+	w.syncing = true
+	w.tags.SetText(tag)
+	w.syncing = false
+	w.loadList()
+}
+
+func (w *MainWindow) linkRow(l store.LinkView) fyne.CanvasObject {
+	kind := string(l.Kind)
+	if l.Direction != "outgoing" {
+		kind = "← " + kind
+	}
+	jump := widget.NewButton(fmt.Sprintf("#%d", l.ID), func() { w.loadDetail(l.ID) })
+	jump.Importance = widget.LowImportance
+	w.linkButtons = append(w.linkButtons, jump)
+
+	row := container.NewHBox(widget.NewLabelWithStyle(kind, fyne.TextAlignLeading, fyne.TextStyle{Italic: true}), jump)
+	mk := widget.NewLabel("[" + string(l.MemoryKind) + "]")
+	mk.Importance = widget.LowImportance
+	row.Add(mk)
+	if l.Title != "" {
+		row.Add(widget.NewLabel(l.Title))
+	}
+	if l.Archived {
+		a := widget.NewLabel("(archived)")
+		a.Importance = widget.DangerImportance
+		row.Add(a)
+	}
+	return row
+}
+
+func (w *MainWindow) historyRow(h core.HistoryItem, diff bool) fyne.CanvasObject {
+	meta := widget.NewRichText(
+		&widget.TextSegment{Text: string(h.Action), Style: widget.RichTextStyle{Inline: true, TextStyle: fyne.TextStyle{Bold: true}}},
+		&widget.TextSegment{Text: fmt.Sprintf(" · %s · %s", h.ChangedAt.Format(time.RFC3339Nano), h.ChangedBy),
+			Style: widget.RichTextStyle{Inline: true, ColorName: theme.ColorNamePlaceHolder}},
+	)
+	if !diff {
+		raw := widget.NewLabel(h.Snapshot)
+		raw.Wrapping = fyne.TextWrapBreak
+		raw.Selectable = true
+		raw.TextStyle = fyne.TextStyle{Monospace: true}
+		w.rawLabels = append(w.rawLabels, raw)
+		return container.NewVBox(meta, raw)
+	}
+	grid := diffGrid(h.Diff)
+	w.diffGrids = append(w.diffGrids, grid)
+	return container.NewVBox(meta, container.NewHScroll(grid))
+}
+
+// diffGrid renders diff lines with the web explorer's "  ", "- ", "+ "
+// prefixes and green/red/muted colors.
+func diffGrid(lines []explorer.DiffLine) *widget.TextGrid {
+	g := widget.NewTextGrid()
+	g.Rows = make([]widget.TextGridRow, len(lines))
+	for i, l := range lines {
+		prefix, fg := "  ", color.Color(colorMuted)
+		var bg color.Color
+		switch l.Op {
+		case explorer.Add:
+			prefix, fg, bg = "+ ", colorGreen, diffAddBG
+		case explorer.Del:
+			prefix, fg, bg = "- ", colorRed, diffDelBG
+		}
+		style := &widget.CustomTextGridStyle{FGColor: fg, BGColor: bg}
+		cells := make([]widget.TextGridCell, 0, len(prefix)+len(l.Text))
+		for _, r := range prefix + l.Text {
+			cells = append(cells, widget.TextGridCell{Rune: r, Style: style})
+		}
+		g.Rows[i] = widget.TextGridRow{Cells: cells}
+	}
+	g.Refresh()
+	return g
+}

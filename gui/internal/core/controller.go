@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/Morditux/llm-memory/internal/explorer"
 	"github.com/Morditux/llm-memory/internal/store"
 )
 
@@ -32,6 +33,8 @@ type Filters struct {
 type Observer struct {
 	Stats      func(store.Stats)
 	Namespaces func([]store.Namespace)
+	List       func(ListResult)
+	Detail     func(DetailView)
 	Error      func(error)
 }
 
@@ -46,11 +49,16 @@ type Controller struct {
 	filters    Filters
 	selectedID int64
 	gens       map[string]uint64
+
+	diffMode   bool
+	lastDetail *explorer.Detail
+	after      AfterFunc
+	pending    func() bool // stops the pending debounce timer, if any
 }
 
 // NewController returns a Controller reading from b and reporting to obs.
 func NewController(b Backend, obs Observer) *Controller {
-	return &Controller{backend: b, obs: obs}
+	return &Controller{backend: b, obs: obs, diffMode: true, after: timeAfterFunc}
 }
 
 // Filters returns the current filters.

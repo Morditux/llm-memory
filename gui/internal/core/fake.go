@@ -15,15 +15,40 @@ var ErrNotImplemented = errors.New("fake backend: not implemented")
 
 // FakeBackend is an in-memory Backend for tests, here and in the view package.
 // Set the exported fields before use; Hook, when set, runs at the start of
-// Stats and Namespaces so tests can block or delay calls.
+// every implemented method so tests can block or delay calls. ListFunc,
+// SearchFunc and DetailFunc, when set, replace the static values.
 type FakeBackend struct {
 	StatsValue      store.Stats
 	NamespacesValue []store.Namespace
-	Err             error
-	Hook            func(method string)
+	ListValue       []store.Memory
+	SearchValue     []store.SearchResult
+	// DetailValues maps a memory id to its detail; unknown ids yield a
+	// *store.NotFoundError.
+	DetailValues map[int64]explorer.Detail
+	ListFunc     func(store.ListFilter) ([]store.Memory, error)
+	SearchFunc   func(store.SearchQuery) ([]store.SearchResult, error)
+	DetailFunc   func(id int64) (explorer.Detail, error)
+	Err          error
+	Hook         func(method string)
 
-	mu    sync.Mutex
-	calls map[string]int
+	mu       sync.Mutex
+	calls    map[string]int
+	lists    []store.ListFilter
+	searches []store.SearchQuery
+}
+
+// ListCalls returns the filters of every List call, in order.
+func (f *FakeBackend) ListCalls() []store.ListFilter {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]store.ListFilter(nil), f.lists...)
+}
+
+// SearchCalls returns the queries of every Search call, in order.
+func (f *FakeBackend) SearchCalls() []store.SearchQuery {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]store.SearchQuery(nil), f.searches...)
 }
 
 // Calls returns how many times method was invoked.
@@ -63,18 +88,46 @@ func (f *FakeBackend) Namespaces(context.Context) ([]store.Namespace, error) {
 }
 
 // List implements Backend.
-func (f *FakeBackend) List(context.Context, store.ListFilter) ([]store.Memory, error) {
-	return nil, ErrNotImplemented
+func (f *FakeBackend) List(_ context.Context, lf store.ListFilter) ([]store.Memory, error) {
+	f.mu.Lock()
+	f.lists = append(f.lists, lf)
+	f.mu.Unlock()
+	if err := f.enter("List"); err != nil {
+		return nil, err
+	}
+	if f.ListFunc != nil {
+		return f.ListFunc(lf)
+	}
+	return f.ListValue, nil
 }
 
 // Search implements Backend.
-func (f *FakeBackend) Search(context.Context, store.SearchQuery) ([]store.SearchResult, error) {
-	return nil, ErrNotImplemented
+func (f *FakeBackend) Search(_ context.Context, q store.SearchQuery) ([]store.SearchResult, error) {
+	f.mu.Lock()
+	f.searches = append(f.searches, q)
+	f.mu.Unlock()
+	if err := f.enter("Search"); err != nil {
+		return nil, err
+	}
+	if f.SearchFunc != nil {
+		return f.SearchFunc(q)
+	}
+	return f.SearchValue, nil
 }
 
 // Detail implements Backend.
-func (f *FakeBackend) Detail(context.Context, int64) (explorer.Detail, error) {
-	return explorer.Detail{}, ErrNotImplemented
+func (f *FakeBackend) Detail(_ context.Context, id int64) (explorer.Detail, error) {
+	if err := f.enter("Detail"); err != nil {
+		return explorer.Detail{}, err
+	}
+	if f.DetailFunc != nil {
+		return f.DetailFunc(id)
+	}
+	d, ok := f.DetailValues[id]
+	if !ok {
+		return explorer.Detail{}, &store.NotFoundError{ID: id}
+	}
+	return d, nil
 }
 
 // Create implements Backend.
