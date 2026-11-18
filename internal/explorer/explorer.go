@@ -162,9 +162,9 @@ func (e *Explorer) Update(ctx context.Context, id int64, r UpdateRequest) (store
 	}, e.actor)
 }
 
-// Archive archives a memory.
-func (e *Explorer) Archive(ctx context.Context, id int64) (store.Memory, error) {
-	return e.st.Archive(ctx, id, e.actor, "archived from web UI")
+// Archive archives a memory, recording reason in its history.
+func (e *Explorer) Archive(ctx context.Context, id int64, reason string) (store.Memory, error) {
+	return e.st.Archive(ctx, id, e.actor, reason)
 }
 
 // Restore un-archives a memory.

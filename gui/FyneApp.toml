@@ -1,0 +1,6 @@
+[Details]
+  Icon = "Icon.png"
+  Name = "llm-memory"
+  ID = "io.github.morditux.llm-memory"
+  Version = "0.1.0"
+  Build = 1
