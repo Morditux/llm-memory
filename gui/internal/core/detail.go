@@ -20,10 +20,12 @@ type DetailView struct {
 	Links    []store.LinkView
 	History  []HistoryItem
 	DiffMode bool
+	// Editing is true while the memory is shown in its edit form.
+	Editing bool
 }
 
-func newDetailView(d explorer.Detail, diff bool) DetailView {
-	v := DetailView{Memory: d.Memory, Links: d.Links, DiffMode: diff}
+func newDetailView(d explorer.Detail, diff, editing bool) DetailView {
+	v := DetailView{Memory: d.Memory, Links: d.Links, DiffMode: diff, Editing: editing}
 	v.History = make([]HistoryItem, len(d.History))
 	for i, h := range d.History {
 		v.History[i].HistoryEntry = h
@@ -50,12 +52,28 @@ func (c *Controller) DiffMode() bool {
 func (c *Controller) SetDiffMode(on bool) {
 	c.mu.Lock()
 	c.diffMode = on
-	d := c.lastDetail
 	c.mu.Unlock()
-	if d != nil && c.obs.Detail != nil {
-		c.notify.Lock()
-		defer c.notify.Unlock()
-		c.obs.Detail(newDetailView(*d, on))
+	c.renotify()
+}
+
+// renotify sends the detail already loaded, and the similar results of that
+// memory if any, to the observer again.
+func (c *Controller) renotify() {
+	c.mu.Lock()
+	d := c.lastDetail
+	diff, editing := c.diffMode, c.editing
+	sim := c.similar
+	c.mu.Unlock()
+	if d == nil {
+		return
+	}
+	c.notify.Lock()
+	defer c.notify.Unlock()
+	if c.obs.Detail != nil {
+		c.obs.Detail(newDetailView(*d, diff, editing))
+	}
+	if sim != nil && c.obs.Similar != nil {
+		c.obs.Similar(*sim)
 	}
 }
 
@@ -76,12 +94,14 @@ func (c *Controller) LoadDetail(ctx context.Context, id int64) error {
 		return nil
 	}
 	c.lastDetail = &d
+	c.editing = false
+	c.similar = nil
 	diff := c.diffMode
 	c.mu.Unlock()
 	if c.obs.Detail != nil {
 		c.notify.Lock()
 		defer c.notify.Unlock()
-		c.obs.Detail(newDetailView(d, diff))
+		c.obs.Detail(newDetailView(d, diff, false))
 	}
 	return nil
 }

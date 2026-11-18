@@ -29,12 +29,23 @@ type FakeBackend struct {
 	SearchFunc   func(store.SearchQuery) ([]store.SearchResult, error)
 	DetailFunc   func(id int64) (explorer.Detail, error)
 	Err          error
-	Hook         func(method string)
+	// Errs maps a method name ("Create", "GC", "Similar"…) to the error that
+	// method returns, in addition to Err which fails every method.
+	Errs map[string]error
+	Hook func(method string)
 
-	mu       sync.Mutex
-	calls    map[string]int
-	lists    []store.ListFilter
-	searches []store.SearchQuery
+	// CreateValue, GCValue, LinksValue and SimilarValue are the results of
+	// Create, GC, AddLink/RemoveLink and Similar.
+	CreateValue  store.Memory
+	GCValue      int64
+	LinksValue   []store.LinkView
+	SimilarValue []store.Similar
+
+	mu        sync.Mutex
+	calls     map[string]int
+	lists     []store.ListFilter
+	searches  []store.SearchQuery
+	mutations []MutationCall
 }
 
 // ListCalls returns the filters of every List call, in order.
@@ -130,39 +141,97 @@ func (f *FakeBackend) Detail(_ context.Context, id int64) (explorer.Detail, erro
 	return d, nil
 }
 
-// Create implements Backend.
-func (f *FakeBackend) Create(context.Context, explorer.CreateRequest) (store.Memory, error) {
-	return store.Memory{}, ErrNotImplemented
+// MutationCall records one call of a mutating FakeBackend method. Only the
+// fields relevant to Method are set.
+type MutationCall struct {
+	Method   string
+	ID       int64
+	TargetID int64
+	Kind     store.LinkKind
+	Reason   string
+	Create   explorer.CreateRequest
+	Update   explorer.UpdateRequest
+}
+
+// MutationCalls returns every mutating call, in order.
+func (f *FakeBackend) MutationCalls() []MutationCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]MutationCall(nil), f.mutations...)
+}
+
+// mutate records c and returns the error configured for its method.
+func (f *FakeBackend) mutate(c MutationCall) error {
+	f.mu.Lock()
+	f.mutations = append(f.mutations, c)
+	f.mu.Unlock()
+	if err := f.enter(c.Method); err != nil {
+		return err
+	}
+	return f.Errs[c.Method]
+}
+
+func (f *FakeBackend) memory(id int64) store.Memory {
+	if m, ok := f.DetailValues[id]; ok {
+		return m.Memory
+	}
+	return store.Memory{ID: id}
+}
+
+// Create implements Backend. It returns CreateValue.
+func (f *FakeBackend) Create(_ context.Context, r explorer.CreateRequest) (store.Memory, error) {
+	if err := f.mutate(MutationCall{Method: "Create", Create: r}); err != nil {
+		return store.Memory{}, err
+	}
+	return f.CreateValue, nil
 }
 
 // Update implements Backend.
-func (f *FakeBackend) Update(context.Context, int64, explorer.UpdateRequest) (store.Memory, error) {
-	return store.Memory{}, ErrNotImplemented
+func (f *FakeBackend) Update(_ context.Context, id int64, r explorer.UpdateRequest) (store.Memory, error) {
+	if err := f.mutate(MutationCall{Method: "Update", ID: id, Update: r}); err != nil {
+		return store.Memory{}, err
+	}
+	return f.memory(id), nil
 }
 
 // Archive implements Backend.
-func (f *FakeBackend) Archive(context.Context, int64, string) (store.Memory, error) {
-	return store.Memory{}, ErrNotImplemented
+func (f *FakeBackend) Archive(_ context.Context, id int64, reason string) (store.Memory, error) {
+	if err := f.mutate(MutationCall{Method: "Archive", ID: id, Reason: reason}); err != nil {
+		return store.Memory{}, err
+	}
+	return f.memory(id), nil
 }
 
 // Restore implements Backend.
-func (f *FakeBackend) Restore(context.Context, int64) (store.Memory, error) {
-	return store.Memory{}, ErrNotImplemented
+func (f *FakeBackend) Restore(_ context.Context, id int64) (store.Memory, error) {
+	if err := f.mutate(MutationCall{Method: "Restore", ID: id}); err != nil {
+		return store.Memory{}, err
+	}
+	return f.memory(id), nil
 }
 
 // Supersede implements Backend.
-func (f *FakeBackend) Supersede(context.Context, int64, int64) (store.Memory, error) {
-	return store.Memory{}, ErrNotImplemented
+func (f *FakeBackend) Supersede(_ context.Context, id, targetID int64) (store.Memory, error) {
+	if err := f.mutate(MutationCall{Method: "Supersede", ID: id, TargetID: targetID}); err != nil {
+		return store.Memory{}, err
+	}
+	return f.memory(id), nil
 }
 
-// AddLink implements Backend.
-func (f *FakeBackend) AddLink(context.Context, int64, int64, store.LinkKind) ([]store.LinkView, error) {
-	return nil, ErrNotImplemented
+// AddLink implements Backend. It returns LinksValue.
+func (f *FakeBackend) AddLink(_ context.Context, id, targetID int64, kind store.LinkKind) ([]store.LinkView, error) {
+	if err := f.mutate(MutationCall{Method: "AddLink", ID: id, TargetID: targetID, Kind: kind}); err != nil {
+		return nil, err
+	}
+	return f.LinksValue, nil
 }
 
-// RemoveLink implements Backend.
-func (f *FakeBackend) RemoveLink(context.Context, int64, int64, store.LinkKind) ([]store.LinkView, error) {
-	return nil, ErrNotImplemented
+// RemoveLink implements Backend. It returns LinksValue.
+func (f *FakeBackend) RemoveLink(_ context.Context, id, targetID int64, kind store.LinkKind) ([]store.LinkView, error) {
+	if err := f.mutate(MutationCall{Method: "RemoveLink", ID: id, TargetID: targetID, Kind: kind}); err != nil {
+		return nil, err
+	}
+	return f.LinksValue, nil
 }
 
 // SetNamespaceDescription implements Backend.
@@ -185,10 +254,21 @@ func (f *FakeBackend) ArchiveNamespace(context.Context, string, string) (int64, 
 	return 0, ErrNotImplemented
 }
 
-// GC implements Backend.
-func (f *FakeBackend) GC(context.Context) (int64, error) { return 0, ErrNotImplemented }
+// GC implements Backend. It returns GCValue.
+func (f *FakeBackend) GC(context.Context) (int64, error) {
+	if err := f.mutate(MutationCall{Method: "GC"}); err != nil {
+		return 0, err
+	}
+	return f.GCValue, nil
+}
 
-// Similar implements Backend.
-func (f *FakeBackend) Similar(context.Context, int64) ([]store.Similar, error) {
-	return nil, ErrNotImplemented
+// Similar implements Backend. It returns SimilarValue.
+func (f *FakeBackend) Similar(_ context.Context, id int64) ([]store.Similar, error) {
+	if err := f.enter("Similar"); err != nil {
+		return nil, err
+	}
+	if err := f.Errs["Similar"]; err != nil {
+		return nil, err
+	}
+	return f.SimilarValue, nil
 }

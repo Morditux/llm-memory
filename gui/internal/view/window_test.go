@@ -54,6 +54,8 @@ func build(t *testing.T, a fyne.App, b core.Backend) (*MainWindow, func(n int)) 
 	t.Helper()
 	ch := make(chan struct{}, 8)
 	w := newMainWindow(context.Background(), a, b, func() { ch <- struct{}{} })
+	// A real timer would fire during a later test and race with it.
+	w.bannerAfter = func(time.Duration, func()) func() bool { return func() bool { return true } }
 	return w, func(n int) {
 		t.Helper()
 		for range n {
@@ -81,8 +83,8 @@ func TestMainWindowPopulates(t *testing.T) {
 	if w.nsList.Length() != 3 {
 		t.Fatalf("list length = %d, want 3 (All + 2)", w.nsList.Length())
 	}
-	if !w.newBtn.Disabled() || !w.gcBtn.Disabled() {
-		t.Fatal("toolbar buttons should be disabled until the mutation phase")
+	if w.newBtn.Disabled() || w.gcBtn.Disabled() {
+		t.Fatal("toolbar buttons must be enabled")
 	}
 	if len(w.items) != 2 || w.empty.Visible() || w.pager.Visible() {
 		t.Fatalf("items = %d, empty = %v, pager = %v", len(w.items), w.empty.Visible(), w.pager.Visible())

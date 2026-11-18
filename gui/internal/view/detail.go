@@ -42,7 +42,9 @@ func (w *MainWindow) setEmptyDetail() {
 
 func (w *MainWindow) resetDetailRefs() {
 	w.tagButtons, w.linkButtons, w.diffGrids, w.rawLabels = nil, nil, nil, nil
+	w.supersedeBtn, w.unlinkBtns = nil, nil
 	w.diffToggle = nil
+	w.actions, w.edit, w.simBox, w.linkAdd = detailActions{}, nil, nil, linkAddRow{}
 }
 
 func heading(text string) *widget.Label {
@@ -55,25 +57,18 @@ func (w *MainWindow) setDetail(v core.DetailView) {
 	m := v.Memory
 	w.resetDetailRefs()
 	w.title = heading(fmt.Sprintf("Memory #%d", m.ID))
-	objs := []fyne.CanvasObject{w.title, widget.NewRichText(memoryMeta(m, false)...)}
-
-	if m.Title != "" {
-		objs = append(objs, heading(m.Title))
+	objs := []fyne.CanvasObject{
+		container.NewBorder(nil, nil, w.title, w.actionButtons(m)),
+		widget.NewRichText(memoryMeta(m, false)...),
 	}
-	if len(m.Tags) > 0 {
-		tags := container.NewHBox()
-		for _, t := range m.Tags {
-			b := widget.NewButton("#"+t, func() { w.onTag(t) })
-			b.Importance = widget.LowImportance
-			w.tagButtons = append(w.tagButtons, b)
-			tags.Add(b)
-		}
-		objs = append(objs, tags)
+	if v.Editing {
+		w.edit = w.newEditForm(m)
+		objs = append(objs, w.edit.form())
+	} else {
+		objs = append(objs, w.readBody(m)...)
 	}
-	content := widget.NewLabel(m.Content)
-	content.Wrapping = fyne.TextWrapWord
-	content.Selectable = true
-	objs = append(objs, content)
+	w.simBox = container.NewVBox()
+	objs = append(objs, w.simBox)
 
 	objs = append(objs, heading(fmt.Sprintf("Links (%d)", len(v.Links))))
 	if len(v.Links) == 0 {
@@ -82,8 +77,9 @@ func (w *MainWindow) setDetail(v core.DetailView) {
 		objs = append(objs, none)
 	}
 	for _, l := range v.Links {
-		objs = append(objs, w.linkRow(l))
+		objs = append(objs, w.linkRow(m.ID, l))
 	}
+	objs = append(objs, w.buildLinkAdd(m.ID))
 
 	w.diffToggle = widget.NewButton(toggleLabel(v.DiffMode), func() {
 		go w.ctrl.SetDiffMode(!v.DiffMode)
@@ -119,7 +115,7 @@ func (w *MainWindow) onTag(tag string) {
 	w.loadList()
 }
 
-func (w *MainWindow) linkRow(l store.LinkView) fyne.CanvasObject {
+func (w *MainWindow) linkRow(id int64, l store.LinkView) fyne.CanvasObject {
 	kind := string(l.Kind)
 	if l.Direction != "outgoing" {
 		kind = "← " + kind
@@ -140,7 +136,15 @@ func (w *MainWindow) linkRow(l store.LinkView) fyne.CanvasObject {
 		a.Importance = widget.DangerImportance
 		row.Add(a)
 	}
-	return row
+	if l.Direction != "outgoing" || l.Kind == store.LinkSupersedes {
+		return row
+	}
+	rm := widget.NewButton("×", func() {
+		go func() { _ = w.ctrl.RemoveLink(w.ctx, id, l.ID, l.Kind) }()
+	})
+	rm.Importance = widget.DangerImportance
+	w.unlinkBtns = append(w.unlinkBtns, rm)
+	return container.NewBorder(nil, nil, nil, rm, row)
 }
 
 func (w *MainWindow) historyRow(h core.HistoryItem, diff bool) fyne.CanvasObject {
