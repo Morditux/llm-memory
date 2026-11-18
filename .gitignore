@@ -4,3 +4,7 @@ coverage.out
 *.db
 *.db-wal
 *.db-shm
+# fyne package outputs
+/gui/**/llm-memory-gui.tar.xz
+/gui/**/llm-memory-gui.app/
+/gui/**/llm-memory-gui.exe
