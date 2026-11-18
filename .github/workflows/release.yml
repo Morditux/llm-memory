@@ -103,15 +103,19 @@ jobs:
             --icon ../../Icon.png --app-version ${{ steps.version.outputs.version }} \
             --app-build ${{ github.run_number }}
           mkdir -p ../dist
+          # The output lands in the cwd or in the source dir depending on the OS.
+          locate() { find . -maxdepth 3 -name "$1" -print -quit | grep . ; }
           case ${{ matrix.target }} in
             linux)
-              mv llm-memory-gui.tar.xz ../dist/llm-memory-gui-linux-amd64.tar.xz ;;
+              mv "$(locate llm-memory-gui.tar.xz)" ../dist/llm-memory-gui-linux-amd64.tar.xz ;;
             darwin)
-              ditto -c -k --sequesterRsrc --keepParent llm-memory-gui.app \
+              app=$(locate llm-memory-gui.app)
+              ditto -c -k --sequesterRsrc --keepParent "$app" \
                 ../dist/llm-memory-gui-darwin-arm64.zip ;;
             windows)
-              mv llm-memory-gui.exe ../dist/llm-memory-gui-windows-amd64.exe ;;
+              mv "$(locate llm-memory-gui.exe)" ../dist/llm-memory-gui-windows-amd64.exe ;;
           esac
+          ls -la ../dist
 
       - name: Build AppImage
         if: runner.os == 'Linux'
