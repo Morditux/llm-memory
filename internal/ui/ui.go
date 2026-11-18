@@ -189,7 +189,7 @@ func NewHandlerWithOptions(st *store.Store, search Searcher, opts Options) http.
 		if !ok {
 			return
 		}
-		m, err := ex.Archive(r.Context(), id)
+		m, err := ex.Archive(r.Context(), id, "archived from web UI")
 		if err != nil {
 			writeErr(w, err)
 			return

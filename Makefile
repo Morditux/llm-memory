@@ -6,7 +6,7 @@ GOLANGCI     ?= $(shell command -v golangci-lint 2>/dev/null || echo $(shell go 
 GOLANGCI_PKG := github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest
 PLATFORMS := linux/amd64 linux/arm64 darwin/arm64 windows/amd64
 
-.PHONY: all build test cover lint fmt release clean
+.PHONY: all build test cover lint fmt release clean gui gui-test
 
 all: fmt lint test build
 
@@ -39,6 +39,12 @@ release:
 		CGO_ENABLED=0 GOOS=$$os GOARCH=$$arch go build -trimpath -ldflags '$(LDFLAGS)' \
 			-o dist/$(BINARY)-$$os-$$arch$$ext $(PKG) || exit 1; \
 	done
+
+gui:
+	cd gui && CGO_ENABLED=1 go build -trimpath -ldflags '$(LDFLAGS)' -o ../bin/llm-memory-gui ./cmd/llm-memory-gui
+
+gui-test:
+	cd gui && CGO_ENABLED=1 go test -race ./...
 
 clean:
 	rm -rf bin dist coverage.out

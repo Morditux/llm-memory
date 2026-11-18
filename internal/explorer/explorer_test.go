@@ -244,3 +244,28 @@ func TestSimilarWithSemanticEngine(t *testing.T) {
 		t.Fatalf("got %+v", sims)
 	}
 }
+
+func TestArchiveRecordsReason(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	ex := New(st, nil, "gui")
+	m, err := ex.Create(ctx, CreateRequest{Namespace: "demo", Kind: store.KindFact, Title: "A", Content: "alpha"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := ex.Archive(ctx, m.ID, "obsolete")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Archived() {
+		t.Fatalf("memory not archived: %+v", got)
+	}
+	d, err := ex.Detail(ctx, m.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := d.History[len(d.History)-1]
+	if last.Action != store.ActionArchive || last.ChangedBy != "gui" || !strings.Contains(last.Snapshot, "obsolete") {
+		t.Fatalf("last history = %+v", last)
+	}
+}
