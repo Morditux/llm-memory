@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Morditux/llm-memory/internal/bootstrap"
 	"github.com/Morditux/llm-memory/internal/briefing"
 	"github.com/Morditux/llm-memory/internal/config"
 	"github.com/Morditux/llm-memory/internal/store"
@@ -229,7 +230,7 @@ func hookText(ctx context.Context, flags *config.Flags, env config.Env, event st
 		var searcher briefing.Searcher = st
 		if cfg.Embed.Enabled() {
 			logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-			if eng, err := newEngine(st, cfg, logger); err == nil && eng != nil {
+			if eng, err := bootstrap.NewEngine(st, cfg, logger); err == nil && eng != nil {
 				searcher = eng
 			}
 		}
