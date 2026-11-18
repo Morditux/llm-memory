@@ -6,7 +6,7 @@ GOLANGCI     ?= $(shell command -v golangci-lint 2>/dev/null || echo $(shell go 
 GOLANGCI_PKG := github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest
 PLATFORMS := linux/amd64 linux/arm64 darwin/arm64 windows/amd64
 
-.PHONY: all build test cover lint fmt release clean gui gui-test
+.PHONY: all build test cover lint fmt release clean gui gui-test gui-appimage
 
 all: fmt lint test build
 
@@ -45,6 +45,10 @@ gui:
 
 gui-test:
 	cd gui && CGO_ENABLED=1 go test -race ./...
+
+# Requires appimagetool in PATH (or APPIMAGETOOL=/path/to/appimagetool).
+gui-appimage: gui
+	scripts/build-appimage.sh bin/llm-memory-gui $(VERSION) dist/llm-memory-gui-linux-x86_64.AppImage
 
 clean:
 	rm -rf bin dist coverage.out
