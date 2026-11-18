@@ -4,13 +4,25 @@ on:
   push:
     tags:
       - "v*"
+  # Dry run: builds every artifact without publishing, to validate changes
+  # to the release pipeline before tagging.
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - scripts/build-appimage.sh
+      - Makefile
+  workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+env:
+  FYNE_TOOLS_VERSION: v1.7.4
+  APP_ID: io.github.morditux.llm-memory
 
 jobs:
-  release:
-    name: Build & Publish Release
+  cli:
+    name: CLI binaries
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -25,12 +37,120 @@ jobs:
         run: go test ./...
 
       - name: Build release binaries
-        run: VERSION=${GITHUB_REF_NAME} make release
+        run: VERSION=$(git describe --tags --always) make release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cli
+          path: dist/*
+          if-no-files-found: error
+
+  gui:
+    name: GUI (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04 # oldest glibc available: widest Linux compatibility
+            target: linux
+          - os: macos-latest
+            target: darwin
+          - os: windows-latest
+            target: windows
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: gui/go.mod
+          cache-dependency-path: gui/go.sum
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc libgl1-mesa-dev xorg-dev libxkbcommon-dev
+
+      - name: Install fyne CLI
+        run: go install fyne.io/tools/cmd/fyne@${FYNE_TOOLS_VERSION}
+
+      - name: Compute version
+        id: version
+        run: |
+          # fyne needs a numeric x.y.z version; non-tag builds get 0.0.0.
+          tag=$(git describe --tags --exact-match 2>/dev/null || true)
+          v=${tag#v}
+          [[ $v =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || v=0.0.0
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Test
+        working-directory: gui
+        run: CGO_ENABLED=1 go test ./...
+
+      - name: Package
+        working-directory: gui
+        env:
+          CGO_ENABLED: "1"
+        run: |
+          fyne package --os ${{ matrix.target }} --release \
+            --src cmd/llm-memory-gui --name llm-memory-gui --app-id "$APP_ID" \
+            --icon ../../Icon.png --app-version ${{ steps.version.outputs.version }} \
+            --app-build ${{ github.run_number }}
+          mkdir -p ../dist
+          case ${{ matrix.target }} in
+            linux)
+              mv llm-memory-gui.tar.xz ../dist/llm-memory-gui-linux-amd64.tar.xz ;;
+            darwin)
+              ditto -c -k --sequesterRsrc --keepParent llm-memory-gui.app \
+                ../dist/llm-memory-gui-darwin-arm64.zip ;;
+            windows)
+              mv llm-memory-gui.exe ../dist/llm-memory-gui-windows-amd64.exe ;;
+          esac
+
+      - name: Build AppImage
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y desktop-file-utils
+          curl -fsSL -o "$RUNNER_TEMP/appimagetool" \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x "$RUNNER_TEMP/appimagetool"
+          mkdir -p "$RUNNER_TEMP/bin"
+          tar -xJf dist/llm-memory-gui-linux-amd64.tar.xz -C "$RUNNER_TEMP/bin" \
+            --strip-components=4 llm-memory-gui/usr/local/bin/llm-memory-gui
+          APPIMAGETOOL="$RUNNER_TEMP/appimagetool" scripts/build-appimage.sh \
+            "$RUNNER_TEMP/bin/llm-memory-gui" ${{ steps.version.outputs.version }} \
+            dist/llm-memory-gui-linux-x86_64.AppImage
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gui-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [cli, gui]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
 
       - name: Generate checksums
         run: |
           cd dist
           sha256sum llm-memory-* > checksums.txt
+          cat checksums.txt
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

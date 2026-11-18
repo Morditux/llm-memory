@@ -134,6 +134,17 @@ structured takes more discipline from the model.
 Prebuilt binaries are published on [GitHub Releases](https://github.com/Morditux/llm-memory/releases)
 for linux/amd64, linux/arm64, darwin/arm64 and windows/amd64 (or built locally with `make release`).
 
+The desktop explorer `llm-memory-gui` (Fyne) is published alongside:
+
+| Platform | Asset |
+| --- | --- |
+| Windows (amd64) | `llm-memory-gui-windows-amd64.exe` |
+| Linux / Ubuntu (amd64) | `llm-memory-gui-linux-amd64.tar.xz` (`sudo make install` inside the archive) |
+| Linux, any distribution (x86_64) | `llm-memory-gui-linux-x86_64.AppImage` |
+| macOS (Apple Silicon) | `llm-memory-gui-darwin-arm64.zip` (unsigned `.app`: right-click › Open the first time) |
+
+The GUI uses OpenGL: on Linux it needs `libgl1` and X11/Wayland libraries, present on any desktop install.
+
 With Go ≥ 1.26:
 
 ```bash
@@ -366,6 +377,8 @@ machine-b$ llm-memory export --history -o b.json         # then: machine-a$ llm-
 | `make cover` | Overall coverage |
 | `make fmt` | `gofmt -s -w .` |
 | `make release` | Cross-platform binaries in `dist/` |
+| `make gui` / `make gui-test` | Build / test the desktop GUI (CGO, needs OpenGL headers) |
+| `make gui-appimage` | AppImage of the GUI in `dist/` (needs `appimagetool`) |
 
 Updating golden files: `go test ./internal/briefing ./cmd/llm-memory -update`.
 
