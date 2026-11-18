@@ -2,16 +2,11 @@ package core
 
 import (
 	"context"
-	"errors"
 	"sync"
 
 	"github.com/Morditux/llm-memory/internal/explorer"
 	"github.com/Morditux/llm-memory/internal/store"
 )
-
-// ErrNotImplemented is returned by the FakeBackend methods that are not
-// needed yet.
-var ErrNotImplemented = errors.New("fake backend: not implemented")
 
 // FakeBackend is an in-memory Backend for tests, here and in the view package.
 // Set the exported fields before use; Hook, when set, runs at the start of
@@ -40,6 +35,12 @@ type FakeBackend struct {
 	GCValue      int64
 	LinksValue   []store.LinkView
 	SimilarValue []store.Similar
+	// RenameValue is the name RenameNamespace returns (default: the new
+	// name), MergeValue and ArchiveNamespaceValue the counts returned by
+	// MergeNamespace and ArchiveNamespace.
+	RenameValue           string
+	MergeValue            int64
+	ArchiveNamespaceValue int64
 
 	mu        sync.Mutex
 	calls     map[string]int
@@ -149,8 +150,10 @@ type MutationCall struct {
 	TargetID int64
 	Kind     store.LinkKind
 	Reason   string
-	Create   explorer.CreateRequest
-	Update   explorer.UpdateRequest
+	// Name is the namespace acted on; NewName the new name or merge target.
+	Name, NewName, Description string
+	Create                     explorer.CreateRequest
+	Update                     explorer.UpdateRequest
 }
 
 // MutationCalls returns every mutating call, in order.
@@ -234,24 +237,41 @@ func (f *FakeBackend) RemoveLink(_ context.Context, id, targetID int64, kind sto
 	return f.LinksValue, nil
 }
 
-// SetNamespaceDescription implements Backend.
-func (f *FakeBackend) SetNamespaceDescription(context.Context, string, string) (string, string, error) {
-	return "", "", ErrNotImplemented
+// SetNamespaceDescription implements Backend. It returns the name and
+// description it was given.
+func (f *FakeBackend) SetNamespaceDescription(_ context.Context, name, description string) (string, string, error) {
+	if err := f.mutate(MutationCall{Method: "SetNamespaceDescription", Name: name, Description: description}); err != nil {
+		return "", "", err
+	}
+	return name, description, nil
 }
 
-// RenameNamespace implements Backend.
-func (f *FakeBackend) RenameNamespace(context.Context, string, string) (string, error) {
-	return "", ErrNotImplemented
+// RenameNamespace implements Backend. It returns RenameValue, or newName when
+// RenameValue is empty.
+func (f *FakeBackend) RenameNamespace(_ context.Context, name, newName string) (string, error) {
+	if err := f.mutate(MutationCall{Method: "RenameNamespace", Name: name, NewName: newName}); err != nil {
+		return "", err
+	}
+	if f.RenameValue != "" {
+		return f.RenameValue, nil
+	}
+	return newName, nil
 }
 
-// MergeNamespace implements Backend.
-func (f *FakeBackend) MergeNamespace(context.Context, string, string) (int64, error) {
-	return 0, ErrNotImplemented
+// MergeNamespace implements Backend. It returns MergeValue.
+func (f *FakeBackend) MergeNamespace(_ context.Context, name, target string) (int64, error) {
+	if err := f.mutate(MutationCall{Method: "MergeNamespace", Name: name, NewName: target}); err != nil {
+		return 0, err
+	}
+	return f.MergeValue, nil
 }
 
-// ArchiveNamespace implements Backend.
-func (f *FakeBackend) ArchiveNamespace(context.Context, string, string) (int64, error) {
-	return 0, ErrNotImplemented
+// ArchiveNamespace implements Backend. It returns ArchiveNamespaceValue.
+func (f *FakeBackend) ArchiveNamespace(_ context.Context, name, reason string) (int64, error) {
+	if err := f.mutate(MutationCall{Method: "ArchiveNamespace", Name: name, Reason: reason}); err != nil {
+		return 0, err
+	}
+	return f.ArchiveNamespaceValue, nil
 }
 
 // GC implements Backend. It returns GCValue.

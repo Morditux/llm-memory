@@ -105,3 +105,119 @@ func TestMutationsAgainstRealStore(t *testing.T) {
 		t.Fatalf("links after removal = %+v", v.Links)
 	}
 }
+
+// TestNamespaceActionsAgainstRealStore renames, merges and archives namespaces
+// over a real store and checks counts, selection and history attribution.
+func TestNamespaceActionsAgainstRealStore(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "gui.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	var banners []string
+	var nss []store.Namespace
+	c := core.NewController(explorer.New(st, nil, "gui"), core.Observer{
+		Banner: func(msg string, isErr bool) {
+			if isErr {
+				msg = "ERR " + msg
+			}
+			banners = append(banners, msg)
+		},
+		Namespaces: func(ns []store.Namespace) { nss = ns },
+		Error:      func(err error) { t.Errorf("load error: %v", err) },
+	})
+	mk := func(ns, content string) store.Memory {
+		t.Helper()
+		m, err := c.Create(ctx, core.CreateForm{Namespace: ns, Kind: "note", Importance: 2, Content: content}.Request())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return m
+	}
+	a1, a2 := mk("alpha", "one"), mk("alpha", "two")
+	b1 := mk("beta", "three")
+	count := func(name string) int {
+		for _, n := range nss {
+			if n.Name == name {
+				return n.ActiveCount
+			}
+		}
+		return -1
+	}
+	lastBanner := func() string { return banners[len(banners)-1] }
+
+	if err := c.SetNamespaceDescription(ctx, "alpha", " The alphas "); err != nil {
+		t.Fatal(err)
+	}
+	if lastBanner() != `Updated description for "alpha"` {
+		t.Fatalf("banner = %q", lastBanner())
+	}
+	for _, n := range nss {
+		if n.Name == "alpha" && n.Description != "The alphas" {
+			t.Fatalf("description = %q", n.Description)
+		}
+	}
+
+	c.SelectNamespace("alpha")
+	c.SetOffset(50)
+	if err := c.RenameNamespace(ctx, "alpha", " Gamma "); err != nil {
+		t.Fatal(err)
+	}
+	if f := c.Filters(); f.Namespace != "gamma" || f.Offset != 0 {
+		t.Fatalf("filters = %+v", f)
+	}
+	if lastBanner() != `Renamed namespace to "gamma"` || count("gamma") != 2 || count("alpha") != -1 {
+		t.Fatalf("banner = %q, gamma = %d, alpha = %d", lastBanner(), count("gamma"), count("alpha"))
+	}
+	if err := c.RenameNamespace(ctx, "gamma", "beta"); err == nil || !strings.HasPrefix(lastBanner(), "ERR ") {
+		t.Fatalf("renaming onto an existing namespace: err = %v, banner = %q", err, lastBanner())
+	}
+	if err := c.RenameNamespace(ctx, "global", "x"); err == nil {
+		t.Fatal("global renamed")
+	}
+
+	if err := c.MergeNamespace(ctx, "gamma", " beta "); err != nil {
+		t.Fatal(err)
+	}
+	if c.Filters().Namespace != "beta" || lastBanner() != `Merged "gamma" into "beta" (2 moved)` ||
+		count("beta") != 3 || count("gamma") != -1 {
+		t.Fatalf("namespace = %q, banner = %q, beta = %d", c.Filters().Namespace, lastBanner(), count("beta"))
+	}
+
+	if err := c.ArchiveNamespace(ctx, "beta"); err != nil {
+		t.Fatal(err)
+	}
+	if lastBanner() != `Archived 3 memory(ies) in "beta"` || count("beta") != 0 {
+		t.Fatalf("banner = %q, beta = %d", lastBanner(), count("beta"))
+	}
+
+	for _, id := range []int64{a1.ID, a2.ID, b1.ID} {
+		hist, err := st.History(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var actions []store.Action
+		for _, h := range hist {
+			if h.ChangedBy != "gui" {
+				t.Errorf("memory %d: history %d changed_by = %q", id, h.ID, h.ChangedBy)
+			}
+			actions = append(actions, h.Action)
+		}
+		want := []store.Action{store.ActionCreate, store.ActionUpdate, store.ActionUpdate, store.ActionArchive}
+		if id == b1.ID {
+			want = []store.Action{store.ActionCreate, store.ActionArchive} // b1 stays in beta
+		}
+		if !slices.Equal(actions, want) {
+			t.Errorf("memory %d: actions = %v, want %v", id, actions, want)
+		}
+		m, err := st.Get(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if m.Namespace != "beta" || m.ArchivedAt == nil || m.UpdatedBy != "gui" {
+			t.Errorf("memory %d = %+v", id, m)
+		}
+	}
+}

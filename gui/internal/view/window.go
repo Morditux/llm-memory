@@ -38,6 +38,10 @@ type MainWindow struct {
 	stats   *widget.Label
 	nsList  *widget.List
 	nsItems []store.Namespace
+	// nsRow is the highlighted row of nsList: 0 is "All namespaces".
+	nsRow      int
+	nsPanel    *nsPanel
+	nsPanelBox *fyne.Container
 
 	banner  *widget.Label
 	search  *widget.Entry
@@ -138,9 +142,11 @@ func newMainWindow(ctx context.Context, app fyne.App, b core.Backend, updated fu
 		container.NewHBox(title, w.newBtn, w.gcBtn), w.stats)
 
 	w.nsList = w.buildNamespaceList()
+	w.nsPanelBox = container.NewVBox()
+	w.nsPanelBox.Hide()
 	left := container.NewBorder(
 		widget.NewLabelWithStyle("Namespaces", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
-		nil, nil, nil, w.nsList)
+		w.nsPanelBox, nil, nil, w.nsList)
 
 	inner := container.NewHSplit(w.buildCenter(), w.buildDetail())
 	inner.SetOffset(0.55)
@@ -205,11 +211,13 @@ func (w *MainWindow) buildNamespaceList() *widget.List {
 		if w.syncing {
 			return
 		}
+		w.nsRow = i
 		if i == 0 {
 			w.ctrl.SelectNamespace("")
 		} else {
 			w.ctrl.SelectNamespace(w.nsItems[i-1].Name)
 		}
+		w.updateNamespacePanel()
 		w.loadList()
 	}
 	return l
@@ -227,8 +235,10 @@ func (w *MainWindow) setNamespaces(ns []store.Namespace) {
 		}
 	}
 	w.syncing = true
+	w.nsRow = sel
 	w.nsList.Select(sel)
 	w.syncing = false
+	w.updateNamespacePanel()
 }
 
 // showBanner shows a status message: errors in red until the next successful
