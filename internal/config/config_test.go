@@ -184,7 +184,8 @@ func TestResolveEmbed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("model2vec defaults: %v", err)
 	}
-	if !cfg.Embed.Enabled() || cfg.Embed.Provider != EmbedProviderModel2Vec || cfg.Embed.Model != DefaultModel2VecModel || cfg.Embed.CacheDir != "/home/test/.llm-memory/models" {
+	wantDefaultCacheDir := filepath.Join("/home/test", ".llm-memory", "models")
+	if !cfg.Embed.Enabled() || cfg.Embed.Provider != EmbedProviderModel2Vec || cfg.Embed.Model != DefaultModel2VecModel || cfg.Embed.CacheDir != wantDefaultCacheDir {
 		t.Errorf("model2vec defaults = %+v", cfg.Embed)
 	}
 
@@ -197,7 +198,8 @@ func TestResolveEmbed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("model2vec env: %v", err)
 	}
-	if cfg.Embed.Provider != EmbedProviderModel2Vec || cfg.Embed.Model != "minishlab/potion-multilingual-128M" || cfg.Embed.CacheDir != "/home/test/custom-models" {
+	wantCustomCacheDir := filepath.Join("/home/test", "custom-models")
+	if cfg.Embed.Provider != EmbedProviderModel2Vec || cfg.Embed.Model != "minishlab/potion-multilingual-128M" || cfg.Embed.CacheDir != wantCustomCacheDir {
 		t.Errorf("model2vec env = %+v", cfg.Embed)
 	}
 }
