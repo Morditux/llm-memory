@@ -35,7 +35,12 @@ type Observer struct {
 	Namespaces func([]store.Namespace)
 	List       func(ListResult)
 	Detail     func(DetailView)
-	Error      func(error)
+	// Similar receives the progress and result of FindSimilar.
+	Similar func(SimilarView)
+	// Banner receives the outcome of a mutation: a success message, or the
+	// error text with isErr set.
+	Banner func(msg string, isErr bool)
+	Error  func(error)
 }
 
 // Controller owns the UI state and loads data from a Backend.
@@ -52,6 +57,8 @@ type Controller struct {
 
 	diffMode   bool
 	lastDetail *explorer.Detail
+	editing    bool
+	similar    *SimilarView
 	after      AfterFunc
 	pending    func() bool // stops the pending debounce timer, if any
 }

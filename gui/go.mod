@@ -4,6 +4,8 @@ go 1.26.0
 
 require github.com/Morditux/llm-memory v0.0.0
 
+require github.com/FyshOS/fancyfs v0.0.1 // indirect
+
 require (
 	fyne.io/fyne/v2 v2.8.2
 	fyne.io/systray v1.12.3-0.20260810170012-af4e8e793ec4 // indirect
@@ -27,7 +29,6 @@ require (
 	github.com/hack-pad/safejs v0.1.0 // indirect
 	github.com/jeandeaual/go-locale v0.0.0-20250612000132-0ef82f21eade // indirect
 	github.com/jsummers/gobmp v0.0.0-20230614200233-a9de23ed2e25 // indirect
-	github.com/kr/text v0.2.0 // indirect
 	github.com/mattn/go-isatty v0.0.24 // indirect
 	github.com/mattn/go-runewidth v0.0.24 // indirect
 	github.com/ncruces/go-strftime v1.1.0 // indirect
