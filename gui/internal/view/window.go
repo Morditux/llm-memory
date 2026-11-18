@@ -3,6 +3,7 @@ package view
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
@@ -31,7 +32,33 @@ type MainWindow struct {
 	stats   *widget.Label
 	nsList  *widget.List
 	nsItems []store.Namespace
-	nsErr   *widget.Label
+
+	banner  *widget.Label
+	search  *widget.Entry
+	tags    *widget.Entry
+	kind    *widget.Select
+	arch    *widget.Select
+	list    *widget.List
+	items   []store.Memory
+	empty   *widget.Label
+	pager   *fyne.Container
+	prevBtn *widget.Button
+	nextBtn *widget.Button
+	pageLbl *widget.Label
+
+	detail       *fyne.Container
+	detailScroll *container.Scroll
+	shownID      int64
+	title        *widget.Label
+	tagButtons   []*widget.Button
+	linkButtons  []*widget.Button
+	diffToggle   *widget.Button
+	diffGrids    []*widget.TextGrid
+	rawLabels    []*widget.Label
+
+	// syncing is set while the views are changed programmatically so that
+	// their change callbacks do not act as user input. UI thread only.
+	syncing bool
 
 	// updated, when set, is called on the UI thread after each data update.
 	updated func()
@@ -46,8 +73,13 @@ func NewMainWindow(ctx context.Context, app fyne.App, b core.Backend) *MainWindo
 func newMainWindow(ctx context.Context, app fyne.App, b core.Backend, updated func()) *MainWindow {
 	app.Settings().SetTheme(Theme{})
 	w := &MainWindow{ctx: ctx, Window: app.NewWindow("llm-memory"), updated: updated}
+	// uiMu serialises updates: the real driver runs them on one thread, but
+	// the test driver runs fyne.Do inline in the calling goroutine.
+	var uiMu sync.Mutex
 	ui := func(f func()) {
 		fyne.Do(func() {
+			uiMu.Lock()
+			defer uiMu.Unlock()
 			f()
 			if w.updated != nil {
 				w.updated()
@@ -57,7 +89,9 @@ func newMainWindow(ctx context.Context, app fyne.App, b core.Backend, updated fu
 	w.ctrl = core.NewController(b, core.Observer{
 		Stats:      func(s store.Stats) { ui(func() { w.stats.SetText(core.StatsLine(s)) }) },
 		Namespaces: func(ns []store.Namespace) { ui(func() { w.setNamespaces(ns) }) },
-		Error:      func(err error) { ui(func() { w.nsErr.SetText(err.Error()) }) },
+		List:       func(r core.ListResult) { ui(func() { w.setList(r) }) },
+		Detail:     func(v core.DetailView) { ui(func() { w.setDetail(v) }) },
+		Error:      func(err error) { ui(func() { w.showError(err) }) },
 	})
 
 	w.newBtn = widget.NewButton("+ New", nil)
@@ -71,18 +105,12 @@ func newMainWindow(ctx context.Context, app fyne.App, b core.Backend, updated fu
 	toolbar := container.NewBorder(nil, nil,
 		container.NewHBox(title, w.newBtn, w.gcBtn), w.stats)
 
-	w.nsErr = widget.NewLabel("")
-	w.nsErr.Importance = widget.DangerImportance
-	w.nsErr.Wrapping = fyne.TextWrapWord
 	w.nsList = w.buildNamespaceList()
 	left := container.NewBorder(
 		widget.NewLabelWithStyle("Namespaces", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
-		w.nsErr, nil, nil, w.nsList)
+		nil, nil, nil, w.nsList)
 
-	center := placeholder("Memories")
-	right := placeholder("Select a memory")
-
-	inner := container.NewHSplit(center, right)
+	inner := container.NewHSplit(w.buildCenter(), w.buildDetail())
 	inner.SetOffset(0.55)
 	root := container.NewHSplit(left, inner)
 	root.SetOffset(0.18)
@@ -95,9 +123,18 @@ func newMainWindow(ctx context.Context, app fyne.App, b core.Backend, updated fu
 	return w
 }
 
-// Reload fetches stats and namespaces in the background.
+// Reload fetches stats, namespaces and the memory list in the background.
 func (w *MainWindow) Reload() {
 	go func() { _ = w.ctrl.Refresh(w.ctx) }()
+	w.loadList()
+}
+
+func (w *MainWindow) loadList() {
+	go func() { _ = w.ctrl.LoadList(w.ctx) }()
+}
+
+func (w *MainWindow) loadDetail(id int64) {
+	go func() { _ = w.ctrl.LoadDetail(w.ctx, id) }()
 }
 
 // Controller returns the window controller.
@@ -132,23 +169,41 @@ func (w *MainWindow) buildNamespaceList() *widget.List {
 		},
 	)
 	l.OnSelected = func(i widget.ListItemID) {
-		if i == 0 {
-			w.ctrl.SelectNamespace("")
+		if w.syncing {
 			return
 		}
-		w.ctrl.SelectNamespace(w.nsItems[i-1].Name)
+		if i == 0 {
+			w.ctrl.SelectNamespace("")
+		} else {
+			w.ctrl.SelectNamespace(w.nsItems[i-1].Name)
+		}
+		w.loadList()
 	}
 	return l
 }
 
 func (w *MainWindow) setNamespaces(ns []store.Namespace) {
-	w.nsErr.SetText("")
+	w.clearError()
 	w.nsItems = ns
 	w.nsList.Refresh()
+	sel := 0
+	cur := w.ctrl.Filters().Namespace
+	for i, n := range ns {
+		if n.Name == cur {
+			sel = i + 1
+		}
+	}
+	w.syncing = true
+	w.nsList.Select(sel)
+	w.syncing = false
 }
 
-func placeholder(text string) fyne.CanvasObject {
-	l := widget.NewLabel(text)
-	l.Importance = widget.LowImportance
-	return container.NewCenter(l)
+func (w *MainWindow) showError(err error) {
+	w.banner.SetText(err.Error())
+	w.banner.Show()
+}
+
+func (w *MainWindow) clearError() {
+	w.banner.SetText("")
+	w.banner.Hide()
 }
