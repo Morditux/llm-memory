@@ -2,12 +2,12 @@ package view
 
 import (
 	"fmt"
-	"strings"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/widget"
 
+	"github.com/Morditux/llm-memory/gui/internal/core"
 	"github.com/Morditux/llm-memory/internal/store"
 )
 
@@ -95,8 +95,8 @@ func (w *MainWindow) updateNamespacePanel() {
 // mergeNamespace merges name into the target after a confirmation. A blank
 // target is sent as is so that the backend error reaches the banner.
 func (w *MainWindow) mergeNamespace(name, target string) {
+	target = core.NormalizeNamespaceInput(target)
 	run := func() { go func() { _ = w.ctrl.MergeNamespace(w.ctx, name, target) }() }
-	target = strings.TrimSpace(target)
 	if target == "" {
 		run()
 		return

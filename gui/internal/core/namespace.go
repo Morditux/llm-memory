@@ -54,14 +54,23 @@ func (c *Controller) RenameNamespace(ctx context.Context, name, newName string) 
 	return nil
 }
 
-// MergeNamespace moves every memory of name into target (trimmed). The
-// selected namespace becomes the target, then everything is reloaded. The
+// NormalizeNamespaceInput returns the canonical namespace name when s is valid,
+// or trimmed s so invalid inputs still reach the backend for validation.
+func NormalizeNamespaceInput(s string) string {
+	if norm, err := store.NormalizeNamespace(s); err == nil {
+		return norm
+	}
+	return strings.TrimSpace(s)
+}
+
+// MergeNamespace moves every memory of name into target (normalized when valid).
+// The selected namespace becomes the target, then everything is reloaded. The
 // global namespace is refused as a source.
 func (c *Controller) MergeNamespace(ctx context.Context, name, target string) error {
 	if isGlobal(name) {
 		return c.bannerErr(fmt.Errorf("cannot merge the %s namespace", store.DefaultNamespace))
 	}
-	target = strings.TrimSpace(target)
+	target = NormalizeNamespaceInput(target)
 	moved, err := c.backend.MergeNamespace(ctx, name, target)
 	if err != nil {
 		return c.bannerErr(err)

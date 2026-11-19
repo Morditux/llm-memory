@@ -178,7 +178,7 @@ func TestNamespaceActionsAgainstRealStore(t *testing.T) {
 		t.Fatal("global renamed")
 	}
 
-	if err := c.MergeNamespace(ctx, "gamma", " beta "); err != nil {
+	if err := c.MergeNamespace(ctx, "gamma", "  Beta "); err != nil {
 		t.Fatal(err)
 	}
 	if c.Filters().Namespace != "beta" || lastBanner() != `Merged "gamma" into "beta" (2 moved)` ||

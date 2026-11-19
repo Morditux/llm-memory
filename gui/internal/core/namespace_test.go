@@ -92,6 +92,28 @@ func TestMergeNamespaceFollowsTarget(t *testing.T) {
 	}
 }
 
+func TestMergeNamespaceNormalizesTarget(t *testing.T) {
+	fb := mutFake()
+	fb.MergeValue = 2
+	c, r := setup(fb)
+	ctx := context.Background()
+	c.SelectNamespace("alpha")
+
+	if err := c.MergeNamespace(ctx, "alpha", "  My  Target "); err != nil {
+		t.Fatal(err)
+	}
+	want := MutationCall{Method: "MergeNamespace", Name: "alpha", NewName: "my-target"}
+	if calls := fb.MutationCalls(); len(calls) != 1 || !reflect.DeepEqual(calls[0], want) {
+		t.Fatalf("calls = %+v", calls)
+	}
+	if b := []banner{{`Merged "alpha" into "my-target" (2 moved)`, false}}; !slices.Equal(r.banners, b) {
+		t.Fatalf("banners = %+v", r.banners)
+	}
+	if got := c.Filters().Namespace; got != "my-target" {
+		t.Fatalf("namespace filter = %q, want %q", got, "my-target")
+	}
+}
+
 func TestArchiveNamespace(t *testing.T) {
 	fb := mutFake()
 	fb.ArchiveNamespaceValue = 6

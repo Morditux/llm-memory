@@ -164,7 +164,7 @@ func TestMergeAsksConfirmation(t *testing.T) {
 	w, wait, c := nsReady(t, a, 2, fb)
 	fb.NamespacesValue = []store.Namespace{{Name: "global", ActiveCount: 5}}
 
-	w.nsPanel.mergeTo.SetText("  global ")
+	w.nsPanel.mergeTo.SetText("  Global ")
 	c.accept = false
 	test.Tap(w.nsPanel.merge)
 	if len(c.msgs) != 1 || !strings.Contains(c.msgs[0], `"demo"`) || !strings.Contains(c.msgs[0], `"global"`) ||
