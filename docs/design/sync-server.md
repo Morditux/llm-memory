@@ -1,6 +1,6 @@
 # Design: Multi-Machine Sync Server
 
-Status: draft, revised after design review (2026-11-20). Nothing implemented yet.
+Status: design finalized (2026-11-20). Nothing implemented yet.
 
 ## Overview
 
@@ -21,6 +21,7 @@ It builds on [multi-machine.md](multi-machine.md) (uuid identity, dump format v2
 - **Confidentiality against the server operator.** The server merges plaintext memories; whoever has access to the data directory can read `users/*.db`. End-to-end encryption is incompatible with server-side merging and is out of scope. "Admins have no access to memory contents" is a web UI restriction, not a confidentiality guarantee; host-level disk encryption is the operator's responsibility.
 - Real-time or background sync (no daemon, no push from the server).
 - Field-level merge: last-writer-wins stays per whole row.
+- Per-namespace sync filtering (local-only / excluded namespaces): all namespaces of a user's store are always synced together; use a separate account or local database when strict isolation is needed.
 
 ## Architecture
 
@@ -46,6 +47,7 @@ Machine B (local SQLite) ──HTTP/HTTPS + JSON──▶   └── users/<use
     "protocol": 1,
     "client_version": "1.5.0",
     "schema_version": 7,
+    "client_time": "2026-11-20T10:00:00.000Z",
     "since": null,
     "dry_run": false,
     "dump": { "format_version": 3, "...": "..." }
@@ -82,8 +84,8 @@ Machine B (local SQLite) ──HTTP/HTTPS + JSON──▶   └── users/<use
 
 Last-writer-wins compares wall-clock timestamps written by different machines. The server makes skew visible instead of letting it silently decide conflicts:
 
-- **Future timestamps are rejected.** A dump containing a `created_at`, `updated_at`, `archived_at`, link timestamp, tombstone or history `changed_at` more than 5 minutes ahead of `server_time` is rejected (`400`) with the offending memory ids/uuids. A future-dated row would otherwise win every conflict until that date, and later edits on every machine would lose silently (kept only in history). Rejection rather than clamping: a clamped row would differ from the client's copy and the two would replace each other on every sync. The fix is a local `llm-memory update` of the memory, which re-dates it to `now`.
-- **Client clock check.** The client compares `server_time` (corrected by half the round trip) with its own clock and refuses to push when the skew exceeds a threshold (default 2 minutes), with an explicit error; `doctor` reports the measured skew.
+- **Clock skew check (`client_time`).** Every `POST /v1/sync` request carries `client_time`. Before merging, the server checks `|client_time - server_time|` against the skew threshold (default 2 minutes, configurable) and rejects skewed requests with `400` (returning `server_time` and the measured skew), checking both directions in a single round-trip without needing a pre-flight `GET /v1/whoami`. `llm-memory doctor` and `sync login` also report the measured skew from `GET /v1/whoami` (corrected by half the round trip).
+- **Future timestamps are rejected.** A dump containing a `created_at`, `updated_at`, `archived_at`, namespace `created_at`, link timestamp (`created_at` / `deleted_at`), tombstone `deleted_at` or history `changed_at` more than 5 minutes ahead of `server_time` (configurable) is rejected (`400`) with the offending memory ids/uuids (`expires_at` is excluded, as it is legitimately in the future). A future-dated row would otherwise win every conflict until that date, and later edits on every machine would lose silently (kept only in history). Rejection rather than server-side clamping: a server-clamped row would differ from the client's copy and the two would replace each other on every sync. Once the machine's clock is fixed, a local repair command (`llm-memory doctor --fix-timestamps`) clamps all future timestamps (`> now`) in the local database to `now` (`memories.created_at`/`updated_at`/`archived_at`, `memory_history.changed_at`, `memory_links.created_at`/`deleted_at`, `memory_tombstones.deleted_at`, `namespaces.created_at`, never `expires_at`), preserving `created_at <= updated_at` and `created_at <= deleted_at`.
 
 ### Incremental sync (future)
 
@@ -134,7 +136,7 @@ Sync state lives in the local database's `meta` table (`sync_last_ok_at`, `sync_
    - Must **never** fail or noticeably stall `SessionStart` when offline or unreachable.
 3. **Best-effort sync on `handoff`:**
    - When a remote sync server is configured (and `sync_on_handoff` is enabled, default `true`), `handoff` attempts a sync after writing the local handoff.
-   - In `llm-memory serve`, the sync runs in a background goroutine after the tool has returned, so the assistant is never blocked. In the CLI (`llm-memory handoff`), it runs synchronously with the same budget as `SessionStart`, since the process exits right after.
+   - In `llm-memory serve`, the sync runs in a background goroutine after the tool has returned, so the assistant is never blocked; on clean shutdown (stdin EOF / signal), `serve` waits briefly (up to the ~3 s sync budget) for an in-flight handoff sync to finish so closing the client right after a handoff does not abort the push. In the CLI (`llm-memory handoff`), it runs synchronously with the same budget as `SessionStart`, since the process exits right after.
    - Must **never** fail the local `handoff` if the server is unreachable or times out: log/return a warning instead so offline work is never blocked.
 
 ## Store changes required for sync
@@ -211,14 +213,8 @@ Namespaces are matched by name. A description is only filled in when empty local
 ## Phases
 
 1. **Store:** dump format v3, link tombstones, memory tombstones and `purge --id`, deterministic handoff resolution in `Merge`, no `merged` history line when the dump carries history, trigger fix. Convergence tests, including a property test: random operations on several replicas, merged in random orders, must end with identical exports. File-based `import --merge` benefits immediately.
-2. **Protocol + minimal server + client:** envelope, versioning, clock checks, `POST /v1/sync`, `whoami`, `health`, CLI-managed accounts and keys (phase A), `llm-memory sync` / `sync login` / `doctor`.
+2. **Protocol + minimal server + client:** envelope, versioning, clock checks (`client_time` skew check, future timestamp rejection, `doctor --fix-timestamps`), `POST /v1/sync`, `whoami`, `health`, CLI-managed accounts and keys (phase A), `llm-memory sync` / `sync login` / `doctor`.
 3. **Hooks & MCP:** best-effort sync at `SessionStart` and on `handoff`, `sync` MCP tool.
 4. **Deployment:** Dockerfile, compose file, server backup command, release pipeline.
 5. **Web UI accounts (phase B):** registration, approval, roles, self-service keys.
 6. **Incremental sync:** server-assigned cursor, local push counter, partial exports.
-
-## Open questions
-
-1. Skew thresholds: 5 minutes for rejecting future timestamps on the server, 2 minutes for the client refusing to push. Are these the right defaults?
-2. Should some namespaces stay local (excluded from sync)? This needs filtering in both directions, since the server sends back everything it has.
-3. Is `sync_on_handoff` defaulting to `true` right?
