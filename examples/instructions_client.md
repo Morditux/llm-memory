@@ -2,12 +2,16 @@
 
 Without these instructions, LLMs do not call the memory reliably.
 
+`llm-memory setup --write <client>` installs and updates this block automatically for Antigravity, Claude Code, Codex, and OpenCode (use `--project` for project-local files, or `--no-instructions` to skip).
+
 Where to put it:
 
 | Client | Location |
 | --- | --- |
 | Antigravity | `~/.gemini/GEMINI.md` (global) or `GEMINI.md` / `AGENTS.md` in the project |
 | Claude Code | `~/.claude/CLAUDE.md` (global) or the project's `CLAUDE.md` |
+| Codex | `~/.codex/AGENTS.md` (global) or the project's `AGENTS.md` |
+| OpenCode | `~/.config/opencode/AGENTS.md` (global) or the project's `AGENTS.md` |
 | Claude Desktop | Custom instructions, or project instructions |
 | VS Code / Copilot | `.github/copilot-instructions.md` |
 | Internal LLM | System prompt |

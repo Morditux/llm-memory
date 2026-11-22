@@ -712,21 +712,22 @@ func TestCLISetupAndDoctor(t *testing.T) {
 		t.Errorf("unexpected codex setup output:\n%s", codexOut)
 	}
 
-	// setup opencode (JSON)
+	// setup opencode (JSON v2)
 	ocOut := cliOK(t, "setup", "--db", db, "--ollama", "opencode")
 	var ocCfg struct {
 		Schema string `json:"$schema"`
-		MCP    map[string]struct {
-			Type    string   `json:"type"`
-			Command []string `json:"command"`
-			Enabled bool     `json:"enabled"`
+		MCP    struct {
+			Servers map[string]struct {
+				Type    string   `json:"type"`
+				Command []string `json:"command"`
+			} `json:"servers"`
 		} `json:"mcp"`
 	}
 	if err := json.Unmarshal([]byte(ocOut), &ocCfg); err != nil {
 		t.Fatalf("unmarshal opencode json: %v\n%s", err, ocOut)
 	}
-	entry, ok := ocCfg.MCP["llm-memory"]
-	if !ok || entry.Type != "local" || !entry.Enabled || len(entry.Command) < 4 {
+	entry, ok := ocCfg.MCP.Servers["llm-memory"]
+	if !ok || entry.Type != "local" || len(entry.Command) < 4 {
 		t.Fatalf("unexpected opencode entry: %+v", ocCfg)
 	}
 	joined := strings.Join(entry.Command, " ")
@@ -801,14 +802,23 @@ func TestCLISetupWrite(t *testing.T) {
 		t.Errorf("claude-code config unexpected:\n%s", ccData)
 	}
 
-	// OpenCode: writes ~/.config/opencode/opencode.json.
+	// OpenCode: writes ~/.config/opencode/opencode.json (v2 format) and ~/.config/opencode/AGENTS.md.
 	runWithHome("setup", "--db", db, "--write", "--ollama", "opencode")
 	ocData, err := os.ReadFile(filepath.Join(home, ".config", "opencode", "opencode.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(ocData), `"type": "local"`) || !strings.Contains(string(ocData), defaultOllamaModel) {
+	if !strings.Contains(string(ocData), `"servers"`) || !strings.Contains(string(ocData), `"type": "local"`) || !strings.Contains(string(ocData), defaultOllamaModel) {
 		t.Errorf("opencode config unexpected:\n%s", ocData)
+	}
+	for _, instr := range []string{
+		filepath.Join(home, ".gemini", "GEMINI.md"),
+		filepath.Join(home, ".claude", "CLAUDE.md"),
+		filepath.Join(home, ".config", "opencode", "AGENTS.md"),
+	} {
+		if data, err := os.ReadFile(instr); err != nil || !strings.Contains(string(data), instructionStartMarker) {
+			t.Errorf("instruction file %s missing or invalid (%v):\n%s", instr, err, data)
+		}
 	}
 
 	// Codex: appends then updates in-place without clobbering other tables.
@@ -989,8 +999,8 @@ func TestCLISetupHooks(t *testing.T) {
 	}
 
 	// Unsupported client and malformed config.
-	if r := runHome("setup", "--hooks", "opencode"); !errors.Is(r.err, errUsage) {
-		t.Errorf("opencode hooks: err=%v", r.err)
+	if r := runHome("setup", "--hooks", "vscode"); !errors.Is(r.err, errUsage) {
+		t.Errorf("vscode hooks: err=%v", r.err)
 	}
 	bad := filepath.Join(home, "bad.json")
 	if err := os.WriteFile(bad, []byte(`{"hooks":[]}`), 0o644); err != nil {
@@ -1021,8 +1031,8 @@ func TestCLISetupHooks(t *testing.T) {
 	if r := runHome("hook", "--config", alt, "claude-code"); !errors.Is(r.err, errUsage) {
 		t.Errorf("hook --config without --write: err=%v", r.err)
 	}
-	if r := runHome("hook", "--write", "opencode"); !errors.Is(r.err, errUsage) {
-		t.Errorf("hook --write opencode: err=%v", r.err)
+	if r := runHome("hook", "--write", "vscode"); !errors.Is(r.err, errUsage) {
+		t.Errorf("hook --write vscode: err=%v", r.err)
 	}
 }
 

@@ -161,10 +161,69 @@ make build                  # → bin/llm-memory
 Copy the binary wherever you like (for example `~/.local/bin/llm-memory`) and note its **absolute path**:
 MCP clients do not go through a shell and do not necessarily have the same `PATH`.
 
+## Easy setup
+
+Two commands configure a client end-to-end: `setup` wires up the MCP server and client
+instructions, and `hook` (or `setup --hooks`) wires up automatic lifecycle briefings. Both preview
+to stdout by default and apply changes with `--write` (idempotent: rerun to update, `--remove` to
+undo).
+
+### 1. MCP server & instructions (`llm-memory setup`)
+
+```bash
+llm-memory setup --write claude-code     # ~/.claude.json + ~/.claude/CLAUDE.md
+llm-memory setup --write codex           # ~/.codex/config.toml + ~/.codex/AGENTS.md
+llm-memory setup --write antigravity     # ~/.gemini/config/mcp_config.json + ~/.gemini/GEMINI.md
+llm-memory setup --write opencode        # ~/.config/opencode/opencode.json(c) + ~/.config/opencode/AGENTS.md
+llm-memory setup --write claude-desktop  # Claude Desktop config
+llm-memory setup --write vscode          # .vscode/mcp.json
+```
+
+Key options:
+
+- **Preview (dry run)**: omit `--write` to print the generated configuration snippet without touching any file.
+- **Automatic instructions**: `--write` inserts or updates a delimited `<!-- llm-memory:start -->`…`<!-- llm-memory:end -->` block (migrating an existing manual `## Shared memory` section without duplicating it); `--remove` strips it (deleting the file if empty). Pass `--no-instructions` to leave instruction files untouched.
+- **Project scope (`--project`)**: writes project-local config and instructions (`./opencode.json(c)` + `./AGENTS.md`, `./.mcp.json` + `./CLAUDE.md`, `./.codex/config.toml` + `./AGENTS.md`, `./.vscode/mcp.json`).
+- **OpenCode (>= 2.0)**: writes the v2 `mcp.servers.llm-memory` schema and automatically detects existing `opencode.jsonc` (or `opencode.json`) files.
+- **Semantic search**: add `--model2vec` (built-in local embeddings, no external server) or `--ollama` to include embedding flags automatically.
+- **Custom path & cleanup**: `--config PATH` overrides the config file path; `--remove` removes both the MCP entry and the managed instruction block.
+
+### 2. Automatic briefings & lifecycle hooks (`setup --hooks` / `hook`)
+
+Hooks inject the project briefing automatically at session start (detecting the namespace from the
+session directory via `--namespace auto`) and remind the assistant to save memories and handoffs
+before compaction (`PreCompact`) or at session end (`Stop`). Errors are logged to stderr and never
+block a session (exit status `0`).
+
+```bash
+llm-memory setup --hooks --write claude-code   # ~/.claude/settings.json
+llm-memory setup --hooks --write codex         # ~/.codex/hooks.json (then trust with /hooks)
+llm-memory setup --hooks --write antigravity   # ~/.gemini/config/hooks.json
+llm-memory setup --hooks --write opencode      # ~/.config/opencode/plugins/llm-memory.js (OpenCode >= 2.0)
+```
+
+How `setup --hooks` and `hook` relate:
+
+- **`llm-memory hook <client>`** is the runtime entry point invoked by the client on lifecycle events (reads the client JSON payload on stdin and prints the client-specific output on stdout).
+- **`llm-memory hook --write <client>`** installs hooks just like `setup --hooks --write`, and additionally preserves `--max-chars` and `--focus` in the installed command or plugin (e.g. `llm-memory hook --write --max-chars 3000 --focus "auth" opencode`).
+- **Events (`--events`)**: comma-separated list of `SessionStart`, `PreCompact`, `Stop`. OpenCode (>= 2.0) installs `SessionStart` + `PreCompact` by default via a standalone v2 plugin (`ctx.session.hook("context", ...)` and `ctx.session.hook("compaction", ...)`); `Stop` is not supported on OpenCode.
+- **Project scope & removal**: pass `--project` to install hooks in the current repository (`.opencode/plugins/llm-memory.js`, `.claude/settings.json`, `.codex/hooks.json`, `.gemini/hooks.json`), or `--remove` to uninstall them.
+- **Verify anytime**: run `llm-memory doctor` to check database health, MCP entries, and hook binary paths across all configured clients.
+
+| Client | Global MCP config | Project MCP (`--project`) | Instructions file | Hook / plugin file |
+| --- | --- | --- | --- | --- |
+| `antigravity` | `~/.gemini/config/mcp_config.json` | *(use `--config`)* | `~/.gemini/GEMINI.md` / `GEMINI.md` | `~/.gemini/config/hooks.json` / `.gemini/hooks.json` |
+| `claude-code` | `~/.claude.json` | `.mcp.json` | `~/.claude/CLAUDE.md` / `CLAUDE.md` | `~/.claude/settings.json` / `.claude/settings.json` |
+| `codex` | `~/.codex/config.toml` | `.codex/config.toml` | `~/.codex/AGENTS.md` / `AGENTS.md` | `~/.codex/hooks.json` / `.codex/hooks.json` |
+| `opencode` | `~/.config/opencode/opencode.json(c)` | `opencode.json(c)` | `~/.config/opencode/AGENTS.md` / `AGENTS.md` | `~/.config/opencode/plugins/llm-memory.js` / `.opencode/plugins/llm-memory.js` |
+| `claude-desktop` | OS app config | *(use `--config`)* | *(manual)* | — |
+| `vscode` | `.vscode/mcp.json` | `.vscode/mcp.json` | *(manual)* | — |
+
 ## Client configuration
 
-All clients launch the same binary with the same database file (by default
-`~/.llm-memory/memory.db`, created on first launch, directory with mode 0700, file with mode 0600).
+For manual setup or custom environments, all clients launch the same binary with the same database
+file (by default `~/.llm-memory/memory.db`, created on first launch, directory with mode 0700, file
+with mode 0600). See [Easy setup](#easy-setup) above to configure supported clients automatically.
 
 | Client | Example |
 | --- | --- |
@@ -172,39 +231,16 @@ All clients launch the same binary with the same database file (by default
 | Claude Desktop | [examples/claude_desktop_config.json](examples/claude_desktop_config.json) |
 | Claude Code | [examples/claude_code.md](examples/claude_code.md) |
 | Codex | [examples/codex_config.toml](examples/codex_config.toml) (`~/.codex/config.toml`) |
-| OpenCode | [examples/opencode.json](examples/opencode.json) (`~/.config/opencode/opencode.json`) |
+| OpenCode | [examples/opencode.json](examples/opencode.json) (`~/.config/opencode/opencode.json` or `.jsonc`, OpenCode >= 2.0) |
 | VS Code | [examples/vscode_mcp.json](examples/vscode_mcp.json) (project default namespace) |
 | Internal LLM | same principle if its client supports MCP over stdio; otherwise `llm-memory context` and `llm-memory search` to paste the context by hand |
 
-For **Antigravity**, add the `llm-memory` entry to `~/.gemini/config/mcp_config.json` (or inspect active servers in the UI via **Additional Options (...) > MCP Servers**), and add the instruction block to `~/.gemini/GEMINI.md` (global) or `GEMINI.md` / `AGENTS.md` in your project.
-
-**Required**: add the instruction block from
+**Required** (when configuring manually): add the instruction block from
 [examples/instructions_client.md](examples/instructions_client.md) to each client. Without it, LLMs
-do not call the memory reliably.
+do not call the memory reliably (including writes via `remember` and `handoff`, even when hooks are
+enabled).
 
 On Windows, escape backslashes in JSON (`"C:\\tools\\llm-memory.exe"`).
-
-### Automatic briefing (session-start hooks)
-
-Clients that support hooks can inject the briefing themselves at the start of every session,
-so the memory no longer depends on the LLM remembering to call `get_context`:
-
-```bash
-llm-memory setup --hooks --write claude-code   # ~/.claude/settings.json
-llm-memory setup --hooks --write codex         # ~/.codex/hooks.json (then trust it with /hooks)
-llm-memory setup --hooks --write antigravity   # ~/.gemini/config/hooks.json
-```
-
-`llm-memory hook --write <client>` does the same patch from the hook command itself, and also keeps
-`--max-chars` and `--focus` in the installed command line (e.g.
-`llm-memory hook --write --max-chars 3000 claude-code`).
-
-Without `--write`, the JSON to add is printed. The hook runs `llm-memory hook <client> --namespace auto`:
-the namespace is detected from the session's directory (`cwd` or `workspacePaths` sent by the client),
-the hook also fires after `/clear` and compaction, and a database error never blocks the session
-(message on stderr, exit status 0). Rerunning the command replaces the previous entry and keeps your
-other hooks. Keep the instruction block anyway: it covers writes (`remember`, `handoff`) and the
-clients without hooks (Claude Desktop, VS Code, OpenCode).
 
 ### Parameters
 
@@ -262,11 +298,11 @@ llm-memory namespace <list|rename|merge|archive> ... # manage namespaces
 llm-memory gc [--json]                   # archive expired (TTL) memories
 llm-memory backup [--keep N] [--verify] [--json] [<dest>] # hot SQLite backup (VACUUM INTO)
 llm-memory doctor [--json]               # check database integrity, permissions, embeddings and client configs
-llm-memory setup [--model2vec|--ollama] [--write|--remove] [--config PATH] <client> # print, write or remove MCP config (antigravity, claude-desktop, claude-code, codex, opencode, vscode)
-llm-memory setup --hooks [--events SessionStart,PreCompact,Stop] [--write|--remove] [--config PATH] <client> # lifecycle hooks (antigravity, claude-code, codex)
+llm-memory setup [--model2vec|--ollama] [--write|--remove] [--project] [--no-instructions] [--config PATH] <client> # print, write or remove MCP config & instructions (antigravity, claude-desktop, claude-code, codex, opencode, vscode)
+llm-memory setup --hooks [--events SessionStart,PreCompact,Stop] [--write|--remove] [--project] [--config PATH] <client> # lifecycle hooks (antigravity, claude-code, codex, opencode)
 llm-memory hook [--event E] [--focus Q] <client>     # hook entry point: prints the payload in the client's hook format
-llm-memory hook --write [--events LIST] [--config PATH] [--max-chars N] [--focus Q] <client>  # install hook(s) in the client config
-llm-memory hook --remove [--config PATH] <client>    # remove llm-memory hooks from the client config
+llm-memory hook --write [--events LIST] [--project] [--config PATH] [--max-chars N] [--focus Q] <client>  # install hook(s) in the client config
+llm-memory hook --remove [--project] [--config PATH] <client>    # remove llm-memory hooks from the client config
 llm-memory reindex [--all]               # embeddings (semantic search only)
 llm-memory ui [--addr 127.0.0.1:8765]    # local web explorer (create/edit, tags, TTL, links, namespaces, diff history, similar/supersede, GC)
 llm-memory completion <bash|zsh|fish>    # print shell completion script

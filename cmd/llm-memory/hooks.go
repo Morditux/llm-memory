@@ -27,7 +27,10 @@ import (
 // the LLM remembering to call get_context or handoff.
 
 // hookClients lists the clients whose hooks are supported.
-var hookClients = []string{"antigravity", "claude-code", "codex"}
+var hookClients = []string{"antigravity", "claude-code", "codex", "opencode"}
+
+// opencodeHookEvents lists the hook events supported by the OpenCode v2 plugin.
+var opencodeHookEvents = []string{hookEventSessionStart, hookEventPreCompact}
 
 // hookEvents lists the supported hook lifecycle events.
 var hookEvents = []string{"SessionStart", "PreCompact", "Stop"}
@@ -68,6 +71,33 @@ func (p hookPayload) dir() string {
 }
 
 func isHookClient(c string) bool { return slices.Contains(hookClients, c) }
+
+func validateHookEvents(client string, events []string) error {
+	if client != "opencode" {
+		return nil
+	}
+	for _, ev := range events {
+		if !slices.Contains(opencodeHookEvents, ev) {
+			return fmt.Errorf("hook event %q is not supported for opencode (expected %s)", ev, strings.Join(opencodeHookEvents, ", "))
+		}
+	}
+	return nil
+}
+
+func resolveWd(env config.Env) (string, error) {
+	if env.Getwd != nil {
+		wd, err := env.Getwd()
+		if err != nil {
+			return "", fmt.Errorf("resolve working directory: %w", err)
+		}
+		return wd, nil
+	}
+	wd, err := os.Getwd()
+	if err != nil {
+		return "", fmt.Errorf("resolve working directory: %w", err)
+	}
+	return wd, nil
+}
 
 func unknownHookClient(w io.Writer, c string) error {
 	fmt.Fprintf(w, "hooks are not supported for %q (expected %s)\n", c, strings.Join(hookClients, ", "))
@@ -150,6 +180,7 @@ func (a app) cmdHook(ctx context.Context, args []string) error {
 	focus := fs.String("focus", "", "optional topic or query to prioritize relevant memories")
 	write := fs.Bool("write", false, "patch the client configuration file with this hook instead of printing the briefing")
 	remove := fs.Bool("remove", false, "remove llm-memory hooks from the client configuration file")
+	project := fs.Bool("project", false, "target project-local hook configuration (with --write or --remove)")
 	cfgPath := fs.String("config", "", "override target config file path (with --write or --remove)")
 	pos, err := parse(fs, args, 1, 1)
 	if err != nil {
@@ -163,16 +194,29 @@ func (a app) cmdHook(ctx context.Context, args []string) error {
 		fmt.Fprintln(a.stderr, "cannot combine --write and --remove")
 		return errUsage
 	}
+	if *project && !*write && !*remove {
+		fmt.Fprintln(a.stderr, "--project requires --write or --remove")
+		return errUsage
+	}
 	if *remove {
-		return a.removeHooks(client, *cfgPath)
+		return a.removeHooks(client, *project, *cfgPath)
 	}
 	if *write {
 		evSpec := *eventsFlag
 		if isSet(fs, "event") && !isSet(fs, "events") {
 			evSpec = *eventFlag
 		}
-		events, err := parseHookEvents(evSpec)
-		if err != nil {
+		var events []string
+		if client == "opencode" && !isSet(fs, "events") && !isSet(fs, "event") {
+			events = append([]string(nil), opencodeHookEvents...)
+		} else {
+			events, err = parseHookEvents(evSpec)
+			if err != nil {
+				fmt.Fprintln(a.stderr, err)
+				return errUsage
+			}
+		}
+		if err := validateHookEvents(client, events); err != nil {
 			fmt.Fprintln(a.stderr, err)
 			return errUsage
 		}
@@ -187,7 +231,7 @@ func (a app) cmdHook(ctx context.Context, args []string) error {
 		if isSet(fs, "focus") {
 			extra = append(extra, "--focus", *focus)
 		}
-		return a.setupHooks(client, executablePath(), cfg.DB, hookNamespace(fs, a.env), events, true, *cfgPath, extra...)
+		return a.setupHooks(client, executablePath(), cfg.DB, hookNamespace(fs, a.env), events, true, *project, *cfgPath, extra...)
 	}
 	if isSet(fs, "config") {
 		fmt.Fprintln(a.stderr, "--config requires --write or --remove")
@@ -195,6 +239,10 @@ func (a app) cmdHook(ctx context.Context, args []string) error {
 	}
 	event, err := normalizeHookEvent(*eventFlag)
 	if err != nil {
+		fmt.Fprintln(a.stderr, err)
+		return errUsage
+	}
+	if err := validateHookEvents(client, []string{event}); err != nil {
 		fmt.Fprintln(a.stderr, err)
 		return errUsage
 	}
@@ -276,6 +324,12 @@ func hookReminder(event, ns string, tasks []store.Memory) string {
 
 // hookOutput builds the stdout JSON for each client and event.
 func hookOutput(client, event, text string) any {
+	if client == "opencode" {
+		return map[string]any{
+			"event":   event,
+			"context": text,
+		}
+	}
 	if client == "antigravity" {
 		// Shape of the SessionStart example in the Antigravity hooks docs.
 		return map[string]any{
@@ -300,10 +354,32 @@ func hookOutput(client, event, text string) any {
 
 // ---- setup --hooks ----------------------------------------------------------
 
-func hookConfigPath(client string, env config.Env) (string, error) {
+func hookConfigPath(client string, project bool, env config.Env) (string, error) {
+	if project {
+		wd, err := resolveWd(env)
+		if err != nil {
+			return "", err
+		}
+		switch client {
+		case "antigravity":
+			return filepath.Join(wd, ".gemini", "hooks.json"), nil
+		case "claude-code":
+			return filepath.Join(wd, ".claude", "settings.json"), nil
+		case "codex":
+			return filepath.Join(wd, ".codex", "hooks.json"), nil
+		case "opencode":
+			return filepath.Join(wd, ".opencode", "plugins", "llm-memory.js"), nil
+		default:
+			return "", fmt.Errorf("unknown client %q", client)
+		}
+	}
 	home, err := env.UserHomeDir()
 	if err != nil {
 		return "", fmt.Errorf("resolve home directory: %w", err)
+	}
+	xdgConfig := env.Getenv("XDG_CONFIG_HOME")
+	if xdgConfig == "" {
+		xdgConfig = filepath.Join(home, ".config")
 	}
 	switch client {
 	case "antigravity":
@@ -312,6 +388,8 @@ func hookConfigPath(client string, env config.Env) (string, error) {
 		return filepath.Join(home, ".claude", "settings.json"), nil
 	case "codex":
 		return filepath.Join(home, ".codex", "hooks.json"), nil
+	case "opencode":
+		return filepath.Join(xdgConfig, "opencode", "plugins", "llm-memory.js"), nil
 	default:
 		return "", fmt.Errorf("unknown client %q", client)
 	}
@@ -479,14 +557,22 @@ func applyHooks(root map[string]any, client string, events []string, cmdForEvent
 // patchJSONFile decodes path (missing or empty = {}), applies fn and writes
 // it back, keeping every other key.
 func patchJSONFile(path string, fn func(map[string]any) error) error {
+	return patchJSONFileWithWarn(path, nil, fn)
+}
+
+func patchJSONFileWithWarn(path string, warn io.Writer, fn func(map[string]any) error) error {
 	root := map[string]any{}
 	data, err := os.ReadFile(path)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("read %s: %w", path, err)
 	}
 	if len(strings.TrimSpace(string(data))) > 0 {
-		if err := json.Unmarshal(data, &root); err != nil {
+		hasComments, err := decodeJSONC(data, &root)
+		if err != nil {
 			return fmt.Errorf("parse %s: %w", path, err)
+		}
+		if hasComments && warn != nil {
+			fmt.Fprintf(warn, "note: JSONC comments in %s were not preserved\n", path)
 		}
 	}
 	if err := fn(root); err != nil {
@@ -510,23 +596,172 @@ func patchJSONFile(path string, fn func(map[string]any) error) error {
 	return nil
 }
 
+func renderOpenCodePlugin(bin, db, namespace string, events []string, extra ...string) string {
+	binJSON, _ := json.Marshal(bin)
+	baseArgs := []string{"hook", "opencode", "--db", db, "--namespace", namespace}
+	baseArgs = append(baseArgs, extra...)
+	argsJSON, _ := json.Marshal(baseArgs)
+
+	hasSessionStart := slices.Contains(events, hookEventSessionStart)
+	hasPreCompact := slices.Contains(events, hookEventPreCompact)
+
+	var b strings.Builder
+	b.WriteString("// Generated by llm-memory. Do not edit by hand; rerun `llm-memory setup --hooks --write opencode` to update.\n")
+	b.WriteString("import { Plugin } from \"@opencode/plugin\"\n")
+	b.WriteString("import { spawn } from \"node:child_process\"\n\n")
+	fmt.Fprintf(&b, "const BIN = %s\n", binJSON)
+	fmt.Fprintf(&b, "const BASE_ARGS = %s\n", argsJSON)
+	b.WriteString("const TIMEOUT_MS = 15000\n")
+	b.WriteString("const MAX_CACHE = 200\n\n")
+	b.WriteString(`function runHook(eventName, cwd) {
+  return new Promise((resolve) => {
+    let stdout = ""
+    let done = false
+    const finish = (val) => {
+      if (done) return
+      done = true
+      clearTimeout(timer)
+      resolve(val)
+    }
+    const child = spawn(BIN, [...BASE_ARGS, "--event", eventName], {
+      stdio: ["pipe", "pipe", "ignore"],
+    })
+    const timer = setTimeout(() => {
+      try { child.kill() } catch {}
+      finish("")
+    }, TIMEOUT_MS)
+    child.on("error", () => finish(""))
+    child.stdout.on("data", (chunk) => { stdout += chunk })
+    child.on("close", (code) => {
+      if (code !== 0 || !stdout.trim()) return finish("")
+      try {
+        const parsed = JSON.parse(stdout)
+        finish(typeof parsed.context === "string" ? parsed.context : "")
+      } catch {
+        finish("")
+      }
+    })
+    try {
+      child.stdin.end(JSON.stringify({ cwd: cwd || process.cwd() }))
+    } catch {
+      finish("")
+    }
+  })
+}
+
+async function sessionDir(ctx, sessionID) {
+  if (sessionID && ctx.session?.get) {
+    try {
+      const s = await ctx.session.get({ sessionID })
+      if (s?.directory) return s.directory
+    } catch {}
+  }
+  return ctx.location?.directory || process.cwd()
+}
+
+export default Plugin.define({
+  id: "llm-memory",
+  async setup(ctx) {
+    const briefings = new Map()
+    const pending = new Map()
+`)
+	if hasSessionStart {
+		b.WriteString(`
+    await ctx.session.hook("context", async (event) => {
+      const sid = event.sessionID || ""
+      let text = briefings.get(sid)
+      if (text === undefined) {
+        let req = pending.get(sid)
+        if (!req) {
+          req = sessionDir(ctx, sid).then((cwd) => runHook("SessionStart", cwd))
+          pending.set(sid, req)
+        }
+        try {
+          text = await req
+        } finally {
+          pending.delete(sid)
+        }
+        if (briefings.size >= MAX_CACHE) {
+          const oldest = briefings.keys().next().value
+          if (oldest !== undefined) briefings.delete(oldest)
+        }
+        briefings.set(sid, text)
+      }
+      if (text) {
+        event.system.push({ type: "text", text })
+      }
+    })
+`)
+	}
+	if hasPreCompact {
+		b.WriteString(`
+    await ctx.session.hook("compaction", async (event) => {
+      const sid = event.sessionID || ""
+      briefings.delete(sid)
+      const cwd = await sessionDir(ctx, sid)
+      const reminder = await runHook("PreCompact", cwd)
+      if (reminder) {
+        event.system.push({ type: "text", text: reminder })
+      }
+    })
+`)
+	} else if hasSessionStart {
+		b.WriteString(`
+    await ctx.session.hook("compaction", (event) => {
+      briefings.delete(event.sessionID || "")
+    })
+`)
+	}
+	b.WriteString("  },\n})\n")
+	return b.String()
+}
+
 // setupHooks prints or writes the hook configuration.
-func (a app) setupHooks(client, bin, db, namespace string, events []string, write bool, cfgPath string, extra ...string) error {
+func (a app) setupHooks(client, bin, db, namespace string, events []string, write, project bool, cfgPath string, extra ...string) error {
 	if !isHookClient(client) {
 		return unknownHookClient(a.stderr, client)
 	}
 	if len(events) == 0 {
-		events = []string{hookEventSessionStart}
+		if client == "opencode" {
+			events = append([]string(nil), opencodeHookEvents...)
+		} else {
+			events = []string{hookEventSessionStart}
+		}
 	}
-	cmdForEvent := func(ev string) string {
-		return hookCommand(bin, client, ev, db, namespace, extra...)
+	if err := validateHookEvents(client, events); err != nil {
+		fmt.Fprintln(a.stderr, err)
+		return errUsage
 	}
 	target := cfgPath
 	if target == "" {
 		var err error
-		if target, err = hookConfigPath(client, a.env); err != nil {
+		if target, err = hookConfigPath(client, project, a.env); err != nil {
 			return err
 		}
+	}
+	if client == "opencode" {
+		js := renderOpenCodePlugin(bin, db, namespace, events, extra...)
+		if write {
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return fmt.Errorf("create directory for %s: %w", target, err)
+			}
+			mode := os.FileMode(0o644)
+			if fi, err := os.Stat(target); err == nil {
+				mode = fi.Mode().Perm()
+			}
+			if err := os.WriteFile(target, []byte(js), mode); err != nil {
+				return fmt.Errorf("write %s: %w", target, err)
+			}
+			fmt.Fprintf(a.stdout, "Updated %s (%s %s hook)\n", target, client, strings.Join(events, ","))
+		} else {
+			fmt.Fprintf(a.stderr, "# Write to %s (or rerun with --write):\n", target)
+			_, err := fmt.Fprint(a.stdout, js)
+			return err
+		}
+		return nil
+	}
+	cmdForEvent := func(ev string) string {
+		return hookCommand(bin, client, ev, db, namespace, extra...)
 	}
 	if write {
 		if err := patchJSONFile(target, func(root map[string]any) error {
@@ -551,16 +786,30 @@ func (a app) setupHooks(client, bin, db, namespace string, events []string, writ
 	return nil
 }
 
-func (a app) removeHooks(client, cfgPath string) error {
+func (a app) removeHooks(client string, project bool, cfgPath string) error {
 	target := cfgPath
 	if target == "" {
 		var err error
-		if target, err = hookConfigPath(client, a.env); err != nil {
+		if target, err = hookConfigPath(client, project, a.env); err != nil {
 			return err
 		}
 	}
 	if _, err := os.Stat(target); errors.Is(err, os.ErrNotExist) {
 		fmt.Fprintf(a.stdout, "No hook configuration found at %s\n", target)
+		return nil
+	}
+	if client == "opencode" {
+		data, err := os.ReadFile(target)
+		if err != nil {
+			return fmt.Errorf("read %s: %w", target, err)
+		}
+		if !strings.Contains(string(data), "llm-memory") {
+			return fmt.Errorf("%s does not look like an llm-memory OpenCode plugin", target)
+		}
+		if err := os.Remove(target); err != nil {
+			return fmt.Errorf("remove %s: %w", target, err)
+		}
+		fmt.Fprintf(a.stdout, "Removed llm-memory hooks from %s (%s)\n", target, client)
 		return nil
 	}
 	if err := patchJSONFile(target, func(root map[string]any) error {

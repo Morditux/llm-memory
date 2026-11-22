@@ -67,15 +67,15 @@ Usage:
   llm-memory doctor [--json]                 check database integrity, permissions and embeddings
   llm-memory backup [--keep N] [--verify] [--json] [<dest>]
                                              hot SQLite backup via VACUUM INTO
-  llm-memory setup [--model2vec|--ollama] [--write] [--remove] [--config PATH] <client>
-                                             print, write or remove MCP configuration for a client
-  llm-memory setup --hooks [--events LIST] [--write] [--remove] [--config PATH] <antigravity|claude-code|codex>
+  llm-memory setup [--model2vec|--ollama] [--write] [--remove] [--project] [--no-instructions] [--config PATH] <client>
+                                             print, write or remove MCP configuration and instructions for a client
+  llm-memory setup --hooks [--events LIST] [--write] [--remove] [--project] [--config PATH] <antigravity|claude-code|codex|opencode>
                                              print, write or remove the client hooks (SessionStart, PreCompact, Stop)
-  llm-memory hook [--event E] [--namespace X] [--max-chars N] [--focus Q] <antigravity|claude-code|codex>
+  llm-memory hook [--event E] [--namespace X] [--max-chars N] [--focus Q] <antigravity|claude-code|codex|opencode>
                                              hook entry point (reads the client payload on stdin)
-  llm-memory hook --write [--events LIST] [--config PATH] [--namespace X] [--max-chars N] [--focus Q] <client>
+  llm-memory hook --write [--events LIST] [--project] [--config PATH] [--namespace X] [--max-chars N] [--focus Q] <client>
                                              install hook(s) in the client's configuration file
-  llm-memory hook --remove [--config PATH] <client>
+  llm-memory hook --remove [--project] [--config PATH] <client>
                                              remove llm-memory hooks from the client's configuration file
   llm-memory ui [--addr 127.0.0.1:8765]      start local web explorer
   llm-memory completion <bash|zsh|fish>      print shell completion script
@@ -120,7 +120,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	err := run(ctx, os.Args[1:], app{
 		stdin: os.Stdin, stdout: os.Stdout, stderr: os.Stderr,
-		env: config.Env{Getenv: os.Getenv, UserHomeDir: os.UserHomeDir},
+		env: config.Env{Getenv: os.Getenv, UserHomeDir: os.UserHomeDir, Getwd: os.Getwd},
 	})
 	stop()
 	switch {

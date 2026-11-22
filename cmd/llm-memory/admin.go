@@ -1356,7 +1356,7 @@ func (a app) cmdDoctor(ctx context.Context, args []string) error {
 func checkClientConfigs(env config.Env) []clientCheck {
 	var checks []clientCheck
 	for _, client := range []string{"antigravity", "claude-desktop", "claude-code", "codex", "opencode"} {
-		path, err := clientConfigPath(client, env)
+		path, err := clientConfigPath(client, false, env)
 		if err != nil {
 			continue
 		}
@@ -1376,12 +1376,18 @@ func checkClientConfigs(env config.Env) []clientCheck {
 		checks = append(checks, verifyCommand(client, "mcp", path, cmd))
 	}
 	for _, client := range hookClients {
-		path, err := hookConfigPath(client, env)
+		path, err := hookConfigPath(client, false, env)
 		if err != nil {
 			continue
 		}
 		data, err := os.ReadFile(path)
 		if err != nil {
+			continue
+		}
+		if client == "opencode" {
+			if bin := extractOpenCodePluginBinary(data); bin != "" {
+				checks = append(checks, verifyCommand(client, "hook", path, bin))
+			}
 			continue
 		}
 		for _, cmdLine := range extractHookCommands(client, data) {
@@ -1416,15 +1422,30 @@ func verifyCommand(client, kind, path, cmd string) clientCheck {
 
 func extractJSONMCPCommand(client string, data []byte) string {
 	var root map[string]any
-	if err := json.Unmarshal(data, &root); err != nil {
+	if _, err := decodeJSONC(data, &root); err != nil || root == nil {
 		return ""
 	}
-	key := "mcpServers"
 	if client == "opencode" {
-		key = "mcp"
+		mcpObj, _ := root["mcp"].(map[string]any)
+		if mcpObj == nil {
+			return ""
+		}
+		var entry map[string]any
+		if servers, ok := mcpObj["servers"].(map[string]any); ok {
+			entry, _ = servers["llm-memory"].(map[string]any)
+		}
+		if entry == nil {
+			// Legacy OpenCode v1 fallback.
+			entry, _ = mcpObj["llm-memory"].(map[string]any)
+		}
+		return extractCommandFromMCPEntry(entry)
 	}
-	sec, _ := root[key].(map[string]any)
+	sec, _ := root["mcpServers"].(map[string]any)
 	entry, _ := sec["llm-memory"].(map[string]any)
+	return extractCommandFromMCPEntry(entry)
+}
+
+func extractCommandFromMCPEntry(entry map[string]any) string {
 	if entry == nil {
 		return ""
 	}
@@ -1434,6 +1455,19 @@ func extractJSONMCPCommand(client string, data []byte) string {
 	if arr, ok := entry["command"].([]any); ok && len(arr) > 0 {
 		s, _ := arr[0].(string)
 		return s
+	}
+	return ""
+}
+
+func extractOpenCodePluginBinary(data []byte) string {
+	for line := range strings.SplitSeq(strings.ReplaceAll(string(data), "\r\n", "\n"), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if after, ok := strings.CutPrefix(trimmed, "const BIN = "); ok {
+			var bin string
+			if err := json.Unmarshal([]byte(strings.TrimSpace(after)), &bin); err == nil {
+				return bin
+			}
+		}
 	}
 	return ""
 }
@@ -1550,7 +1584,71 @@ func formatTOMLStringArray(items []string) string {
 	return "[" + strings.Join(quoted, ", ") + "]"
 }
 
-func clientConfigPath(client string, env config.Env) (string, error) {
+func opencodeConfigPath(project bool, env config.Env) (string, error) {
+	if project {
+		wd, err := resolveWd(env)
+		if err != nil {
+			return "", err
+		}
+		for _, cand := range []string{
+			filepath.Join(wd, "opencode.jsonc"),
+			filepath.Join(wd, "opencode.json"),
+			filepath.Join(wd, ".opencode", "opencode.jsonc"),
+			filepath.Join(wd, ".opencode", "opencode.json"),
+		} {
+			if _, err := os.Stat(cand); err == nil {
+				return cand, nil
+			}
+		}
+		return filepath.Join(wd, "opencode.json"), nil
+	}
+	home, err := env.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("resolve home directory: %w", err)
+	}
+	xdgConfig := env.Getenv("XDG_CONFIG_HOME")
+	if xdgConfig == "" {
+		xdgConfig = filepath.Join(home, ".config")
+	}
+	dir := filepath.Join(xdgConfig, "opencode")
+	for _, name := range []string{"opencode.jsonc", "opencode.json"} {
+		cand := filepath.Join(dir, name)
+		if _, err := os.Stat(cand); err == nil {
+			return cand, nil
+		}
+	}
+	return filepath.Join(dir, "opencode.json"), nil
+}
+
+func clientConfigPath(client string, project bool, env config.Env) (string, error) {
+	if project {
+		switch client {
+		case "opencode":
+			return opencodeConfigPath(true, env)
+		case "vscode":
+			wd, err := resolveWd(env)
+			if err != nil {
+				return "", err
+			}
+			return filepath.Join(wd, ".vscode", "mcp.json"), nil
+		case "claude-code":
+			wd, err := resolveWd(env)
+			if err != nil {
+				return "", err
+			}
+			return filepath.Join(wd, ".mcp.json"), nil
+		case "codex":
+			wd, err := resolveWd(env)
+			if err != nil {
+				return "", err
+			}
+			return filepath.Join(wd, ".codex", "config.toml"), nil
+		case "antigravity", "claude-desktop":
+			return "", fmt.Errorf("--project is not supported for %s MCP config; use --config to specify a custom path", client)
+		default:
+			return "", fmt.Errorf("unknown client %q", client)
+		}
+	}
 	home, err := env.UserHomeDir()
 	if err != nil {
 		return "", fmt.Errorf("resolve home directory: %w", err)
@@ -1580,7 +1678,7 @@ func clientConfigPath(client string, env config.Env) (string, error) {
 	case "codex":
 		return filepath.Join(home, ".codex", "config.toml"), nil
 	case "opencode":
-		return filepath.Join(xdgConfig, "opencode", "opencode.json"), nil
+		return opencodeConfigPath(false, env)
 	case "vscode":
 		return filepath.Join(".vscode", "mcp.json"), nil
 	default:
@@ -1589,46 +1687,85 @@ func clientConfigPath(client string, env config.Env) (string, error) {
 }
 
 func patchJSONConfig(path, sectionKey, serverName string, entry, defaults map[string]any) error {
-	root := map[string]any{}
-	data, err := os.ReadFile(path)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("read %s: %w", path, err)
-	}
-	if len(strings.TrimSpace(string(data))) > 0 {
-		if err := json.Unmarshal(data, &root); err != nil {
-			return fmt.Errorf("parse %s: %w", path, err)
+	return patchJSONFileWithWarn(path, nil, func(root map[string]any) error {
+		for k, v := range defaults {
+			if _, ok := root[k]; !ok {
+				root[k] = v
+			}
 		}
-	}
-	for k, v := range defaults {
-		if _, ok := root[k]; !ok {
-			root[k] = v
+		var section map[string]any
+		if raw, ok := root[sectionKey]; ok && raw != nil {
+			m, ok := raw.(map[string]any)
+			if !ok {
+				return fmt.Errorf("%q is not a JSON object", sectionKey)
+			}
+			section = m
+		} else {
+			section = map[string]any{}
+			root[sectionKey] = section
 		}
-	}
-	var section map[string]any
-	if raw, ok := root[sectionKey]; ok && raw != nil {
-		m, ok := raw.(map[string]any)
-		if !ok {
-			return fmt.Errorf("%s: %q is not a JSON object", path, sectionKey)
-		}
-		section = m
-	} else {
-		section = map[string]any{}
-		root[sectionKey] = section
-	}
-	section[serverName] = entry
+		section[serverName] = entry
+		return nil
+	})
+}
 
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return fmt.Errorf("create directory for %s: %w", path, err)
+func patchOpenCodeMCP(path string, entry map[string]any, warn io.Writer) error {
+	return patchJSONFileWithWarn(path, warn, func(root map[string]any) error {
+		if _, ok := root["$schema"]; !ok {
+			root["$schema"] = "https://opencode.ai/config.json"
+		}
+		var mcpObj map[string]any
+		if raw, ok := root["mcp"]; ok && raw != nil {
+			m, ok := raw.(map[string]any)
+			if !ok {
+				return errors.New(`"mcp" is not a JSON object`)
+			}
+			mcpObj = m
+		} else {
+			mcpObj = map[string]any{}
+			root["mcp"] = mcpObj
+		}
+		var servers map[string]any
+		if raw, ok := mcpObj["servers"]; ok && raw != nil {
+			m, ok := raw.(map[string]any)
+			if !ok {
+				return errors.New(`"mcp.servers" is not a JSON object`)
+			}
+			servers = m
+		} else {
+			servers = map[string]any{}
+			mcpObj["servers"] = servers
+		}
+		servers["llm-memory"] = entry
+		// Clean up legacy OpenCode v1 mcp.llm-memory entry if present.
+		delete(mcpObj, "llm-memory")
+		return nil
+	})
+}
+
+func removeOpenCodeMCP(path string, warn io.Writer) error {
+	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+		return nil
 	}
-	out, err := json.MarshalIndent(root, "", "  ")
-	if err != nil {
-		return fmt.Errorf("encode %s: %w", path, err)
-	}
-	out = append(out, '\n')
-	if err := os.WriteFile(path, out, 0o644); err != nil {
-		return fmt.Errorf("write %s: %w", path, err)
-	}
-	return nil
+	return patchJSONFileWithWarn(path, warn, func(root map[string]any) error {
+		raw, ok := root["mcp"]
+		if !ok || raw == nil {
+			return nil
+		}
+		mcpObj, ok := raw.(map[string]any)
+		if !ok {
+			return errors.New(`"mcp" is not a JSON object`)
+		}
+		if rawServers, ok := mcpObj["servers"]; ok && rawServers != nil {
+			servers, ok := rawServers.(map[string]any)
+			if !ok {
+				return errors.New(`"mcp.servers" is not a JSON object`)
+			}
+			delete(servers, "llm-memory")
+		}
+		delete(mcpObj, "llm-memory")
+		return nil
+	})
 }
 
 func patchCodexTOML(path, block string) error {
@@ -1749,8 +1886,10 @@ func (a app) cmdSetup(_ context.Context, args []string) error {
 	m2v := fs.Bool("model2vec", false, "include local Model2Vec embeddings defaults ("+config.DefaultModel2VecModel+", no external server)")
 	write := fs.Bool("write", false, "patch the client configuration file directly")
 	remove := fs.Bool("remove", false, "remove llm-memory from the client configuration file")
+	project := fs.Bool("project", false, "target project-local configuration and instructions instead of global")
+	noInstructions := fs.Bool("no-instructions", false, "do not update or remove client instruction files (AGENTS.md, CLAUDE.md, GEMINI.md)")
 	cfgPath := fs.String("config", "", "override target config file path (with --write or --remove)")
-	hooks := fs.Bool("hooks", false, "configure client hooks (antigravity, claude-code, codex)")
+	hooks := fs.Bool("hooks", false, "configure client hooks (antigravity, claude-code, codex, opencode)")
 	eventsFlag := fs.String("events", hookEventSessionStart, "comma-separated hook events with --hooks: "+strings.Join(hookEvents, ", "))
 	pos, err := parse(fs, args, 1, 1)
 	if err != nil {
@@ -1790,21 +1929,34 @@ func (a app) cmdSetup(_ context.Context, args []string) error {
 	client := strings.ToLower(pos[0])
 	if *hooks {
 		if *remove {
-			return a.removeHooks(client, *cfgPath)
+			return a.removeHooks(client, *project, *cfgPath)
 		}
-		events, err := parseHookEvents(*eventsFlag)
-		if err != nil {
+		var events []string
+		if client == "opencode" && !isSet(fs, "events") {
+			events = append([]string(nil), opencodeHookEvents...)
+		} else {
+			events, err = parseHookEvents(*eventsFlag)
+			if err != nil {
+				fmt.Fprintln(a.stderr, err)
+				return errUsage
+			}
+		}
+		if err := validateHookEvents(client, events); err != nil {
 			fmt.Fprintln(a.stderr, err)
 			return errUsage
 		}
-		return a.setupHooks(client, bin, cfg.DB, hookNamespace(fs, a.env), events, *write, *cfgPath)
+		return a.setupHooks(client, bin, cfg.DB, hookNamespace(fs, a.env), events, *write, *project, *cfgPath)
 	}
 	if *remove {
 		target := *cfgPath
 		if target == "" {
-			target, err = clientConfigPath(client, a.env)
+			target, err = clientConfigPath(client, *project, a.env)
 			if err != nil {
-				fmt.Fprintf(a.stderr, "unknown client %q (expected antigravity, claude-desktop, claude-code, codex, opencode or vscode)\n", pos[0])
+				if !*project {
+					fmt.Fprintf(a.stderr, "unknown client %q (expected antigravity, claude-desktop, claude-code, codex, opencode or vscode)\n", pos[0])
+				} else {
+					fmt.Fprintln(a.stderr, err)
+				}
 				return errUsage
 			}
 		}
@@ -1814,7 +1966,7 @@ func (a app) cmdSetup(_ context.Context, args []string) error {
 		case "vscode":
 			err = removeJSONConfig(target, "servers", "llm-memory")
 		case "opencode":
-			err = removeJSONConfig(target, "mcp", "llm-memory")
+			err = removeOpenCodeMCP(target, a.stderr)
 		case "codex":
 			err = removeCodexTOML(target)
 		default:
@@ -1825,6 +1977,19 @@ func (a app) cmdSetup(_ context.Context, args []string) error {
 			return err
 		}
 		fmt.Fprintf(a.stdout, "Removed llm-memory from %s (%s)\n", target, client)
+		if !*noInstructions {
+			if instrPath, supported, ierr := instructionFilePath(client, *project, a.env); ierr != nil {
+				return ierr
+			} else if supported {
+				removed, rerr := removeInstructionBlock(instrPath)
+				if rerr != nil {
+					return rerr
+				}
+				if removed {
+					fmt.Fprintf(a.stdout, "Removed llm-memory instructions from %s (%s)\n", instrPath, client)
+				}
+			}
+		}
 		return nil
 	}
 
@@ -1843,9 +2008,13 @@ func (a app) cmdSetup(_ context.Context, args []string) error {
 	if *write {
 		target := *cfgPath
 		if target == "" {
-			target, err = clientConfigPath(client, a.env)
+			target, err = clientConfigPath(client, *project, a.env)
 			if err != nil {
-				fmt.Fprintf(a.stderr, "unknown client %q (expected antigravity, claude-desktop, claude-code, codex, opencode or vscode)\n", pos[0])
+				if !*project {
+					fmt.Fprintf(a.stderr, "unknown client %q (expected antigravity, claude-desktop, claude-code, codex, opencode or vscode)\n", pos[0])
+				} else {
+					fmt.Fprintln(a.stderr, err)
+				}
 				return errUsage
 			}
 		}
@@ -1861,9 +2030,8 @@ func (a app) cmdSetup(_ context.Context, args []string) error {
 				return err
 			}
 		case "opencode":
-			entry := map[string]any{"type": "local", "command": append([]string{bin}, srvArgs...), "enabled": true}
-			defaults := map[string]any{"$schema": "https://opencode.ai/config.json"}
-			if err := patchJSONConfig(target, "mcp", "llm-memory", entry, defaults); err != nil {
+			entry := map[string]any{"type": "local", "command": append([]string{bin}, srvArgs...)}
+			if err := patchOpenCodeMCP(target, entry, a.stderr); err != nil {
 				return err
 			}
 		case "codex":
@@ -1877,6 +2045,16 @@ func (a app) cmdSetup(_ context.Context, args []string) error {
 			return errUsage
 		}
 		fmt.Fprintf(a.stdout, "Updated %s (%s)\n", target, client)
+		if !*noInstructions {
+			if instrPath, supported, ierr := instructionFilePath(client, *project, a.env); ierr != nil {
+				return ierr
+			} else if supported {
+				if uerr := upsertInstructionBlock(instrPath); uerr != nil {
+					return uerr
+				}
+				fmt.Fprintf(a.stdout, "Updated %s (%s instructions)\n", instrPath, client)
+			}
+		}
 		return nil
 	}
 
@@ -1914,10 +2092,11 @@ func (a app) cmdSetup(_ context.Context, args []string) error {
 		out := map[string]any{
 			"$schema": "https://opencode.ai/config.json",
 			"mcp": map[string]any{
-				"llm-memory": map[string]any{
-					"type":    "local",
-					"command": cmd,
-					"enabled": true,
+				"servers": map[string]any{
+					"llm-memory": map[string]any{
+						"type":    "local",
+						"command": cmd,
+					},
 				},
 			},
 		}
@@ -2097,10 +2276,10 @@ const bashCompletion = `_llm_memory() {
       fi
       ;;
     setup)
-      COMPREPLY=( $(compgen -W "antigravity claude-desktop claude-code codex opencode vscode --hooks --write --remove --model2vec --ollama --events --config" -- "${cur}") )
+      COMPREPLY=( $(compgen -W "antigravity claude-desktop claude-code codex opencode vscode --hooks --write --remove --project --no-instructions --model2vec --ollama --events --config" -- "${cur}") )
       ;;
     hook)
-      COMPREPLY=( $(compgen -W "antigravity claude-code codex --event --events --write --remove --max-chars --focus --config" -- "${cur}") )
+      COMPREPLY=( $(compgen -W "antigravity claude-code codex opencode --event --events --write --remove --project --max-chars --focus --config" -- "${cur}") )
       ;;
     completion)
       COMPREPLY=( $(compgen -W "bash zsh fish" -- "${cur}") )
@@ -2158,7 +2337,7 @@ _llm-memory() {
       _values 'client' antigravity claude-desktop claude-code codex opencode vscode
       ;;
     hook)
-      _values 'client' antigravity claude-code codex
+      _values 'client' antigravity claude-code codex opencode
       ;;
     completion)
       _values 'shell' bash zsh fish
@@ -2174,6 +2353,6 @@ complete -c llm-memory -f
 complete -c llm-memory -n "not __fish_seen_subcommand_from $cmds" -a "$cmds"
 complete -c llm-memory -n "__fish_seen_subcommand_from namespace" -a "list rename merge archive"
 complete -c llm-memory -n "__fish_seen_subcommand_from setup" -a "antigravity claude-desktop claude-code codex opencode vscode"
-complete -c llm-memory -n "__fish_seen_subcommand_from hook" -a "antigravity claude-code codex"
+complete -c llm-memory -n "__fish_seen_subcommand_from hook" -a "antigravity claude-code codex opencode"
 complete -c llm-memory -n "__fish_seen_subcommand_from completion" -a "bash zsh fish"
 `
