@@ -67,7 +67,7 @@ Usage:
   llm-memory doctor [--json]                 check database integrity, permissions and embeddings
   llm-memory backup [--keep N] [--verify] [--json] [<dest>]
                                              hot SQLite backup via VACUUM INTO
-  llm-memory setup [--model2vec|--ollama] [--write] [--remove] [--project] [--no-instructions] [--config PATH] <client>
+  llm-memory setup [--model2vec|--ollama] [--write] [--remove] [--project] [--no-instructions] [--no-download] [--config PATH] <client>
                                              print, write or remove MCP configuration and instructions for a client
   llm-memory setup --hooks [--events LIST] [--write] [--remove] [--project] [--config PATH] <antigravity|claude-code|codex|opencode>
                                              print, write or remove the client hooks (SessionStart, PreCompact, Stop)

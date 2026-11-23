@@ -212,6 +212,32 @@ func (e *Embedder) CheckLocal() (dir string, ready bool, err error) {
 	return resolveLocalModelDir(e.opts.Model, e.opts.CacheDir)
 }
 
+// Ensure verifies that all required model files are present locally,
+// downloading missing files from Hugging Face when Model is a repo ID.
+// It returns the local model directory and whether any file was downloaded.
+func (e *Embedder) Ensure(ctx context.Context) (dir string, downloaded bool, err error) {
+	if err := ctx.Err(); err != nil {
+		return "", false, err
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	dir, ready, err := resolveLocalModelDir(e.opts.Model, e.opts.CacheDir)
+	if err != nil {
+		return "", false, err
+	}
+	if ready {
+		e.dir = dir
+		return dir, false, nil
+	}
+	dir, err = ensureModelFiles(ctx, e.opts, e.log)
+	if err != nil {
+		return "", false, err
+	}
+	e.dir = dir
+	return dir, true, nil
+}
+
 func (e *Embedder) ensureLoaded(ctx context.Context) (*StaticModel, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()

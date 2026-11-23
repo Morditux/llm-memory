@@ -1879,7 +1879,7 @@ func removeCodexTOML(path string) error {
 	return os.WriteFile(path, []byte(updated), 0o644)
 }
 
-func (a app) cmdSetup(_ context.Context, args []string) error {
+func (a app) cmdSetup(ctx context.Context, args []string) error {
 	fs := a.newFlagSet("setup")
 	flags := config.Register(fs)
 	ollama := fs.Bool("ollama", false, "include local Ollama embeddings defaults ("+defaultOllamaModel+")")
@@ -1888,6 +1888,7 @@ func (a app) cmdSetup(_ context.Context, args []string) error {
 	remove := fs.Bool("remove", false, "remove llm-memory from the client configuration file")
 	project := fs.Bool("project", false, "target project-local configuration and instructions instead of global")
 	noInstructions := fs.Bool("no-instructions", false, "do not update or remove client instruction files (AGENTS.md, CLAUDE.md, GEMINI.md)")
+	noDownload := fs.Bool("no-download", false, "do not download the Model2Vec model during --write")
 	cfgPath := fs.String("config", "", "override target config file path (with --write or --remove)")
 	hooks := fs.Bool("hooks", false, "configure client hooks (antigravity, claude-code, codex, opencode)")
 	eventsFlag := fs.String("events", hookEventSessionStart, "comma-separated hook events with --hooks: "+strings.Join(hookEvents, ", "))
@@ -1903,27 +1904,37 @@ func (a app) cmdSetup(_ context.Context, args []string) error {
 		fmt.Fprintln(a.stderr, "cannot combine --ollama and --model2vec")
 		return errUsage
 	}
-	cfg, err := flags.Resolve(a.env)
-	if err != nil {
-		return err
-	}
-	if *ollama {
-		if cfg.Embed.URL == "" {
-			cfg.Embed.URL = defaultOllamaURL
-		}
-		if cfg.Embed.Model == "" {
-			cfg.Embed.Model = defaultOllamaModel
-		}
-	}
 	if *m2v {
-		if cfg.Embed.URL != "" {
+		if isSet(fs, "embed-provider") && !strings.EqualFold(strings.TrimSpace(fs.Lookup("embed-provider").Value.String()), config.EmbedProviderModel2Vec) {
+			fmt.Fprintln(a.stderr, "cannot combine --model2vec with --embed-provider")
+			return errUsage
+		}
+		embedURL := strings.TrimSpace(a.env.Getenv(config.EnvEmbedURL))
+		if isSet(fs, "embed-url") {
+			embedURL = strings.TrimSpace(fs.Lookup("embed-url").Value.String())
+		}
+		if embedURL != "" {
 			fmt.Fprintln(a.stderr, "cannot combine --model2vec with --embed-url")
 			return errUsage
 		}
-		cfg.Embed.Provider = config.EmbedProviderModel2Vec
-		if cfg.Embed.Model == "" {
-			cfg.Embed.Model = config.DefaultModel2VecModel
+		_ = fs.Set("embed-provider", config.EmbedProviderModel2Vec)
+	}
+	if *ollama {
+		if isSet(fs, "embed-provider") && !strings.EqualFold(strings.TrimSpace(fs.Lookup("embed-provider").Value.String()), config.EmbedProviderHTTP) {
+			fmt.Fprintln(a.stderr, "cannot combine --ollama with --embed-provider")
+			return errUsage
 		}
+		_ = fs.Set("embed-provider", config.EmbedProviderHTTP)
+		if !isSet(fs, "embed-url") && strings.TrimSpace(a.env.Getenv(config.EnvEmbedURL)) == "" {
+			_ = fs.Set("embed-url", defaultOllamaURL)
+		}
+		if !isSet(fs, "embed-model") && strings.TrimSpace(a.env.Getenv(config.EnvEmbedModel)) == "" {
+			_ = fs.Set("embed-model", defaultOllamaModel)
+		}
+	}
+	cfg, err := flags.Resolve(a.env)
+	if err != nil {
+		return err
 	}
 	bin := executablePath()
 	client := strings.ToLower(pos[0])
@@ -2000,12 +2011,21 @@ func (a app) cmdSetup(_ context.Context, args []string) error {
 	if cfg.Embed.Enabled() {
 		if cfg.Embed.Provider == config.EmbedProviderModel2Vec {
 			srvArgs = append(srvArgs, "--embed-provider", config.EmbedProviderModel2Vec, "--embed-model", cfg.Embed.Model)
+			if isSet(fs, "embed-cache-dir") || strings.TrimSpace(a.env.Getenv(config.EnvEmbedCacheDir)) != "" {
+				srvArgs = append(srvArgs, "--embed-cache-dir", cfg.Embed.CacheDir)
+			}
 		} else {
 			srvArgs = append(srvArgs, "--embed-url", cfg.Embed.URL, "--embed-model", cfg.Embed.Model)
 		}
 	}
 
 	if *write {
+		switch client {
+		case "antigravity", "claude-desktop", "claude-code", "vscode", "opencode", "codex":
+		default:
+			fmt.Fprintf(a.stderr, "unknown client %q (expected antigravity, claude-desktop, claude-code, codex, opencode or vscode)\n", pos[0])
+			return errUsage
+		}
 		target := *cfgPath
 		if target == "" {
 			target, err = clientConfigPath(client, *project, a.env)
@@ -2017,6 +2037,26 @@ func (a app) cmdSetup(_ context.Context, args []string) error {
 				}
 				return errUsage
 			}
+		}
+		var modelDir string
+		var modelDownloaded bool
+		var modelPrepared bool
+		if cfg.Embed.Provider == config.EmbedProviderModel2Vec && !*noDownload {
+			logger := slog.New(slog.NewTextHandler(a.stderr, &slog.HandlerOptions{Level: cfg.LogLevel}))
+			emb, err := model2vec.NewEmbedder(model2vec.Options{
+				Model:    cfg.Embed.Model,
+				CacheDir: cfg.Embed.CacheDir,
+				BaseURL:  strings.TrimSpace(a.env.Getenv("HF_ENDPOINT")),
+				Logger:   logger,
+			})
+			if err != nil {
+				return fmt.Errorf("prepare model2vec model %q: %w", cfg.Embed.Model, err)
+			}
+			modelDir, modelDownloaded, err = emb.Ensure(ctx)
+			if err != nil {
+				return fmt.Errorf("prepare model2vec model %q: %w", cfg.Embed.Model, err)
+			}
+			modelPrepared = true
 		}
 		switch client {
 		case "antigravity", "claude-desktop", "claude-code":
@@ -2040,9 +2080,6 @@ func (a app) cmdSetup(_ context.Context, args []string) error {
 			if err := patchCodexTOML(target, block); err != nil {
 				return err
 			}
-		default:
-			fmt.Fprintf(a.stderr, "unknown client %q (expected antigravity, claude-desktop, claude-code, codex, opencode or vscode)\n", pos[0])
-			return errUsage
 		}
 		fmt.Fprintf(a.stdout, "Updated %s (%s)\n", target, client)
 		if !*noInstructions {
@@ -2053,6 +2090,13 @@ func (a app) cmdSetup(_ context.Context, args []string) error {
 					return uerr
 				}
 				fmt.Fprintf(a.stdout, "Updated %s (%s instructions)\n", instrPath, client)
+			}
+		}
+		if modelPrepared {
+			if modelDownloaded {
+				fmt.Fprintf(a.stdout, "Downloaded Model2Vec model %s to %s\n", cfg.Embed.Model, modelDir)
+			} else {
+				fmt.Fprintf(a.stdout, "Model2Vec model %s ready at %s\n", cfg.Embed.Model, modelDir)
 			}
 		}
 		return nil
@@ -2276,7 +2320,7 @@ const bashCompletion = `_llm_memory() {
       fi
       ;;
     setup)
-      COMPREPLY=( $(compgen -W "antigravity claude-desktop claude-code codex opencode vscode --hooks --write --remove --project --no-instructions --model2vec --ollama --events --config" -- "${cur}") )
+      COMPREPLY=( $(compgen -W "antigravity claude-desktop claude-code codex opencode vscode --hooks --write --remove --project --no-instructions --no-download --model2vec --ollama --events --config" -- "${cur}") )
       ;;
     hook)
       COMPREPLY=( $(compgen -W "antigravity claude-code codex opencode --event --events --write --remove --project --max-chars --focus --config" -- "${cur}") )

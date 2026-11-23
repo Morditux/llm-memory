@@ -185,7 +185,7 @@ Key options:
 - **Automatic instructions**: `--write` inserts or updates a delimited `<!-- llm-memory:start -->`…`<!-- llm-memory:end -->` block (migrating an existing manual `## Shared memory` section without duplicating it); `--remove` strips it (deleting the file if empty). Pass `--no-instructions` to leave instruction files untouched.
 - **Project scope (`--project`)**: writes project-local config and instructions (`./opencode.json(c)` + `./AGENTS.md`, `./.mcp.json` + `./CLAUDE.md`, `./.codex/config.toml` + `./AGENTS.md`, `./.vscode/mcp.json`).
 - **OpenCode (>= 2.0)**: writes the v2 `mcp.servers.llm-memory` schema and automatically detects existing `opencode.jsonc` (or `opencode.json`) files.
-- **Semantic search**: add `--model2vec` (built-in local embeddings, no external server) or `--ollama` to include embedding flags automatically.
+- **Semantic search**: add `--model2vec` (built-in local embeddings, no external server; `--write` downloads the model into `~/.llm-memory/models` unless `--no-download` is passed) or `--ollama` to include embedding flags automatically.
 - **Custom path & cleanup**: `--config PATH` overrides the config file path; `--remove` removes both the MCP entry and the managed instruction block.
 
 ### 2. Automatic briefings & lifecycle hooks (`setup --hooks` / `hook`)
@@ -298,7 +298,7 @@ llm-memory namespace <list|rename|merge|archive> ... # manage namespaces
 llm-memory gc [--json]                   # archive expired (TTL) memories
 llm-memory backup [--keep N] [--verify] [--json] [<dest>] # hot SQLite backup (VACUUM INTO)
 llm-memory doctor [--json]               # check database integrity, permissions, embeddings and client configs
-llm-memory setup [--model2vec|--ollama] [--write|--remove] [--project] [--no-instructions] [--config PATH] <client> # print, write or remove MCP config & instructions (antigravity, claude-desktop, claude-code, codex, opencode, vscode)
+llm-memory setup [--model2vec|--ollama] [--write|--remove] [--project] [--no-instructions] [--no-download] [--config PATH] <client> # print, write or remove MCP config & instructions (antigravity, claude-desktop, claude-code, codex, opencode, vscode)
 llm-memory setup --hooks [--events SessionStart,PreCompact,Stop] [--write|--remove] [--project] [--config PATH] <client> # lifecycle hooks (antigravity, claude-code, codex, opencode)
 llm-memory hook [--event E] [--focus Q] <client>     # hook entry point: prints the payload in the client's hook format
 llm-memory hook --write [--events LIST] [--project] [--config PATH] [--max-chars N] [--focus Q] <client>  # install hook(s) in the client config
@@ -327,7 +327,7 @@ Two backends are supported:
 llm-memory reindex --embed-provider model2vec
 # or a multilingual model:
 llm-memory reindex --embed-provider model2vec --embed-model minishlab/potion-multilingual-128M
-# configure a client:
+# configure a client (downloads the model to ~/.llm-memory/models on --write; pass --no-download to skip):
 llm-memory setup --model2vec --write claude-code
 ```
 

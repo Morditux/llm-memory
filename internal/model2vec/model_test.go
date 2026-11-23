@@ -384,6 +384,98 @@ func TestEmbedderHubDownloadAndCache(t *testing.T) {
 	}
 }
 
+func TestEmbedderEnsure(t *testing.T) {
+	srcDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(srcDir, "config.json"), []byte(`{"normalize":true}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(srcDir, "tokenizer.json"), []byte(`{
+		"normalizer":{"type":"BertNormalizer","lowercase":true},
+		"pre_tokenizer":{"type":"BertPreTokenizer"},
+		"model":{"type":"WordPiece","unk_token":"[UNK]","vocab":{"[UNK]":0,"go":1}}
+	}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	payload := f32Bytes(0, 0, 3, 4)
+	writeSafetensorsFile(t, filepath.Join(srcDir, "model.safetensors"), map[string]any{
+		"embeddings": map[string]any{
+			"dtype":        "F32",
+			"shape":        []int{2, 2},
+			"data_offsets": []int64{0, int64(len(payload))},
+		},
+	}, payload)
+
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		switch r.URL.Path {
+		case "/minishlab/ensure-model/resolve/main/config.json":
+			http.ServeFile(w, r, filepath.Join(srcDir, "config.json"))
+		case "/minishlab/ensure-model/resolve/main/tokenizer.json":
+			http.ServeFile(w, r, filepath.Join(srcDir, "tokenizer.json"))
+		case "/minishlab/ensure-model/resolve/main/model.safetensors":
+			http.ServeFile(w, r, filepath.Join(srcDir, "model.safetensors"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	cacheDir := t.TempDir()
+	emb, err := NewEmbedder(Options{
+		Model:    "minishlab/ensure-model",
+		CacheDir: cacheDir,
+		BaseURL:  srv.URL,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dir, downloaded, err := emb.Ensure(context.Background())
+	if err != nil {
+		t.Fatalf("first Ensure: %v", err)
+	}
+	if !downloaded {
+		t.Error("expected downloaded=true on first Ensure")
+	}
+	if hits.Load() != 3 {
+		t.Errorf("server hits = %d, want 3", hits.Load())
+	}
+	wantDir := filepath.Join(cacheDir, "minishlab", "ensure-model")
+	if dir != wantDir {
+		t.Errorf("dir = %q, want %q", dir, wantDir)
+	}
+	if _, ready, err := emb.CheckLocal(); err != nil || !ready {
+		t.Fatalf("expected ready=true after Ensure, got ready=%v err=%v", ready, err)
+	}
+
+	// Second Ensure works completely offline and reports downloaded=false.
+	srv.Close()
+	dir2, downloaded2, err := emb.Ensure(context.Background())
+	if err != nil {
+		t.Fatalf("second Ensure: %v", err)
+	}
+	if downloaded2 {
+		t.Error("expected downloaded=false when already cached")
+	}
+	if dir2 != wantDir {
+		t.Errorf("dir2 = %q, want %q", dir2, wantDir)
+	}
+
+	// Incomplete local directory returns an error.
+	incompleteDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(incompleteDir, "config.json"), []byte(`{}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	localEmb, err := NewEmbedder(Options{Model: incompleteDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := localEmb.Ensure(context.Background()); err == nil {
+		t.Error("expected error on incomplete local model directory")
+	}
+}
+
 func TestPrecompiledNormalizerInvalidBase64(t *testing.T) {
 	if _, err := parsePrecompiledNormalizer("%%%"); err == nil {
 		t.Error("expected error on invalid base64")

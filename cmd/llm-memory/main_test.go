@@ -18,6 +18,7 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1284,5 +1285,165 @@ func TestCLIModel2VecSemanticAndSetup(t *testing.T) {
 	}
 	if !repUncached.OK || !strings.HasPrefix(repUncached.Embeddings, "not cached") || len(repUncached.Warnings) == 0 {
 		t.Errorf("unexpected doctor uncached model2vec report: %+v", repUncached)
+	}
+}
+
+func TestCLISetupModel2VecDownload(t *testing.T) {
+	home := t.TempDir()
+	db := filepath.Join(home, "mem.db")
+	srcDir := t.TempDir()
+
+	if err := os.WriteFile(filepath.Join(srcDir, "config.json"), []byte(`{"model_type":"model2vec","normalize":true}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(srcDir, "tokenizer.json"), []byte(`{
+		"normalizer":{"type":"BertNormalizer","lowercase":true},
+		"pre_tokenizer":{"type":"BertPreTokenizer"},
+		"model":{"type":"WordPiece","unk_token":"[UNK]","vocab":{"[UNK]":0,"go":1}}
+	}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var lenBuf [8]byte
+	header := `{"embeddings":{"dtype":"F32","shape":[2,2],"data_offsets":[0,16]}}`
+	binary.LittleEndian.PutUint64(lenBuf[:], uint64(len(header)))
+	payload := make([]byte, 16)
+	binary.LittleEndian.PutUint32(payload[8:], math.Float32bits(3))
+	binary.LittleEndian.PutUint32(payload[12:], math.Float32bits(4))
+	sf := append(append(lenBuf[:], []byte(header)...), payload...)
+	if err := os.WriteFile(filepath.Join(srcDir, "model.safetensors"), sf, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		switch r.URL.Path {
+		case "/minishlab/test-model/resolve/main/config.json":
+			http.ServeFile(w, r, filepath.Join(srcDir, "config.json"))
+		case "/minishlab/test-model/resolve/main/tokenizer.json":
+			http.ServeFile(w, r, filepath.Join(srcDir, "tokenizer.json"))
+		case "/minishlab/test-model/resolve/main/model.safetensors":
+			http.ServeFile(w, r, filepath.Join(srcDir, "model.safetensors"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	runEnv := func(args ...string) result {
+		t.Helper()
+		var out, errOut bytes.Buffer
+		err := run(context.Background(), args, app{
+			stdin:  strings.NewReader(""),
+			stdout: &out,
+			stderr: &errOut,
+			env: config.Env{
+				Getenv: func(k string) string {
+					if k == "HF_ENDPOINT" {
+						return srv.URL
+					}
+					return ""
+				},
+				UserHomeDir: func() (string, error) { return home, nil },
+			},
+		})
+		return result{out.String(), errOut.String(), err}
+	}
+
+	// 1. Dry-run with custom --embed-model and --embed-cache-dir must not hit the network.
+	customCache := filepath.Join(home, "custom-cache")
+	r := runEnv("setup", "--db", db, "--model2vec", "--embed-model", "minishlab/test-model", "--embed-cache-dir", customCache, "opencode")
+	if r.err != nil {
+		t.Fatalf("dry-run setup --model2vec: %v\nstderr: %s", r.err, r.errOut)
+	}
+	if !strings.Contains(r.out, `"--embed-provider"`) ||
+		!strings.Contains(r.out, `"minishlab/test-model"`) ||
+		!strings.Contains(r.out, `"--embed-cache-dir"`) {
+		t.Errorf("dry-run output missing expected flags:\n%s", r.out)
+	}
+	if hits.Load() != 0 {
+		t.Errorf("dry-run hit network %d times, want 0", hits.Load())
+	}
+
+	// 2. --ollama combined with --embed-model overrides defaultOllamaModel cleanly.
+	rOllama := runEnv("setup", "--db", db, "--ollama", "--embed-model", "bge-m3", "opencode")
+	if rOllama.err != nil {
+		t.Fatalf("setup --ollama --embed-model: %v\nstderr: %s", rOllama.err, rOllama.errOut)
+	}
+	if !strings.Contains(rOllama.out, defaultOllamaURL) || !strings.Contains(rOllama.out, `"bge-m3"`) {
+		t.Errorf("ollama output missing expected url/model:\n%s", rOllama.out)
+	}
+
+	// 3. --write with --model2vec downloads the 3 model files into ~/.llm-memory/models.
+	r = runEnv("setup", "--db", db, "--write", "--model2vec", "--embed-model", "minishlab/test-model", "opencode")
+	if r.err != nil {
+		t.Fatalf("setup --write --model2vec: %v\nstderr: %s", r.err, r.errOut)
+	}
+	if hits.Load() != 3 {
+		t.Errorf("server hits = %d, want 3", hits.Load())
+	}
+	if !strings.Contains(r.out, "Downloaded Model2Vec model minishlab/test-model to ") {
+		t.Errorf("expected download confirmation in stdout, got:\n%s", r.out)
+	}
+	modelCache := filepath.Join(home, ".llm-memory", "models", "minishlab", "test-model")
+	for _, f := range []string{"config.json", "tokenizer.json", "model.safetensors"} {
+		if _, err := os.Stat(filepath.Join(modelCache, f)); err != nil {
+			t.Errorf("expected cached model file %s: %v", f, err)
+		}
+	}
+	ocPath := filepath.Join(home, ".config", "opencode", "opencode.json")
+	ocData, err := os.ReadFile(ocPath)
+	if err != nil {
+		t.Fatalf("read opencode.json: %v", err)
+	}
+	if !strings.Contains(string(ocData), `"minishlab/test-model"`) {
+		t.Errorf("opencode.json missing model:\n%s", ocData)
+	}
+
+	// 4. Re-running --write works offline when already cached.
+	srv.Close()
+	r = runEnv("setup", "--db", db, "--write", "--model2vec", "--embed-model", "minishlab/test-model", "opencode")
+	if r.err != nil {
+		t.Fatalf("offline rerun setup --write --model2vec: %v\nstderr: %s", r.err, r.errOut)
+	}
+	if !strings.Contains(r.out, "Model2Vec model minishlab/test-model ready at ") {
+		t.Errorf("expected ready confirmation in stdout, got:\n%s", r.out)
+	}
+
+	// 5. --no-download skips network and writes config.
+	r = runEnv("setup", "--db", db, "--write", "--no-download", "--model2vec", "--embed-model", "minishlab/not-fetched", "opencode")
+	if r.err != nil {
+		t.Fatalf("setup --write --no-download: %v\nstderr: %s", r.err, r.errOut)
+	}
+	if strings.Contains(r.out, "Downloaded") || strings.Contains(r.out, "ready at") {
+		t.Errorf("unexpected model status output with --no-download:\n%s", r.out)
+	}
+
+	// 6. Failed download (404) returns error and does not create target config file.
+	srv404 := httptest.NewServer(http.NotFoundHandler())
+	defer srv404.Close()
+	missingCfg := filepath.Join(home, "missing-client.json")
+	var out404, err404 bytes.Buffer
+	err = run(context.Background(), []string{
+		"setup", "--db", db, "--write", "--model2vec", "--embed-model", "minishlab/missing", "--config", missingCfg, "claude-code",
+	}, app{
+		stdin:  strings.NewReader(""),
+		stdout: &out404,
+		stderr: &err404,
+		env: config.Env{
+			Getenv: func(k string) string {
+				if k == "HF_ENDPOINT" {
+					return srv404.URL
+				}
+				return ""
+			},
+			UserHomeDir: func() (string, error) { return home, nil },
+		},
+	})
+	if err == nil {
+		t.Fatal("expected error when model download fails with 404")
+	}
+	if _, statErr := os.Stat(missingCfg); !errors.Is(statErr, os.ErrNotExist) {
+		t.Errorf("config file %s should not have been created on failed download", missingCfg)
 	}
 }
