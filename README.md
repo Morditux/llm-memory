@@ -185,7 +185,7 @@ Key options:
 - **Automatic instructions**: `--write` inserts or updates a delimited `<!-- llm-memory:start -->`…`<!-- llm-memory:end -->` block (migrating an existing manual `## Shared memory` section without duplicating it); `--remove` strips it (deleting the file if empty). Pass `--no-instructions` to leave instruction files untouched.
 - **Project scope (`--project`)**: writes project-local config and instructions (`./opencode.json(c)` + `./AGENTS.md`, `./.mcp.json` + `./CLAUDE.md`, `./.codex/config.toml` + `./AGENTS.md`, `./.vscode/mcp.json`).
 - **OpenCode (>= 2.0)**: writes the v2 `mcp.servers.llm-memory` schema and automatically detects existing `opencode.jsonc` (or `opencode.json`) files.
-- **Semantic search**: add `--model2vec` (built-in local embeddings, no external server; `--write` downloads the model into `~/.llm-memory/models` unless `--no-download` is passed) or `--ollama` to include embedding flags automatically.
+- **Semantic search**: add `--model2vec` (built-in local embeddings, no external server; `--write` downloads the model into `~/.llm-memory/models` unless `--no-download` is passed; override the default model with `--embed-model`, e.g. `minishlab/potion-multilingual-128M`) or `--ollama` to include embedding flags automatically.
 - **Custom path & cleanup**: `--config PATH` overrides the config file path; `--remove` removes both the MCP entry and the managed instruction block.
 
 ### 2. Automatic briefings & lifecycle hooks (`setup --hooks` / `hook`)
@@ -329,6 +329,8 @@ llm-memory reindex --embed-provider model2vec
 llm-memory reindex --embed-provider model2vec --embed-model minishlab/potion-multilingual-128M
 # configure a client (downloads the model to ~/.llm-memory/models on --write; pass --no-download to skip):
 llm-memory setup --model2vec --write claude-code
+# or with a multilingual model:
+llm-memory setup --model2vec --embed-model minishlab/potion-multilingual-128M --write opencode
 ```
 
 2. **OpenAI-compatible `POST /v1/embeddings` API** (OpenAI, Ollama, LM Studio, vLLM, most
